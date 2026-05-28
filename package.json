@@ -1,0 +1,37 @@
+{
+  "name": "screenshottool-mcp",
+  "version": "0.1.0",
+  "description": "Windows screenshot MCP server for launching apps and capturing windows or screen regions.",
+  "type": "module",
+  "bin": {
+    "screenshottool-mcp": "./dist/index.js"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "dev": "tsx src/index.ts",
+    "start": "node dist/index.js",
+    "test": "node --test --import tsx tests/*.test.ts",
+    "smoke:notepad": "tsx tests/smoke-notepad.ts",
+    "smoke:type-text": "tsx tests/smoke-type-text.ts",
+    "smoke:menu-click": "tsx tests/smoke-menu-click.ts",
+    "smoke:no-cursor-click": "tsx tests/smoke-no-cursor-click.ts",
+    "inspect": "npx @modelcontextprotocol/inspector node dist/index.js"
+  },
+  "keywords": [
+    "mcp",
+    "screenshot",
+    "windows",
+    "codex",
+    "claude"
+  ],
+  "license": "MIT",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "1.29.0",
+    "zod": "4.4.3"
+  },
+  "devDependencies": {
+    "@types/node": "^24.10.1",
+    "tsx": "^4.21.0",
+    "typescript": "^5.9.3"
+  }
+}

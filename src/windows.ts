@@ -1,0 +1,423 @@
+import { spawn, spawnSync } from "node:child_process";
+import { constants as fsConstants } from "node:fs";
+import { access, mkdir, stat } from "node:fs/promises";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+
+import type {
+  CaptureScreenRegionInput,
+  CaptureWindowInput,
+  ClickMenuItemInput,
+  ClickWindowInput,
+  LaunchAppInput,
+  ListWindowsInput,
+  MoveMouseWindowInput,
+  TypeTextInput,
+  SendKeyInput
+} from "./schemas.js";
+
+export type Rect = {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+  left?: number;
+  top?: number;
+  right?: number;
+  bottom?: number;
+};
+
+export type WindowInfo = {
+  hwnd: string;
+  title: string;
+  pid: number;
+  processName: string;
+  className: string;
+  rect: Rect;
+};
+
+export type CaptureResult = {
+  path: string;
+  width: number;
+  height: number;
+  target: string;
+  rect: Rect;
+  timestamp: string;
+};
+
+export type ClickResult = {
+  clicked: boolean
+  target: string
+  hwnd: string
+  title: string
+  pid: number
+  button: "left" | "right" | "middle"
+  doubleClick: boolean
+  method: "post_message" | "native_menu_command"
+  nativeMenu?: NativeMenuResult
+  windowPoint: { x: number; y: number }
+  screenPoint: { x: number; y: number }
+  timestamp: string
+}
+
+export type MoveMouseResult = {
+  moved: boolean
+  target: string
+  hwnd: string
+  title: string
+  pid: number
+  method: "post_message"
+  windowPoint: { x: number; y: number }
+  screenPoint: { x: number; y: number }
+  timestamp: string
+}
+
+export type ClickMenuItemResult = {
+  clicked: boolean
+  target: string
+  hwnd: string
+  title: string
+  pid: number
+  method: "native_menu_command"
+  menuPath: NativeMenuResult[]
+  commandId: number
+  timestamp: string
+}
+
+export type TypeTextResult = {
+  typed: boolean
+  target: string
+  hwnd: string
+  title: string
+  pid: number
+  textLength: number
+  skipped: string[]
+  timestamp: string
+}
+
+export type SendKeyResult = {
+  sent: boolean
+  key: string
+  modifiers: string[]
+  target: string
+  hwnd: string
+  title: string
+  pid: number
+  timestamp: string
+}
+
+type NativeMenuResult = {
+  index: number;
+  text: string;
+  normalizedText: string;
+  commandId: number | null;
+};
+
+const sourceRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..")
+const runtimeRoot = sourceRoot.endsWith(`${path.sep}dist`) ? path.dirname(sourceRoot) : sourceRoot
+const helperPath = path.join(runtimeRoot, "scripts", "win-capture.ps1")
+const defaultOutputDir = path.join(runtimeRoot, "outputs")
+const powershellCommand = findPowerShellCommand()
+
+type HelperRequest =
+  | { action: "list-windows"; filters?: ListWindowsInput }
+  | { action: "capture-window"; target: Omit<CaptureWindowInput, "outputPath">; outputPath: string }
+  | { action: "capture-screen-region"; region: CaptureScreenRegionInput["region"]; outputPath: string }
+  | { action: "click-window"; target: ClickWindowInput }
+  | { action: "move-mouse-window"; target: MoveMouseWindowInput }
+  | { action: "click-menu-item"; target: ClickMenuItemInput }
+  | { action: "type-text"; target: TypeTextInput }
+  | { action: "send-key"; target: SendKeyInput }
+
+export function getDefaultOutputDir(): string {
+  return defaultOutputDir
+}
+
+export async function typeText(input: TypeTextInput): Promise<TypeTextResult> {
+  return runHelper<TypeTextResult>({ action: "type-text", target: input })
+}
+
+export async function sendKey(input: SendKeyInput): Promise<SendKeyResult> {
+  return runHelper<SendKeyResult>({ action: "send-key", target: input })
+}
+
+export async function ensureExecutablePath(exePath: string): Promise<void> {
+  if (!path.isAbsolute(exePath)) {
+    throw new Error("exePath must be an absolute path.");
+  }
+
+  if (path.extname(exePath).toLowerCase() !== ".exe") {
+    throw new Error("exePath must point to a .exe file.");
+  }
+
+  try {
+    await access(exePath, fsConstants.X_OK);
+  } catch {
+    await access(exePath, fsConstants.R_OK);
+  }
+}
+
+export async function ensureOutputPath(outputPath?: string): Promise<string> {
+  if (outputPath && !path.isAbsolute(outputPath)) {
+    throw new Error("outputPath must be an absolute path when provided.");
+  }
+
+  const finalPath = outputPath ? path.resolve(outputPath) : path.join(defaultOutputDir, `${timestampForFile()}-${randomSuffix()}.png`);
+
+  if (path.extname(finalPath).toLowerCase() !== ".png") {
+    throw new Error("outputPath must end with .png.");
+  }
+
+  await mkdir(path.dirname(finalPath), { recursive: true });
+  return finalPath;
+}
+
+export async function launchApp(input: LaunchAppInput): Promise<{ pid: number; window: WindowInfo | null }> {
+  await ensureExecutablePath(input.exePath);
+  const cwd = await ensureWorkingDirectory(input.cwd);
+  const processName = path.basename(input.exePath, path.extname(input.exePath));
+  const existingProcessWindows = input.waitForWindow ? await listWindows({ processName }) : [];
+  const existingHwnds = new Set(existingProcessWindows.map((window) => window.hwnd));
+
+  const child = await spawnApp(input, cwd);
+
+  if (typeof child.pid !== "number") {
+    throw new Error("Failed to start process.");
+  }
+
+  if (!input.waitForWindow) {
+    return { pid: child.pid, window: null };
+  }
+
+  const window = await waitForWindow(child.pid, processName, existingHwnds, input.timeoutMs);
+  return { pid: child.pid, window };
+}
+
+export async function closeApp(pid: number): Promise<{ pid: number; closed: boolean }> {
+  const result = spawnSync("taskkill.exe", ["/PID", String(pid), "/T", "/F"], {
+    encoding: "utf8",
+    shell: false
+  });
+
+  if (result.status !== 0) {
+    const message = (result.stderr || result.stdout || "").trim();
+    throw new Error(message || `taskkill failed for pid ${pid}.`);
+  }
+
+  return { pid, closed: true };
+}
+
+export async function listWindows(filters: ListWindowsInput = {}): Promise<WindowInfo[]> {
+  return runHelper<WindowInfo[]>({ action: "list-windows", filters });
+}
+
+export async function captureWindow(input: CaptureWindowInput): Promise<CaptureResult> {
+  const outputPath = await ensureOutputPath(input.outputPath);
+  const { outputPath: _outputPath, ...target } = input;
+  return runHelper<CaptureResult>({ action: "capture-window", target, outputPath });
+}
+
+export async function captureScreenRegion(input: CaptureScreenRegionInput): Promise<CaptureResult> {
+  const outputPath = await ensureOutputPath(input.outputPath);
+  return runHelper<CaptureResult>({ action: "capture-screen-region", region: input.region, outputPath });
+}
+
+export async function clickWindow(input: ClickWindowInput): Promise<ClickResult> {
+  return runHelper<ClickResult>({ action: "click-window", target: input });
+}
+
+export async function moveMouseWindow(input: MoveMouseWindowInput): Promise<MoveMouseResult> {
+  return runHelper<MoveMouseResult>({ action: "move-mouse-window", target: input });
+}
+
+export async function clickMenuItem(input: ClickMenuItemInput): Promise<ClickMenuItemResult> {
+  return runHelper<ClickMenuItemResult>({ action: "click-menu-item", target: input });
+}
+
+async function waitForWindow(pid: number, processName: string, existingHwnds: Set<string>, timeoutMs: number): Promise<WindowInfo | null> {
+  const deadline = Date.now() + timeoutMs;
+
+  while (Date.now() < deadline) {
+    const processWindows = await listWindows({ pid });
+    if (processWindows.length > 0) {
+      return processWindows[0];
+    }
+
+    const newNamedWindow = (await listWindows({ processName }))
+      .find((window) => !existingHwnds.has(window.hwnd));
+    if (newNamedWindow) {
+      return newNamedWindow;
+    }
+
+    await delay(500);
+  }
+
+  return null;
+}
+
+async function ensureWorkingDirectory(cwd?: string): Promise<string | undefined> {
+  if (!cwd) {
+    return undefined;
+  }
+
+  if (!path.isAbsolute(cwd)) {
+    throw new Error("cwd must be an absolute path when provided.");
+  }
+
+  let stats;
+  try {
+    stats = await stat(cwd);
+  } catch {
+    throw new Error(`cwd does not exist: ${cwd}`);
+  }
+
+  if (!stats.isDirectory()) {
+    throw new Error(`cwd must be a directory: ${cwd}`);
+  }
+
+  return path.resolve(cwd);
+}
+
+async function spawnApp(input: LaunchAppInput, cwd?: string): Promise<ReturnType<typeof spawn>> {
+  let child: ReturnType<typeof spawn>;
+  try {
+    child = spawn(input.exePath, input.args, {
+      cwd,
+      detached: false,
+      shell: false,
+      stdio: "ignore",
+      windowsHide: false
+    });
+  } catch (error) {
+    throw new Error(`Failed to start process: ${formatSpawnError(error)}`);
+  }
+
+  await new Promise<void>((resolve, reject) => {
+    const cleanup = () => {
+      child.off("spawn", onSpawn);
+      child.off("error", onError);
+    };
+    const onSpawn = () => {
+      cleanup();
+      resolve();
+    };
+    const onError = (error: Error) => {
+      cleanup();
+      reject(error);
+    };
+
+    child.once("spawn", onSpawn);
+    child.once("error", onError);
+  }).catch((error: unknown) => {
+    throw new Error(`Failed to start process: ${formatSpawnError(error)}`);
+  });
+
+  child.on("error", () => undefined);
+  child.unref();
+  return child;
+}
+
+const HELPER_TIMEOUT_MS = 60000;
+
+async function runHelper<T>(request: HelperRequest): Promise<T> {
+  await access(helperPath, fsConstants.R_OK);
+
+  const inputJson = JSON.stringify(request);
+  const child = spawn(powershellCommand, [
+    "-NoProfile",
+    "-ExecutionPolicy",
+    "Bypass",
+    "-File",
+    helperPath,
+    "-InputJson",
+    inputJson
+  ], {
+    shell: false,
+    stdio: ["ignore", "pipe", "pipe"],
+    windowsHide: true
+  });
+
+  let stdout = "";
+  let stderr = "";
+
+  child.stdout.setEncoding("utf8");
+  child.stderr.setEncoding("utf8");
+  child.stdout.on("data", (chunk: string) => {
+    stdout += chunk;
+  });
+  child.stderr.on("data", (chunk: string) => {
+    stderr += chunk;
+  });
+
+  let timeoutId: ReturnType<typeof setTimeout> | undefined;
+  const timeoutRejection = new Promise<never>((_resolve, reject) => {
+    timeoutId = setTimeout(() => {
+      child.kill();
+      reject(new Error(`PowerShell helper timed out after ${HELPER_TIMEOUT_MS}ms.`));
+    }, HELPER_TIMEOUT_MS);
+  });
+
+  let exitCode: number | null;
+  try {
+    exitCode = await Promise.race([
+      timeoutRejection,
+      new Promise<number | null>((resolve, reject) => {
+        child.on("error", reject);
+        child.on("close", resolve);
+      }),
+    ]);
+  } finally {
+    if (timeoutId) {
+      clearTimeout(timeoutId);
+    }
+  }
+
+  if (exitCode !== 0) {
+    throw new Error((stderr || stdout || `PowerShell helper exited with code ${exitCode}.`).trim());
+  }
+
+  try {
+    return JSON.parse(stdout) as T;
+  } catch (error) {
+    throw new Error(`PowerShell helper returned invalid JSON: ${(error as Error).message}\n${stdout}`);
+  }
+}
+
+function timestampForFile(date = new Date()): string {
+  const pad = (value: number) => String(value).padStart(2, "0");
+  return [
+    date.getFullYear(),
+    pad(date.getMonth() + 1),
+    pad(date.getDate())
+  ].join("") + "-" + [
+    pad(date.getHours()),
+    pad(date.getMinutes()),
+    pad(date.getSeconds())
+  ].join("");
+}
+
+function randomSuffix(): string {
+  return Math.random().toString(36).slice(2, 8);
+}
+
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function formatSpawnError(error: unknown): string {
+  if (error instanceof Error) {
+    return error.message;
+  }
+
+  return String(error);
+}
+
+function findPowerShellCommand(): string {
+  const pwsh = spawnSync("where.exe", ["pwsh.exe"], {
+    encoding: "utf8",
+    shell: false,
+    windowsHide: true
+  });
+
+  return pwsh.status === 0 ? "pwsh.exe" : "powershell.exe";
+}
