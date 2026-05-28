@@ -1,0 +1,13 @@
+{
+  "version": 1,
+  "skills": {
+    "guizang-ppt-skill": {
+      "name": "guizang-ppt-skill",
+      "version": "1.0.1",
+      "source": "redskill",
+      "install_dir": "/mnt/x/MCP/ScreenShotTool/skills/guizang-ppt-skill",
+      "installed_at": "1779975595821",
+      "sha256": "1a8735aa0f07d7ec08401342841bcbf5b369d395e58decb63988783bb5908057"
+    }
+  }
+}
