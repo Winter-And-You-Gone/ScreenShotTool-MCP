@@ -53,7 +53,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
   tools: [
     {
       name: "launch_app",
-      description: "Launch a Windows .exe and optionally wait for its first visible window.",
+      description: "Launch a Windows .exe and optionally wait for its first visible window. Use noActivate to prevent the window from stealing focus.",
       inputSchema: toolInputSchemas.launch_app
     },
     {
@@ -63,7 +63,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     },
     {
       name: "capture_window",
-      description: "Capture a visible window by hwnd, pid, process name, or title substring. Optional region is relative to the window top-left corner.",
+      description: "Capture a window by hwnd, pid, process name, or title substring. captureMethod 'print' works on occluded/minimized windows. noActivate avoids stealing focus.",
       inputSchema: toolInputSchemas.capture_window
     },
     {
@@ -93,12 +93,12 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     },
     {
       name: "type_text",
-      description: "Type text into a window via SendInput Unicode. The target window is focused first; supports any Unicode character (including CJK).",
+      description: "Type text into a window via SendInput Unicode. noActivate uses PostMessage WM_CHAR so the target window doesn't need focus.",
       inputSchema: toolInputSchemas.type_text
     },
     {
       name: "send_key",
-      description: "Send a keystroke with optional modifiers (alt/ctrl/shift/win) to a window via keybd_event. Use for keyboard shortcuts like Alt+F to open menus.",
+      description: "Send a keystroke with optional modifiers. noActivate uses PostMessage WM_KEYDOWN/WM_KEYUP so the target window doesn't need focus.",
       inputSchema: toolInputSchemas.send_key
     }
   ]

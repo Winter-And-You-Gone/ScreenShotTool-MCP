@@ -699,12 +699,31 @@ function Capture-Window {
     return Capture-WindowPrint -Window $window -Region $region -OutputPath $OutputPath
   }
 
+  $noActivate = $false
+  if ($Target.ContainsKey("noActivate") -and $null -ne $Target.noActivate) {
+    $noActivate = [bool]$Target.noActivate
+  }
+
   $focus = $true
   if ($Target.ContainsKey("focus") -and $null -ne $Target.focus) {
     $focus = [bool]$Target.focus
   }
+  $hwnd = [IntPtr]([int64]$window.hwnd)
   $previousForeground = [IntPtr]::Zero
-  if ($focus) {
+  $raisedZ = $false
+
+  if ($noActivate) {
+    # Raise window above overlapping ones without activating, so CopyFromScreen
+    # captures the right area but the user's foreground window doesn't change.
+    $SWP_NOSIZE = [uint32]0x0001
+    $SWP_NOMOVE = [uint32]0x0002
+    $SWP_NOACTIVATE = [uint32]0x0010
+    $hwndTop = [IntPtr]0
+    $flags = $SWP_NOSIZE -bor $SWP_NOMOVE -bor $SWP_NOACTIVATE
+    [ScreenshotTool.Native]::SetWindowPos($hwnd, $hwndTop, 0, 0, 0, 0, $flags) | Out-Null
+    $raisedZ = $true
+    Start-Sleep -Milliseconds 50
+  } elseif ($focus) {
     $previousForeground = [ScreenshotTool.Native]::GetForegroundWindow()
     Focus-Window $window
   }
@@ -741,7 +760,14 @@ function Capture-Window {
   try {
     return Save-Screenshot -X $captureX -Y $captureY -Width $captureWidth -Height $captureHeight -OutputPath $OutputPath -Target ("window:" + $window.hwnd) -Rect $rect
   } finally {
-    if ($focus -and $previousForeground -ne [IntPtr]::Zero -and $previousForeground -ne ([IntPtr]([int64]$window.hwnd))) {
+    if ($noActivate -and $raisedZ) {
+      $SWP_NOSIZE = [uint32]0x0001
+      $SWP_NOMOVE = [uint32]0x0002
+      $SWP_NOACTIVATE = [uint32]0x0010
+      $hwndBottom = [IntPtr]1
+      $flags = $SWP_NOSIZE -bor $SWP_NOMOVE -bor $SWP_NOACTIVATE
+      [ScreenshotTool.Native]::SetWindowPos($hwnd, $hwndBottom, 0, 0, 0, 0, $flags) | Out-Null
+    } elseif ($focus -and $previousForeground -ne [IntPtr]::Zero -and $previousForeground -ne ([IntPtr]([int64]$window.hwnd))) {
       [ScreenshotTool.Native]::SetForegroundWindow($previousForeground) | Out-Null
     }
   }
@@ -876,6 +902,67 @@ function Post-MouseMessage {
     throw "Failed to post mouse message 0x$($Message.ToString('X4'))."
   }
 
+  return $posted
+}
+
+function Post-CharMessage {
+  param(
+    [IntPtr]$Hwnd,
+    [uint16]$Char
+  )
+
+  $WM_CHAR = [uint32]0x0102
+  $posted = [ScreenshotTool.Native]::PostMessage($Hwnd, $WM_CHAR, [IntPtr]$Char, [IntPtr]::Zero)
+  if (-not $posted) {
+    throw "Failed to post WM_CHAR for code $Char."
+  }
+  return $posted
+}
+
+function New-KeyLParam {
+  param(
+    [byte]$Vk,
+    [bool]$Down
+  )
+
+  $scanCode = [byte][ScreenshotTool.Native]::MapVirtualKey([uint32]$Vk, [uint32]0)
+  $extendedKeys = @{
+    [byte]0x21 = $true; [byte]0x22 = $true; [byte]0x23 = $true; [byte]0x24 = $true
+    [byte]0x25 = $true; [byte]0x26 = $true; [byte]0x27 = $true; [byte]0x28 = $true
+    [byte]0x2C = $true; [byte]0x2D = $true; [byte]0x2E = $true
+    [byte]0x5B = $true; [byte]0x5C = $true
+  }
+  $isExtended = $extendedKeys.ContainsKey($Vk)
+
+  # lParam layout: bits 0-15 = repeat count (1), bits 16-23 = scan code,
+  # bit 24 = extended key flag, bit 30 = previous key state, bit 31 = transition state
+  $repeatCount = [uint32]1
+  $scanField = [uint32]([uint32]$scanCode -shl 16)
+  $extendedFlag = if ($isExtended) { [uint32]0x01000000 } else { [uint32]0 }
+  # 0xC0000000 = bits 30+31 set (previous key down + transition state released).
+  # PowerShell 5 treats hex literals > 0x7FFFFFFF as int64, which is fine for IntPtr.
+  $prevAndTrans = if ($Down) { [long]0 } else { [long]0xC0000000 }
+
+  $combined = [long]$repeatCount -bor [long]$scanField -bor [long]$extendedFlag -bor $prevAndTrans
+  return [IntPtr]([long]$combined)
+}
+
+function Post-KeyMessage {
+  param(
+    [IntPtr]$Hwnd,
+    [byte]$Vk,
+    [bool]$Down
+  )
+
+  $WM_KEYDOWN = [uint32]0x0100
+  $WM_KEYUP = [uint32]0x0101
+  $msg = if ($Down) { $WM_KEYDOWN } else { $WM_KEYUP }
+  $lParam = New-KeyLParam -Vk $Vk -Down $Down
+
+  $posted = [ScreenshotTool.Native]::PostMessage($Hwnd, $msg, [IntPtr]$Vk, $lParam)
+  if (-not $posted) {
+    throw "Failed to post key message 0x$($msg.ToString('X4')) for VK 0x$($Vk.ToString('X2'))."
+  }
   return $posted
 }
 
@@ -1346,7 +1433,14 @@ function Send-Key {
   param([hashtable]$Target)
 
   $window = Resolve-TargetWindow $Target
-  Focus-Window $window
+  $noActivate = $false
+  if ($Target.ContainsKey("noActivate") -and $null -ne $Target.noActivate) {
+    $noActivate = [bool]$Target.noActivate
+  }
+
+  if (-not $noActivate) {
+    Focus-Window $window
+  }
 
   $key = [string]$Target.key
   $modifiers = @()
@@ -1363,8 +1457,6 @@ function Send-Key {
     $delayMs = [int]$Target.delayMs
   }
 
-  $KEYEVENTF_KEYDOWN = 0x0000
-  $KEYEVENTF_KEYUP = 0x0002
   $VK_SHIFT = 0x10
   $VK_CONTROL = 0x11
   $VK_MENU = 0x12
@@ -1395,16 +1487,32 @@ function Send-Key {
     $modVks += $VK_SHIFT
   }
 
-  foreach ($mvk in $modVks) {
-    [ScreenshotTool.Native]::keybd_event([byte]$mvk, 0, $KEYEVENTF_KEYDOWN, [UIntPtr]::Zero)
-  }
+  $hwnd = [IntPtr]([int64]$window.hwnd)
 
-  [ScreenshotTool.Native]::keybd_event($vk, 0, $KEYEVENTF_KEYDOWN, [UIntPtr]::Zero)
-  Start-Sleep -Milliseconds $pressMs
-  [ScreenshotTool.Native]::keybd_event($vk, 0, $KEYEVENTF_KEYUP, [UIntPtr]::Zero)
-
-  for ($i = $modVks.Count - 1; $i -ge 0; $i--) {
-    [ScreenshotTool.Native]::keybd_event([byte]$modVks[$i], 0, $KEYEVENTF_KEYUP, [UIntPtr]::Zero)
+  if ($noActivate) {
+    # PostMessage WM_KEYDOWN / WM_KEYUP — no focus needed
+    foreach ($mvk in $modVks) {
+      Post-KeyMessage -Hwnd $hwnd -Vk ([byte]$mvk) -Down $true | Out-Null
+    }
+    Post-KeyMessage -Hwnd $hwnd -Vk $vk -Down $true | Out-Null
+    Start-Sleep -Milliseconds $pressMs
+    Post-KeyMessage -Hwnd $hwnd -Vk $vk -Down $false | Out-Null
+    for ($i = $modVks.Count - 1; $i -ge 0; $i--) {
+      Post-KeyMessage -Hwnd $hwnd -Vk ([byte]$modVks[$i]) -Down $false | Out-Null
+    }
+  } else {
+    # keybd_event — global, requires foreground focus
+    $KEYEVENTF_KEYDOWN = 0x0000
+    $KEYEVENTF_KEYUP = 0x0002
+    foreach ($mvk in $modVks) {
+      [ScreenshotTool.Native]::keybd_event([byte]$mvk, 0, $KEYEVENTF_KEYDOWN, [UIntPtr]::Zero)
+    }
+    [ScreenshotTool.Native]::keybd_event($vk, 0, $KEYEVENTF_KEYDOWN, [UIntPtr]::Zero)
+    Start-Sleep -Milliseconds $pressMs
+    [ScreenshotTool.Native]::keybd_event($vk, 0, $KEYEVENTF_KEYUP, [UIntPtr]::Zero)
+    for ($i = $modVks.Count - 1; $i -ge 0; $i--) {
+      [ScreenshotTool.Native]::keybd_event([byte]$modVks[$i], 0, $KEYEVENTF_KEYUP, [UIntPtr]::Zero)
+    }
   }
 
   if ($delayMs -gt 0) {
@@ -1455,7 +1563,14 @@ function Type-Text {
   param([hashtable]$Target)
 
   $window = Resolve-TargetWindow $Target
-  Focus-Window $window
+  $noActivate = $false
+  if ($Target.ContainsKey("noActivate") -and $null -ne $Target.noActivate) {
+    $noActivate = [bool]$Target.noActivate
+  }
+
+  if (-not $noActivate) {
+    Focus-Window $window
+  }
   $delayMs = 50
   $pressMs = 30
 
@@ -1468,12 +1583,23 @@ function Type-Text {
 
   $text = [string]$Target.text
   $skipped = [System.Collections.ArrayList]::new()
+  $hwnd = [IntPtr]([int64]$window.hwnd)
 
   foreach ($ch in $text.ToCharArray()) {
-    $scan = [uint16][int][char]$ch
-    if (-not (Send-UnicodeChar -Scan $scan)) {
-      $skipped.Add([string]$ch) | Out-Null
-      continue
+    if ($noActivate) {
+      # PostMessage WM_CHAR — no focus needed
+      $charCode = [uint16][int][char]$ch
+      if (-not (Post-CharMessage -Hwnd $hwnd -Char $charCode)) {
+        $skipped.Add([string]$ch) | Out-Null
+        continue
+      }
+    } else {
+      # SendInput KEYEVENTF_UNICODE — requires foreground focus
+      $scan = [uint16][int][char]$ch
+      if (-not (Send-UnicodeChar -Scan $scan)) {
+        $skipped.Add([string]$ch) | Out-Null
+        continue
+      }
     }
 
     if ($pressMs -gt 0) {
@@ -1506,6 +1632,34 @@ function Minimize-Window {
 
   return [ordered]@{
     minimized = $ok
+    target = "window:" + $window.hwnd
+    hwnd = $window.hwnd
+    title = $window.title
+    pid = $window.pid
+    timestamp = (Get-Date).ToUniversalTime().ToString("o")
+  }
+}
+
+function NoActivate-Minimize {
+  param([hashtable]$Target)
+
+  $window = Resolve-TargetWindow -Target $Target
+  $hwnd = [IntPtr]([int64]$window.hwnd)
+
+  # Show without activating, then push to bottom of z-order without activating.
+  $SW_SHOWNOACTIVATE = 4
+  $SWP_NOSIZE = [uint32]0x0001
+  $SWP_NOMOVE = [uint32]0x0002
+  $SWP_NOACTIVATE = [uint32]0x0010
+  $hwndBottom = [IntPtr]1
+  $flags = $SWP_NOSIZE -bor $SWP_NOMOVE -bor $SWP_NOACTIVATE
+
+  [ScreenshotTool.Native]::ShowWindow($hwnd, $SW_SHOWNOACTIVATE) | Out-Null
+  [ScreenshotTool.Native]::SetWindowPos($hwnd, $hwndBottom, 0, 0, 0, 0, $flags) | Out-Null
+
+  return [ordered]@{
+    minimized = $true
+    noActivate = $true
     target = "window:" + $window.hwnd
     hwnd = $window.hwnd
     title = $window.title
@@ -1548,6 +1702,9 @@ function Invoke-Action {
     }
     "minimize-window" {
       return Minimize-Window -Target $Request.target
+    }
+    "noactivate-minimize" {
+      return NoActivate-Minimize -Target $Request.target
     }
     default {
       throw "Unknown action: $($Request.action)"

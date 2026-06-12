@@ -129,6 +129,7 @@ type HelperRequest =
   | { action: "type-text"; target: TypeTextInput }
   | { action: "send-key"; target: SendKeyInput }
   | { action: "minimize-window"; target: { hwnd: string } }
+  | { action: "noactivate-minimize"; target: { hwnd: string } }
 
 export function getDefaultOutputDir(): string {
   return defaultOutputDir
@@ -207,9 +208,17 @@ export async function launchApp(input: LaunchAppInput): Promise<{ pid: number; w
     throw new Error(`Process exited before a window appeared (pid=${child.pid}, code=${exitState.code}, signal=${exitState.signal ?? "none"}).`);
   }
 
+  if (input.noActivate && window) {
+    try {
+      await runHelper({ action: "noactivate-minimize", target: { hwnd: window.hwnd } });
+    } catch (error) {
+      console.error(`noActivate minimize failed for hwnd ${window.hwnd}: ${formatSpawnError(error)}`);
+    }
+  }
+
   if (input.startMinimized && window) {
     try {
-      await minimizeWindow(window.hwnd);
+      await minimizeWindow(window.hwnd, input.noActivate);
     } catch (error) {
       console.error(`startMinimized failed for hwnd ${window.hwnd}: ${formatSpawnError(error)}`);
     }
@@ -607,6 +616,7 @@ function findPowerShellCommand(): string {
   return pwsh.status === 0 ? "pwsh.exe" : "powershell.exe";
 }
 
-function minimizeWindow(hwnd: string): Promise<unknown> {
-  return runHelper({ action: "minimize-window", target: { hwnd } });
+function minimizeWindow(hwnd: string, noActivate = false): Promise<unknown> {
+  const action = noActivate ? "noactivate-minimize" : "minimize-window";
+  return runHelper({ action, target: { hwnd } });
 }

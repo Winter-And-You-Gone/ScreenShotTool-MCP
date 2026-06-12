@@ -55,7 +55,8 @@ export const launchAppSchema = z.object({
   cwd: z.string().min(1).optional(),
   waitForWindow: z.boolean().optional().default(true),
   timeoutMs: optionalTimeout.default(10000),
-  startMinimized: z.boolean().optional().default(false)
+  startMinimized: z.boolean().optional().default(false),
+  noActivate: z.boolean().optional().default(false)
 });
 
 export const listWindowsSchema = z.object({
@@ -72,6 +73,7 @@ export const captureWindowSchema = z.object({
   region: regionSchema.optional(),
   focus: z.boolean().optional().default(true),
   captureMethod: z.enum(["screen", "print"]).optional().default("screen"),
+  noActivate: z.boolean().optional().default(false),
   outputPath: z.string().min(1).optional()
 }).refine(
   (value) => value.hwnd !== undefined || value.pid !== undefined || value.processName !== undefined || value.titleContains !== undefined,
@@ -134,7 +136,8 @@ export const typeTextSchema = z.object({
   titleContains: z.string().min(1).optional(),
   text: z.string().min(1),
   delayMs: z.number().int().min(0).max(10000).optional().default(50),
-  pressMs: z.number().int().min(0).max(5000).optional().default(30)
+  pressMs: z.number().int().min(0).max(5000).optional().default(30),
+  noActivate: z.boolean().optional().default(false)
 }).refine(
   (value) => value.hwnd !== undefined || value.pid !== undefined || value.processName !== undefined || value.titleContains !== undefined,
   "Provide at least one of hwnd, pid, processName, or titleContains."
@@ -148,7 +151,8 @@ export const sendKeySchema = z.object({
   key: sendKeyValue,
   modifiers: z.array(z.enum(["alt", "ctrl", "shift", "win"])).optional().default([]),
   delayMs: z.number().int().min(0).max(10000).optional().default(50),
-  pressMs: z.number().int().min(0).max(5000).optional().default(30)
+  pressMs: z.number().int().min(0).max(5000).optional().default(30),
+  noActivate: z.boolean().optional().default(false)
 }).refine(
   (value) => value.hwnd !== undefined || value.pid !== undefined || value.processName !== undefined || value.titleContains !== undefined,
   "Provide at least one of hwnd, pid, processName, or titleContains."
@@ -174,7 +178,8 @@ export const toolInputSchemas = {
       cwd: { type: "string", description: "Optional working directory for the process." },
       waitForWindow: { type: "boolean", default: true, description: "Wait for the first visible window for the process." },
       timeoutMs: { type: "integer", minimum: 100, maximum: 120000, default: 10000 },
-      startMinimized: { type: "boolean", default: false, description: "Start the process minimized. The window will not appear on top." }
+      startMinimized: { type: "boolean", default: false, description: "Start the process minimized. The window will not appear on top." },
+      noActivate: { type: "boolean", default: false, description: "When true, the window is placed at the bottom of the z-order without receiving focus. Combines well with startMinimized for fully non-intrusive launches." }
     },
     required: ["exePath"],
     additionalProperties: false
@@ -209,6 +214,7 @@ export const toolInputSchemas = {
       },
       focus: { type: "boolean", default: true, description: "Bring the window to the foreground before capturing. Set false to preserve open menus, popups, or transient UI." },
       captureMethod: { type: "string", enum: ["screen", "print"], default: "screen", description: "Capture method: 'screen' uses CopyFromScreen (needs visible area), 'print' uses PrintWindow API (captures window content even behind other windows)." },
+      noActivate: { type: "boolean", default: false, description: "When true with captureMethod 'screen', the window is raised above overlapping windows without stealing keyboard focus, then restored after capture." },
       outputPath: { type: "string", description: "Optional absolute PNG output path." }
     },
     additionalProperties: false
@@ -298,7 +304,8 @@ export const toolInputSchemas = {
       titleContains: { type: "string" },
       text: { type: "string", minLength: 1, description: "Text to type into the target window. Sent via SendInput Unicode, so any Unicode character including CJK is supported." },
       delayMs: { type: "integer", minimum: 0, maximum: 10000, default: 50, description: "Delay between keystrokes in milliseconds." },
-      pressMs: { type: "integer", minimum: 0, maximum: 5000, default: 30, description: "Duration of each key press in milliseconds." }
+      pressMs: { type: "integer", minimum: 0, maximum: 5000, default: 30, description: "Duration of each key press in milliseconds." },
+      noActivate: { type: "boolean", default: false, description: "When true, sends WM_CHAR messages via PostMessage instead of SendInput, so the target window never needs focus. Some applications may not respond to posted messages." }
     },
     required: ["text"],
     additionalProperties: false
@@ -319,7 +326,8 @@ export const toolInputSchemas = {
       },
       modifiers: { type: "array", items: { type: "string", enum: ["alt", "ctrl", "shift", "win"] }, description: "Modifier keys to hold during the keypress." },
       delayMs: { type: "integer", minimum: 0, maximum: 10000, default: 50 },
-      pressMs: { type: "integer", minimum: 0, maximum: 5000, default: 30 }
+      pressMs: { type: "integer", minimum: 0, maximum: 5000, default: 30 },
+      noActivate: { type: "boolean", default: false, description: "When true, sends WM_KEYDOWN/WM_KEYUP via PostMessage instead of keybd_event, so the target window never needs focus. Some applications may not respond to posted messages." }
     },
     required: ["key"],
     additionalProperties: false

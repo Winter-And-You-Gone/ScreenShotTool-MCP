@@ -18,6 +18,7 @@
     "smoke:print-capture": "tsx tests/smoke-print-capture.ts",
     "smoke:p1-fixes": "tsx tests/smoke-p1-fixes.ts",
     "smoke:perf": "tsx tests/smoke-perf.ts",
+    "smoke:no-activate": "tsx tests/smoke-no-activate.ts",
     "inspect": "npx @modelcontextprotocol/inspector node dist/index.js"
   },
   "engines": {

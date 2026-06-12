@@ -223,3 +223,10 @@ test("capture_window accepts captureMethod and defaults to screen", () => {
 
   assert.throws(() => captureWindowSchema.parse({ hwnd: "1", captureMethod: "invalid" }));
 });
+
+test("noActivate defaults to false on launch_app, capture_window, type_text, send_key", () => {
+  assert.equal(launchAppSchema.parse({ exePath: "C:\\x.exe" }).noActivate, false);
+  assert.equal(captureWindowSchema.parse({ hwnd: "1" }).noActivate, false);
+  assert.equal(typeTextSchema.parse({ hwnd: "1", text: "a" }).noActivate, false);
+  assert.equal(sendKeySchema.parse({ hwnd: "1", key: "a" }).noActivate, false);
+});
