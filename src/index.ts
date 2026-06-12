@@ -88,7 +88,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     },
     {
       name: "close_app",
-      description: "Terminate a process by pid using taskkill.",
+      description: "Terminate a process and its descendants via taskkill /T /F.",
       inputSchema: toolInputSchemas.close_app
     },
     {

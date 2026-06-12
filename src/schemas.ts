@@ -284,7 +284,7 @@ export const toolInputSchemas = {
   close_app: {
     type: "object",
     properties: {
-      pid: { type: "integer", minimum: 1 }
+      pid: { type: "integer", minimum: 1, description: "Process ID. taskkill /T /F is used, which terminates the entire process tree (the target plus any child processes it spawned)." }
     },
     required: ["pid"],
     additionalProperties: false
