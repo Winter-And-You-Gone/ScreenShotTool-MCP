@@ -80,6 +80,116 @@ npm run dev
 npm start
 ```
 
+---
+
+## 🤖 给 AI Agent 的安装指引
+
+> 这一节专门写给 Codex / Claude Code 等 AI Agent 阅读，按顺序执行即可完成安装和接入。
+
+### 前置条件检查
+
+```powershell
+# 1. 必须是 Windows 桌面会话
+[System.Environment]::OSVersion.Platform   # 期望: Win32NT
+
+# 2. Node 版本必须 >= 20
+node --version
+
+# 3. 必须能调用 PowerShell（pwsh.exe 优先，否则 powershell.exe）
+where.exe pwsh.exe
+where.exe powershell.exe
+```
+
+如果 Node 缺失或版本过低，先告知用户并停止。**不要**自动安装 Node。
+
+### 克隆 + 构建
+
+```powershell
+# 选一个目录（示例用 X:\MCP，你可以换成任意绝对路径）
+cd X:\MCP
+git clone git@github.com:Winter-And-You-Gone/ScreenShotTool-MCP.git
+cd ScreenShotTool-MCP
+npm install
+npm run build
+```
+
+构建产物在 `dist/index.js`，**这就是 MCP 客户端要调用的入口**。
+
+### 配置 MCP 客户端
+
+把以下条目写入客户端的 `mcpServers` 配置（**绝对路径**必须用双反斜杠转义）：
+
+```json
+{
+  "mcpServers": {
+    "screenshottool": {
+      "command": "node",
+      "args": ["X:\\MCP\\ScreenShotTool-MCP\\dist\\index.js"],
+      "cwd": "X:\\MCP\\ScreenShotTool-MCP"
+    }
+  }
+}
+```
+
+不同客户端的配置文件位置：
+- **Claude Code**: `%APPDATA%\Claude\claude_desktop_config.json` 或 `~/.claude.json`
+- **Codex CLI**: `~/.codex/config.toml`（TOML 格式，需要换种写法）
+- **MCP Inspector**: `npm run inspect`
+
+### 自检（不依赖客户端）
+
+```powershell
+# 单元测试
+npm test                    # 期望 24/24 通过
+
+# 启动 + 关闭 Notepad 的端到端测试
+npm run smoke:notepad
+
+# 验证 noActivate 不抢焦点
+npm run smoke:no-activate
+```
+
+如果 `smoke:no-activate` 失败，通常是因为：
+1. 当前没有桌面会话（远程会话/服务模式跑不动）
+2. UAC 阻止了 `keybd_event`（用普通用户权限运行即可，**不要**用管理员权限）
+
+### 接入后的第一次调用
+
+确认接入成功的最小调用：
+
+```jsonc
+// 1. 列出当前可见窗口（不会改变任何状态）
+{ "tool": "list_windows", "arguments": {} }
+
+// 2. noActivate 启动记事本（不抢焦点）
+{ "tool": "launch_app", "arguments": {
+    "exePath": "C:\\Windows\\System32\\notepad.exe",
+    "waitForWindow": true,
+    "noActivate": true
+} }
+```
+
+返回的 `window.hwnd` 就是后续 `type_text`、`capture_window`、`click_window` 的目标。
+
+### 常见错误
+
+| 现象 | 原因 | 修复 |
+|------|------|------|
+| `exePath must be an absolute path` | 路径不是绝对路径 | 用 `C:\\Windows\\System32\\notepad.exe` 这类完整路径 |
+| `outputPath must end with .png` | 输出路径后缀不对 | 省略 `outputPath` 让工具自动生成，或确保以 `.png` 结尾 |
+| `PowerShell helper exited unexpectedly` | helper 进程崩溃（一般是首次启动慢） | 重试一次；持续失败查看 `outputs/` 同级是否有报错日志 |
+| `noActivate` 模式下窗口仍然闪一下 | 极少数程序自身会调用 `SetForegroundWindow` | 这是程序行为，工具层面已尽力抑制 |
+| 中文菜单匹配失败 | 旧版本 (< 73a9fa6) 的 ANSI 编码问题 | 拉取最新 main 重新构建 |
+
+### 不要做的事
+
+- ❌ 不要自动 `git pull` 升级——可能引入 break change
+- ❌ 不要修改 `outputs/`、`dist/`、`.claude/` 目录——都被 gitignore
+- ❌ 不要给 `type_text` 传超长字符串（>1000 字符），分段发送更可靠
+- ❌ 不要在 `click_window` 之后立刻 `capture_window`——加 `delayMs: 200` 给 UI 重绘时间
+
+---
+
 ## Codex / Claude Code 配置示例
 
 构建后，把 MCP Server 配到客户端的 `mcpServers` 中：

@@ -5,3 +5,4 @@ outputs/
 *.log
 npm-debug.log*
 .claude/
+AGENTS.md
