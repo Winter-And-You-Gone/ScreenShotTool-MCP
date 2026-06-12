@@ -2,8 +2,9 @@ import assert from "node:assert/strict";
 import { stat } from "node:fs/promises";
 
 import { captureWindow, closeApp, launchApp } from "../src/windows.js";
+import { testExePath } from "./helpers.js";
 
-const exePath = "C:\\Windows\\System32\\notepad.exe";
+const exePath = await testExePath();
 const launched = await launchApp({
   exePath,
   args: [],

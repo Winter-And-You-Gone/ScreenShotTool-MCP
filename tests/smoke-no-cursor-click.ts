@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 
 import { clickMenuItem, clickWindow, closeApp, launchApp, listWindows } from "../src/windows.js";
+import { testExePath } from "./helpers.js";
 
 function cursorPosition(): string {
   const script = "Add-Type -AssemblyName System.Windows.Forms; $p=[System.Windows.Forms.Cursor]::Position; [Console]::Write($p.X.ToString()+','+$p.Y.ToString())";
@@ -19,7 +20,7 @@ function cursorPosition(): string {
 }
 
 const launched = await launchApp({
-  exePath: "C:\\Windows\\System32\\notepad.exe",
+  exePath: await testExePath(),
   args: [],
   waitForWindow: true,
   timeoutMs: 10000

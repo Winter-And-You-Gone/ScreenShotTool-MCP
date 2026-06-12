@@ -2,12 +2,13 @@ import assert from "node:assert/strict";
 import { stat } from "node:fs/promises";
 
 import { captureWindow, closeApp, launchApp, listWindows, typeText } from "../src/windows.js";
+import { testExePath } from "./helpers.js";
 
 // ── Test 1: startMinimized via minimize-window helper ──
 {
   console.log("\n=== Test 1: minimize-window helper action ===");
   const r = await launchApp({
-    exePath: "C:\\Windows\\System32\\notepad.exe",
+    exePath: await testExePath(),
     args: [],
     waitForWindow: true,
     timeoutMs: 10000
@@ -38,7 +39,7 @@ import { captureWindow, closeApp, launchApp, listWindows, typeText } from "../sr
 {
   console.log("\n=== Test 2: Unicode type_text ===");
   const r = await launchApp({
-    exePath: "C:\\Windows\\System32\\notepad.exe",
+    exePath: await testExePath(),
     args: [],
     waitForWindow: true,
     timeoutMs: 10000

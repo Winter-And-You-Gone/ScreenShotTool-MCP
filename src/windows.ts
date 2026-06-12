@@ -275,7 +275,7 @@ async function waitForWindow(
 
     const processWindows = await listWindows({ pid });
     if (processWindows.length > 0) {
-      return processWindows[0];
+      return processWindows[0]!;
     }
 
     const newNamedWindow = (await listWindows({ processName }))

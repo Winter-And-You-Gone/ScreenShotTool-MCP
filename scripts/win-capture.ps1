@@ -428,7 +428,7 @@ function Filter-Windows {
     [hashtable]$Filters
   )
 
-  $result = @()
+  $result = [System.Collections.ArrayList]::new()
   foreach ($win in $Windows) {
     if ($Filters.ContainsKey("pid") -and $null -ne $Filters.pid) {
       if ($win.pid -ne [int]$Filters.pid) { continue }
@@ -441,9 +441,9 @@ function Filter-Windows {
       $needle = [string]$Filters.titleContains
       if ($win.title.IndexOf($needle, [StringComparison]::OrdinalIgnoreCase) -lt 0) { continue }
     }
-    $result += $win
+    $result.Add($win) | Out-Null
   }
-  return $result
+  return @($result.ToArray())
 }
 
 function Resolve-TargetWindow {
@@ -545,14 +545,13 @@ function Capture-WindowPrint {
   $wasIconic = $false
   if ($Window.iconic) {
     $wasIconic = $true
-    $SW_RESTORE = 9
+    $SW_SHOWNOACTIVATE = 4
     $SWP_NOSIZE = 0x0001
     $SWP_NOMOVE = 0x0002
     $SWP_NOACTIVATE = 0x0010
-    $SWP_NOZORDER = 0x0004
-    $flags = [uint32]($SWP_NOSIZE -bor $SWP_NOMOVE -bor $SWP_NOACTIVATE -bor $SWP_NOZORDER)
     $hwndBottom = [IntPtr]1
-    [ScreenshotTool.Native]::ShowWindow($hwnd, $SW_RESTORE) | Out-Null
+    $flags = [uint32]($SWP_NOSIZE -bor $SWP_NOMOVE -bor $SWP_NOACTIVATE)
+    [ScreenshotTool.Native]::ShowWindow($hwnd, $SW_SHOWNOACTIVATE) | Out-Null
     [ScreenshotTool.Native]::SetWindowPos($hwnd, $hwndBottom, 0, 0, 0, 0, $flags) | Out-Null
     Start-Sleep -Milliseconds 300
     $updatedRect = New-Object ScreenshotTool.Native+RECT
@@ -720,8 +719,12 @@ function Capture-Window {
     $region = $Target.region
     $captureX += [int]$region.x
     $captureY += [int]$region.y
-    $captureWidth = [int]$region.width
-    $captureHeight = [int]$region.height
+    # Clamp the region so it doesn't extend past the window bounds.
+    # Without this, CopyFromScreen returns black pixels for out-of-bounds areas.
+    $maxWidth = [int]$windowRect.width - [int]$region.x
+    $maxHeight = [int]$windowRect.height - [int]$region.y
+    $captureWidth = [Math]::Max(1, [Math]::Min([int]$region.width, $maxWidth))
+    $captureHeight = [Math]::Max(1, [Math]::Min([int]$region.height, $maxHeight))
   }
 
   $rect = [ordered]@{
