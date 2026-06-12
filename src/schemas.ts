@@ -54,7 +54,8 @@ export const launchAppSchema = z.object({
   args: z.array(z.string()).optional().default([]),
   cwd: z.string().min(1).optional(),
   waitForWindow: z.boolean().optional().default(true),
-  timeoutMs: optionalTimeout.default(10000)
+  timeoutMs: optionalTimeout.default(10000),
+  startMinimized: z.boolean().optional().default(false)
 });
 
 export const listWindowsSchema = z.object({
@@ -70,6 +71,7 @@ export const captureWindowSchema = z.object({
   titleContains: z.string().min(1).optional(),
   region: regionSchema.optional(),
   focus: z.boolean().optional().default(true),
+  captureMethod: z.enum(["screen", "print"]).optional().default("screen"),
   outputPath: z.string().min(1).optional()
 }).refine(
   (value) => value.hwnd !== undefined || value.pid !== undefined || value.processName !== undefined || value.titleContains !== undefined,
@@ -171,7 +173,8 @@ export const toolInputSchemas = {
       args: { type: "array", items: { type: "string" }, description: "Process arguments as an array." },
       cwd: { type: "string", description: "Optional working directory for the process." },
       waitForWindow: { type: "boolean", default: true, description: "Wait for the first visible window for the process." },
-      timeoutMs: { type: "integer", minimum: 100, maximum: 120000, default: 10000 }
+      timeoutMs: { type: "integer", minimum: 100, maximum: 120000, default: 10000 },
+      startMinimized: { type: "boolean", default: false, description: "Start the process minimized. The window will not appear on top." }
     },
     required: ["exePath"],
     additionalProperties: false
@@ -205,6 +208,7 @@ export const toolInputSchemas = {
         description: "Optional rectangle relative to the target window top-left corner."
       },
       focus: { type: "boolean", default: true, description: "Bring the window to the foreground before capturing. Set false to preserve open menus, popups, or transient UI." },
+      captureMethod: { type: "string", enum: ["screen", "print"], default: "screen", description: "Capture method: 'screen' uses CopyFromScreen (needs visible area), 'print' uses PrintWindow API (captures window content even behind other windows)." },
       outputPath: { type: "string", description: "Optional absolute PNG output path." }
     },
     additionalProperties: false
@@ -292,7 +296,7 @@ export const toolInputSchemas = {
       pid: { type: "integer", minimum: 1 },
       processName: { type: "string" },
       titleContains: { type: "string" },
-      text: { type: "string", minLength: 1, description: "Text to type into the target window." },
+      text: { type: "string", minLength: 1, description: "Text to type into the target window. Sent via SendInput Unicode, so any Unicode character including CJK is supported." },
       delayMs: { type: "integer", minimum: 0, maximum: 10000, default: 50, description: "Delay between keystrokes in milliseconds." },
       pressMs: { type: "integer", minimum: 0, maximum: 5000, default: 30, description: "Duration of each key press in milliseconds." }
     },

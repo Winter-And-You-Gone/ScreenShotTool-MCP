@@ -1,6 +1,9 @@
 param(
-  [Parameter(Mandatory = $true)]
-  [string]$InputJson
+  [Parameter(Mandatory = $false)]
+  [string]$InputJson,
+
+  [Parameter(Mandatory = $false)]
+  [switch]$Worker
 )
 
 $ErrorActionPreference = "Stop"
@@ -67,6 +70,9 @@ namespace ScreenshotTool {
     public static extern bool SetForegroundWindow(IntPtr hWnd);
 
     [DllImport("user32.dll")]
+    public static extern IntPtr GetForegroundWindow();
+
+    [DllImport("user32.dll")]
     public static extern bool BringWindowToTop(IntPtr hWnd);
 
     [DllImport("user32.dll")]
@@ -77,6 +83,48 @@ namespace ScreenshotTool {
 
     [DllImport("user32.dll")]
     public static extern void keybd_event(byte bVk, byte bScan, uint dwFlags, UIntPtr dwExtraInfo);
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct KEYBDINPUT {
+      public ushort wVk;
+      public ushort wScan;
+      public uint dwFlags;
+      public uint time;
+      public IntPtr dwExtraInfo;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct MOUSEINPUT {
+      public int dx;
+      public int dy;
+      public uint mouseData;
+      public uint dwFlags;
+      public uint time;
+      public IntPtr dwExtraInfo;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct HARDWAREINPUT {
+      public uint uMsg;
+      public ushort wParamL;
+      public ushort wParamH;
+    }
+
+    [StructLayout(LayoutKind.Explicit)]
+    public struct INPUT_UNION {
+      [FieldOffset(0)] public MOUSEINPUT mi;
+      [FieldOffset(0)] public KEYBDINPUT ki;
+      [FieldOffset(0)] public HARDWAREINPUT hi;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct INPUT {
+      public uint type;
+      public INPUT_UNION u;
+    }
+
+    [DllImport("user32.dll", SetLastError = true)]
+    public static extern uint SendInput(uint nInputs, [In] INPUT[] pInputs, int cbSize);
 
     [DllImport("user32.dll")]
     public static extern bool PostMessage(IntPtr hWnd, uint Msg, IntPtr wParam, IntPtr lParam);
@@ -110,6 +158,36 @@ namespace ScreenshotTool {
 
     [DllImport("user32.dll")]
     public static extern uint MapVirtualKey(uint uCode, uint uMapType);
+
+    [DllImport("user32.dll")]
+    public static extern bool PrintWindow(IntPtr hWnd, IntPtr hdcBlt, uint nFlags);
+
+    [DllImport("user32.dll")]
+    public static extern IntPtr GetDC(IntPtr hWnd);
+
+    [DllImport("user32.dll")]
+    public static extern IntPtr GetWindowDC(IntPtr hWnd);
+
+    [DllImport("user32.dll")]
+    public static extern int ReleaseDC(IntPtr hWnd, IntPtr hdc);
+
+    [DllImport("gdi32.dll")]
+    public static extern IntPtr CreateCompatibleDC(IntPtr hdc);
+
+    [DllImport("gdi32.dll")]
+    public static extern bool DeleteDC(IntPtr hdc);
+
+    [DllImport("gdi32.dll")]
+    public static extern IntPtr CreateCompatibleBitmap(IntPtr hdc, int cx, int cy);
+
+    [DllImport("gdi32.dll")]
+    public static extern IntPtr SelectObject(IntPtr hdc, IntPtr hgdiobj);
+
+    [DllImport("gdi32.dll")]
+    public static extern bool DeleteObject(IntPtr hObject);
+
+    [DllImport("dwmapi.dll")]
+    public static extern int DwmGetWindowAttribute(IntPtr hWnd, uint dwAttribute, out int pvAttribute, int cbAttribute);
 
     [StructLayout(LayoutKind.Sequential)]
     public struct POINT {
@@ -256,6 +334,84 @@ function Get-VisibleWindows {
   return @($windows.ToArray())
 }
 
+function Test-WindowCloaked {
+  param([IntPtr]$Hwnd)
+
+  $DWMWA_CLOAKED = [uint32]14
+  $cloaked = 0
+  $hr = [ScreenshotTool.Native]::DwmGetWindowAttribute($Hwnd, $DWMWA_CLOAKED, [ref]$cloaked, 4)
+  if ($hr -ne 0) {
+    return $false
+  }
+  return $cloaked -ne 0
+}
+
+function Get-AllWindows {
+  $windows = [System.Collections.ArrayList]::new()
+  $excludedClasses = @(
+    'ApplicationFrameWindow_skip',
+    'Windows.UI.Core.CoreWindow',
+    'Shell_TrayWnd',
+    'Shell_SecondaryTrayWnd',
+    'WorkerW',
+    'Progman',
+    'TaskListThumbnailWnd',
+    'MSCTFIME UI',
+    'IME'
+  )
+
+  $callback = [ScreenshotTool.Native+EnumWindowsProc]{
+    param([IntPtr]$Hwnd, [IntPtr]$LParam)
+
+    if (Test-WindowCloaked $Hwnd) {
+      return $true
+    }
+
+    $className = Get-WindowClassName $Hwnd
+    if ($excludedClasses -contains $className) {
+      return $true
+    }
+
+    $title = Get-WindowTitle $Hwnd
+    $isVisible = [bool][ScreenshotTool.Native]::IsWindowVisible($Hwnd)
+    $isIconic = [bool][ScreenshotTool.Native]::IsIconic($Hwnd)
+
+    if ([string]::IsNullOrWhiteSpace($title) -and -not $isIconic) {
+      return $true
+    }
+
+    $rect = New-Object ScreenshotTool.Native+RECT
+    if (-not [ScreenshotTool.Native]::GetWindowRect($Hwnd, [ref]$rect)) {
+      return $true
+    }
+    $width = [Math]::Max(0, $rect.Right - $rect.Left)
+    $height = [Math]::Max(0, $rect.Bottom - $rect.Top)
+
+    if (-not $isIconic -and ($width -le 0 -or $height -le 0)) {
+      return $true
+    }
+
+    $pidValue = [uint32]0
+    [ScreenshotTool.Native]::GetWindowThreadProcessId($Hwnd, [ref]$pidValue) | Out-Null
+
+    $windows.Add([ordered]@{
+      hwnd = $Hwnd.ToInt64().ToString()
+      title = $title
+      pid = [int]$pidValue
+      processName = Get-WindowProcessName $pidValue
+      className = $className
+      rect = Get-RectObject $rect
+      visible = $isVisible
+      iconic = $isIconic
+    }) | Out-Null
+
+    return $true
+  }
+
+  [ScreenshotTool.Native]::EnumWindows($callback, [IntPtr]::Zero) | Out-Null
+  return @($windows.ToArray())
+}
+
 function Normalize-ProcessName {
   param([string]$Name)
 
@@ -268,47 +424,49 @@ function Normalize-ProcessName {
 
 function Filter-Windows {
   param(
-    [array]$Windows,
+    $Windows,
     [hashtable]$Filters
   )
 
-  $items = @($Windows)
-
-  if ($Filters.ContainsKey("pid") -and $null -ne $Filters.pid) {
-    $pidValue = [int]$Filters.pid
-    $items = @($items | Where-Object { $_.pid -eq $pidValue })
+  $result = @()
+  foreach ($win in $Windows) {
+    if ($Filters.ContainsKey("pid") -and $null -ne $Filters.pid) {
+      if ($win.pid -ne [int]$Filters.pid) { continue }
+    }
+    if ($Filters.ContainsKey("processName") -and -not [string]::IsNullOrWhiteSpace($Filters.processName)) {
+      $processName = Normalize-ProcessName $Filters.processName
+      if ($win.processName -ine $processName) { continue }
+    }
+    if ($Filters.ContainsKey("titleContains") -and -not [string]::IsNullOrWhiteSpace($Filters.titleContains)) {
+      $needle = [string]$Filters.titleContains
+      if ($win.title.IndexOf($needle, [StringComparison]::OrdinalIgnoreCase) -lt 0) { continue }
+    }
+    $result += $win
   }
-
-  if ($Filters.ContainsKey("processName") -and -not [string]::IsNullOrWhiteSpace($Filters.processName)) {
-    $processName = Normalize-ProcessName $Filters.processName
-    $items = @($items | Where-Object { $_.processName -ieq $processName })
-  }
-
-  if ($Filters.ContainsKey("titleContains") -and -not [string]::IsNullOrWhiteSpace($Filters.titleContains)) {
-    $needle = [string]$Filters.titleContains
-    $items = @($items | Where-Object { $_.title.IndexOf($needle, [StringComparison]::OrdinalIgnoreCase) -ge 0 })
-  }
-
-  return @($items)
+  return $result
 }
 
 function Resolve-TargetWindow {
-  param([hashtable]$Target)
+  param(
+    [hashtable]$Target,
+    [switch]$IncludeHidden
+  )
 
-  $windows = Get-VisibleWindows
+  $windows = if ($IncludeHidden) { Get-AllWindows } else { Get-VisibleWindows }
+  if ($null -eq $windows) { $windows = @() }
+  $windows = @($windows)
 
   if ($Target.ContainsKey("hwnd") -and $null -ne $Target.hwnd) {
     $hwndText = ([string]$Target.hwnd).Trim()
-    $match = @($windows | Where-Object { $_.hwnd -eq $hwndText }) | Select-Object -First 1
-    if ($null -ne $match) {
-      return $match
+    foreach ($w in $windows) {
+      if ($w.hwnd -eq $hwndText) { return $w }
     }
-    throw "No visible window found for hwnd $hwndText."
+    throw "No window found for hwnd $hwndText."
   }
 
-  $filtered = Filter-Windows $windows $Target
+  $filtered = @(Filter-Windows $windows $Target)
   if ($filtered.Count -lt 1) {
-    throw "No visible window matched the provided target."
+    throw "No window matched the provided target."
   }
 
   return $filtered[0]
@@ -374,18 +532,181 @@ function Save-Screenshot {
   }
 }
 
+function Capture-WindowPrint {
+  param(
+    [object]$Window,
+    [hashtable]$Region,
+    [string]$OutputPath
+  )
+
+  $hwnd = [IntPtr]([int64]$Window.hwnd)
+  $windowRect = $Window.rect
+
+  $wasIconic = $false
+  if ($Window.iconic) {
+    $wasIconic = $true
+    $SW_RESTORE = 9
+    $SWP_NOSIZE = 0x0001
+    $SWP_NOMOVE = 0x0002
+    $SWP_NOACTIVATE = 0x0010
+    $SWP_NOZORDER = 0x0004
+    $flags = [uint32]($SWP_NOSIZE -bor $SWP_NOMOVE -bor $SWP_NOACTIVATE -bor $SWP_NOZORDER)
+    $hwndBottom = [IntPtr]1
+    [ScreenshotTool.Native]::ShowWindow($hwnd, $SW_RESTORE) | Out-Null
+    [ScreenshotTool.Native]::SetWindowPos($hwnd, $hwndBottom, 0, 0, 0, 0, $flags) | Out-Null
+    Start-Sleep -Milliseconds 300
+    $updatedRect = New-Object ScreenshotTool.Native+RECT
+    [ScreenshotTool.Native]::GetWindowRect($hwnd, [ref]$updatedRect) | Out-Null
+    $windowRect = Get-RectObject $updatedRect
+  }
+
+  $fullWidth = [int]$windowRect.width
+  $fullHeight = [int]$windowRect.height
+
+  if ($fullWidth -le 0 -or $fullHeight -le 0) {
+    throw "Window has no measurable area."
+  }
+
+  $directory = Split-Path -Parent $OutputPath
+  if ($directory) {
+    New-Item -ItemType Directory -Force -Path $directory | Out-Null
+  }
+
+  $captureX = 0
+  $captureY = 0
+  $captureWidth = $fullWidth
+  $captureHeight = $fullHeight
+
+  if ($null -ne $Region) {
+    $captureX = [Math]::Max(0, [int]$Region.x)
+    $captureY = [Math]::Max(0, [int]$Region.y)
+    $captureWidth = [Math]::Min([int]$Region.width, $fullWidth - $captureX)
+    $captureHeight = [Math]::Min([int]$Region.height, $fullHeight - $captureY)
+
+    if ($captureWidth -le 0 -or $captureHeight -le 0) {
+      throw "Region is outside the window bounds."
+    }
+  }
+
+  try {
+    $hdcWindow = [ScreenshotTool.Native]::GetWindowDC($hwnd)
+    if ($hdcWindow -eq [IntPtr]::Zero) {
+      throw "Failed to get window DC."
+    }
+
+    try {
+      $hdcMem = [ScreenshotTool.Native]::CreateCompatibleDC($hdcWindow)
+      if ($hdcMem -eq [IntPtr]::Zero) {
+        throw "Failed to create compatible DC."
+      }
+
+      try {
+        $hBitmap = [ScreenshotTool.Native]::CreateCompatibleBitmap($hdcWindow, $fullWidth, $fullHeight)
+        if ($hBitmap -eq [IntPtr]::Zero) {
+          throw "Failed to create compatible bitmap."
+        }
+
+        try {
+          $hOldBitmap = [ScreenshotTool.Native]::SelectObject($hdcMem, $hBitmap)
+          $PW_RENDERFULLCONTENT = [uint32]0x00000002
+
+          if (-not [ScreenshotTool.Native]::PrintWindow($hwnd, $hdcMem, $PW_RENDERFULLCONTENT)) {
+            if (-not [ScreenshotTool.Native]::PrintWindow($hwnd, $hdcMem, [uint32]0)) {
+              throw "PrintWindow failed for this window. The window may not support WM_PRINT."
+            }
+          }
+
+          $fullBitmap = [System.Drawing.Image]::FromHbitmap($hBitmap)
+
+          try {
+            if ($captureWidth -ne $fullWidth -or $captureHeight -ne $fullHeight -or $captureX -ne 0 -or $captureY -ne 0) {
+              $croppedBitmap = New-Object System.Drawing.Bitmap $captureWidth, $captureHeight
+              $graphics = [System.Drawing.Graphics]::FromImage($croppedBitmap)
+              try {
+                $graphics.DrawImage($fullBitmap, -$captureX, -$captureY)
+                $croppedBitmap.Save($OutputPath, [System.Drawing.Imaging.ImageFormat]::Png)
+              } finally {
+                $graphics.Dispose()
+                $croppedBitmap.Dispose()
+              }
+            } else {
+              $fullBitmap.Save($OutputPath, [System.Drawing.Imaging.ImageFormat]::Png)
+            }
+          } finally {
+            $fullBitmap.Dispose()
+          }
+        } finally {
+          if ($hOldBitmap -ne [IntPtr]::Zero) {
+            [ScreenshotTool.Native]::SelectObject($hdcMem, $hOldBitmap) | Out-Null
+          }
+          [ScreenshotTool.Native]::DeleteObject($hBitmap) | Out-Null
+        }
+      } finally {
+        [ScreenshotTool.Native]::DeleteDC($hdcMem) | Out-Null
+      }
+    } finally {
+      [ScreenshotTool.Native]::ReleaseDC($hwnd, $hdcWindow) | Out-Null
+    }
+  } finally {
+    if ($wasIconic) {
+      $SW_MINIMIZE = 6
+      [ScreenshotTool.Native]::ShowWindow($hwnd, $SW_MINIMIZE) | Out-Null
+    }
+  }
+
+  $screenX = [int]$windowRect.x + $captureX
+  $screenY = [int]$windowRect.y + $captureY
+
+  $rect = [ordered]@{
+    x = $screenX
+    y = $screenY
+    width = $captureWidth
+    height = $captureHeight
+    left = $screenX
+    top = $screenY
+    right = $screenX + $captureWidth
+    bottom = $screenY + $captureHeight
+  }
+
+  return [ordered]@{
+    path = (Resolve-Path $OutputPath).Path
+    width = $captureWidth
+    height = $captureHeight
+    target = "window:" + $Window.hwnd
+    rect = $rect
+    timestamp = (Get-Date).ToUniversalTime().ToString("o")
+  }
+}
+
 function Capture-Window {
   param(
     [hashtable]$Target,
     [string]$OutputPath
   )
 
-  $window = Resolve-TargetWindow $Target
+  $captureMethod = "screen"
+  if ($Target.ContainsKey("captureMethod") -and $null -ne $Target.captureMethod) {
+    $captureMethod = ([string]$Target.captureMethod).ToLowerInvariant()
+  }
+
+  $includeHidden = ($captureMethod -eq "print")
+  $window = Resolve-TargetWindow -Target $Target -IncludeHidden:$includeHidden
+
+  if ($captureMethod -eq "print") {
+    $region = $null
+    if ($Target.ContainsKey("region") -and $null -ne $Target.region) {
+      $region = $Target.region
+    }
+    return Capture-WindowPrint -Window $window -Region $region -OutputPath $OutputPath
+  }
+
   $focus = $true
   if ($Target.ContainsKey("focus") -and $null -ne $Target.focus) {
     $focus = [bool]$Target.focus
   }
+  $previousForeground = [IntPtr]::Zero
   if ($focus) {
+    $previousForeground = [ScreenshotTool.Native]::GetForegroundWindow()
     Focus-Window $window
   }
   $windowRect = $window.rect
@@ -414,7 +735,13 @@ function Capture-Window {
     bottom = $captureY + $captureHeight
   }
 
-  return Save-Screenshot -X $captureX -Y $captureY -Width $captureWidth -Height $captureHeight -OutputPath $OutputPath -Target ("window:" + $window.hwnd) -Rect $rect
+  try {
+    return Save-Screenshot -X $captureX -Y $captureY -Width $captureWidth -Height $captureHeight -OutputPath $OutputPath -Target ("window:" + $window.hwnd) -Rect $rect
+  } finally {
+    if ($focus -and $previousForeground -ne [IntPtr]::Zero -and $previousForeground -ne ([IntPtr]([int64]$window.hwnd))) {
+      [ScreenshotTool.Native]::SetForegroundWindow($previousForeground) | Out-Null
+    }
+  }
 }
 
 function Capture-ScreenRegion {
@@ -1093,6 +1420,34 @@ function Send-Key {
   }
 }
 
+function Send-UnicodeChar {
+  param([uint16]$Scan)
+
+  $INPUT_KEYBOARD = [uint32]1
+  $KEYEVENTF_KEYUP = [uint32]0x0002
+  $KEYEVENTF_UNICODE = [uint32]0x0004
+
+  $down = New-Object ScreenshotTool.Native+INPUT
+  $down.type = $INPUT_KEYBOARD
+  $down.u.ki.wVk = [uint16]0
+  $down.u.ki.wScan = $Scan
+  $down.u.ki.dwFlags = $KEYEVENTF_UNICODE
+  $down.u.ki.time = [uint32]0
+  $down.u.ki.dwExtraInfo = [IntPtr]::Zero
+
+  $up = New-Object ScreenshotTool.Native+INPUT
+  $up.type = $INPUT_KEYBOARD
+  $up.u.ki.wVk = [uint16]0
+  $up.u.ki.wScan = $Scan
+  $up.u.ki.dwFlags = ($KEYEVENTF_UNICODE -bor $KEYEVENTF_KEYUP)
+  $up.u.ki.time = [uint32]0
+  $up.u.ki.dwExtraInfo = [IntPtr]::Zero
+
+  $inputs = [ScreenshotTool.Native+INPUT[]]@($down, $up)
+  $sent = [ScreenshotTool.Native]::SendInput([uint32]2, $inputs, [System.Runtime.InteropServices.Marshal]::SizeOf([type]([ScreenshotTool.Native+INPUT])))
+  return $sent -eq 2
+}
+
 function Type-Text {
   param([hashtable]$Target)
 
@@ -1109,34 +1464,18 @@ function Type-Text {
   }
 
   $text = [string]$Target.text
-  $KEYEVENTF_KEYDOWN = 0x0000
-  $KEYEVENTF_KEYUP = 0x0002
-  $VK_SHIFT = 0x10
-
   $skipped = [System.Collections.ArrayList]::new()
 
   foreach ($ch in $text.ToCharArray()) {
-    $chText = [string]$ch
-    $stroke = Resolve-CharacterKey $chText
-    if ($null -eq $stroke) {
+    $scan = [uint16][int][char]$ch
+    if (-not (Send-UnicodeChar -Scan $scan)) {
       $skipped.Add([string]$ch) | Out-Null
       continue
     }
-    $vk = [byte]$stroke.vk
-    $needShift = [bool]$stroke.shift
 
-    if ($needShift) {
-      [ScreenshotTool.Native]::keybd_event($VK_SHIFT, 0, $KEYEVENTF_KEYDOWN, [UIntPtr]::Zero)
+    if ($pressMs -gt 0) {
+      Start-Sleep -Milliseconds $pressMs
     }
-
-    [ScreenshotTool.Native]::keybd_event($vk, 0, $KEYEVENTF_KEYDOWN, [UIntPtr]::Zero)
-    Start-Sleep -Milliseconds $pressMs
-    [ScreenshotTool.Native]::keybd_event($vk, 0, $KEYEVENTF_KEYUP, [UIntPtr]::Zero)
-
-    if ($needShift) {
-      [ScreenshotTool.Native]::keybd_event($VK_SHIFT, 0, $KEYEVENTF_KEYUP, [UIntPtr]::Zero)
-    }
-
     if ($delayMs -gt 0) {
       Start-Sleep -Milliseconds $delayMs
     }
@@ -1154,43 +1493,123 @@ function Type-Text {
   }
 }
 
-try {
-  $request = ConvertTo-Hashtable ($InputJson | ConvertFrom-Json)
+function Minimize-Window {
+  param([hashtable]$Target)
 
-  switch ($request.action) {
+  $window = Resolve-TargetWindow -Target $Target -IncludeHidden
+  $hwnd = [IntPtr]([int64]$window.hwnd)
+  $SW_MINIMIZE = 6
+  $ok = [bool][ScreenshotTool.Native]::ShowWindow($hwnd, $SW_MINIMIZE)
+
+  return [ordered]@{
+    minimized = $ok
+    target = "window:" + $window.hwnd
+    hwnd = $window.hwnd
+    title = $window.title
+    pid = $window.pid
+    timestamp = (Get-Date).ToUniversalTime().ToString("o")
+  }
+}
+
+function Invoke-Action {
+  param([hashtable]$Request)
+
+  switch ($Request.action) {
     "list-windows" {
       $filters = @{}
-      if ($request.ContainsKey("filters") -and $null -ne $request.filters) {
-        $filters = $request.filters
+      if ($Request.ContainsKey("filters") -and $null -ne $Request.filters) {
+        $filters = $Request.filters
       }
-      $result = @(Filter-Windows (Get-VisibleWindows) $filters)
+      return @(Filter-Windows (Get-VisibleWindows) $filters)
     }
     "capture-window" {
-      $result = Capture-Window -Target $request.target -OutputPath $request.outputPath
+      return Capture-Window -Target $Request.target -OutputPath $Request.outputPath
     }
     "capture-screen-region" {
-      $result = Capture-ScreenRegion -Region $request.region -OutputPath $request.outputPath
+      return Capture-ScreenRegion -Region $Request.region -OutputPath $Request.outputPath
     }
     "click-window" {
-      $result = Click-Window -Target $request.target
+      return Click-Window -Target $Request.target
     }
     "click-menu-item" {
-      $result = Click-MenuItem -Target $request.target
+      return Click-MenuItem -Target $Request.target
     }
     "move-mouse-window" {
-      $result = Move-MouseWindow -Target $request.target
+      return Move-MouseWindow -Target $Request.target
     }
     "type-text" {
-      $result = Type-Text -Target $request.target
+      return Type-Text -Target $Request.target
     }
     "send-key" {
-      $result = Send-Key -Target $request.target
+      return Send-Key -Target $Request.target
+    }
+    "minimize-window" {
+      return Minimize-Window -Target $Request.target
     }
     default {
-      throw "Unknown action: $($request.action)"
+      throw "Unknown action: $($Request.action)"
     }
   }
+}
 
+if ($Worker) {
+  # Long-running worker mode: read newline-delimited JSON requests from stdin,
+  # write newline-delimited JSON responses to stdout. Each response is one line:
+  #   { "ok": true,  "result": ... }
+  #   { "ok": false, "error": "..." }
+  # An empty line or EOF terminates the worker cleanly.
+  try {
+    while ($true) {
+      $line = [Console]::In.ReadLine()
+      if ($null -eq $line) { break }
+      $line = $line.Trim()
+      if ($line.Length -eq 0) { continue }
+
+      $response = $null
+      $isArrayResult = $false
+      try {
+        $request = ConvertTo-Hashtable ($line | ConvertFrom-Json)
+        $result = Invoke-Action -Request $request
+        # Track whether the action returns a list so we can emit [] (not {}) for empty.
+        $isArrayResult = ($request.action -eq "list-windows")
+        $response = [ordered]@{ ok = $true; result = $result }
+      } catch {
+        $isArrayResult = $false
+        $response = [ordered]@{ ok = $false; error = $_.Exception.ToString() }
+      }
+
+      $json = if ($response.ok -and $isArrayResult) {
+        $items = @($response.result)
+        if ($items.Count -eq 0) {
+          '{"ok":true,"result":[]}'
+        } elseif ($items.Count -eq 1) {
+          $itemJson = ConvertTo-Json -InputObject $items[0] -Depth 8 -Compress
+          '{"ok":true,"result":[' + $itemJson + ']}'
+        } else {
+          $arrJson = ConvertTo-Json -InputObject $items -Depth 8 -Compress
+          '{"ok":true,"result":' + $arrJson + '}'
+        }
+      } else {
+        ConvertTo-Json -InputObject $response -Depth 8 -Compress
+      }
+      [Console]::Out.WriteLine($json)
+      [Console]::Out.Flush()
+    }
+  } catch {
+    Write-Error $_.Exception.ToString()
+    exit 1
+  }
+  exit 0
+}
+
+if ([string]::IsNullOrEmpty($InputJson)) {
+  Write-Error "InputJson is required when -Worker is not set."
+  exit 1
+}
+
+try {
+  $request = ConvertTo-Hashtable ($InputJson | ConvertFrom-Json)
+  $result = Invoke-Action -Request $request
   ConvertTo-Json -InputObject $result -Depth 8 -Compress
 } catch {
   Write-Error $_.Exception.ToString()

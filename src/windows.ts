@@ -128,6 +128,7 @@ type HelperRequest =
   | { action: "click-menu-item"; target: ClickMenuItemInput }
   | { action: "type-text"; target: TypeTextInput }
   | { action: "send-key"; target: SendKeyInput }
+  | { action: "minimize-window"; target: { hwnd: string } }
 
 export function getDefaultOutputDir(): string {
   return defaultOutputDir
@@ -185,11 +186,35 @@ export async function launchApp(input: LaunchAppInput): Promise<{ pid: number; w
     throw new Error("Failed to start process.");
   }
 
+  const exitState: { exited: boolean; code: number | null; signal: NodeJS.Signals | null } = {
+    exited: false,
+    code: null,
+    signal: null
+  };
+  child.on("exit", (code, signal) => {
+    exitState.exited = true;
+    exitState.code = code;
+    exitState.signal = signal;
+  });
+
   if (!input.waitForWindow) {
     return { pid: child.pid, window: null };
   }
 
-  const window = await waitForWindow(child.pid, processName, existingHwnds, input.timeoutMs);
+  const window = await waitForWindow(child.pid, processName, existingHwnds, input.timeoutMs, exitState);
+
+  if (window === null && exitState.exited) {
+    throw new Error(`Process exited before a window appeared (pid=${child.pid}, code=${exitState.code}, signal=${exitState.signal ?? "none"}).`);
+  }
+
+  if (input.startMinimized && window) {
+    try {
+      await minimizeWindow(window.hwnd);
+    } catch (error) {
+      console.error(`startMinimized failed for hwnd ${window.hwnd}: ${formatSpawnError(error)}`);
+    }
+  }
+
   return { pid: child.pid, window };
 }
 
@@ -234,10 +259,20 @@ export async function clickMenuItem(input: ClickMenuItemInput): Promise<ClickMen
   return runHelper<ClickMenuItemResult>({ action: "click-menu-item", target: input });
 }
 
-async function waitForWindow(pid: number, processName: string, existingHwnds: Set<string>, timeoutMs: number): Promise<WindowInfo | null> {
+async function waitForWindow(
+  pid: number,
+  processName: string,
+  existingHwnds: Set<string>,
+  timeoutMs: number,
+  exitState?: { exited: boolean }
+): Promise<WindowInfo | null> {
   const deadline = Date.now() + timeoutMs;
 
   while (Date.now() < deadline) {
+    if (exitState?.exited) {
+      return null;
+    }
+
     const processWindows = await listWindows({ pid });
     if (processWindows.length > 0) {
       return processWindows[0];
@@ -312,74 +347,224 @@ async function spawnApp(input: LaunchAppInput, cwd?: string): Promise<ReturnType
     throw new Error(`Failed to start process: ${formatSpawnError(error)}`);
   });
 
-  child.on("error", () => undefined);
+  child.on("error", (error: Error) => {
+    console.error(`Child process error (pid=${child.pid ?? "unknown"}): ${error.message}`);
+  });
   child.unref();
   return child;
 }
 
 const HELPER_TIMEOUT_MS = 60000;
 
-async function runHelper<T>(request: HelperRequest): Promise<T> {
-  await access(helperPath, fsConstants.R_OK);
+type WorkerResponseOk = { ok: true; result: unknown };
+type WorkerResponseErr = { ok: false; error: string };
+type WorkerResponse = WorkerResponseOk | WorkerResponseErr;
 
-  const inputJson = JSON.stringify(request);
-  const child = spawn(powershellCommand, [
-    "-NoProfile",
-    "-ExecutionPolicy",
-    "Bypass",
-    "-File",
-    helperPath,
-    "-InputJson",
-    inputJson
-  ], {
-    shell: false,
-    stdio: ["ignore", "pipe", "pipe"],
-    windowsHide: true
-  });
+type PendingRequest = {
+  resolve: (value: unknown) => void;
+  reject: (reason: Error) => void;
+  action: string;
+  timeout: ReturnType<typeof setTimeout>;
+};
 
-  let stdout = "";
-  let stderr = "";
+type Worker = {
+  child: ReturnType<typeof spawn>;
+  stdoutBuffer: string;
+  stderrBuffer: string;
+  queue: PendingRequest[];
+  exited: boolean;
+  killing: boolean;
+};
 
-  child.stdout.setEncoding("utf8");
-  child.stderr.setEncoding("utf8");
-  child.stdout.on("data", (chunk: string) => {
-    stdout += chunk;
-  });
-  child.stderr.on("data", (chunk: string) => {
-    stderr += chunk;
-  });
+let activeWorker: Worker | null = null;
+let workerStarting: Promise<Worker> | null = null;
 
-  let timeoutId: ReturnType<typeof setTimeout> | undefined;
-  const timeoutRejection = new Promise<never>((_resolve, reject) => {
-    timeoutId = setTimeout(() => {
-      child.kill();
-      reject(new Error(`PowerShell helper timed out after ${HELPER_TIMEOUT_MS}ms.`));
-    }, HELPER_TIMEOUT_MS);
-  });
+async function getWorker(): Promise<Worker> {
+  if (activeWorker && !activeWorker.exited) {
+    return activeWorker;
+  }
+  if (workerStarting) {
+    return workerStarting;
+  }
 
-  let exitCode: number | null;
-  try {
-    exitCode = await Promise.race([
-      timeoutRejection,
-      new Promise<number | null>((resolve, reject) => {
-        child.on("error", reject);
-        child.on("close", resolve);
-      }),
-    ]);
-  } finally {
-    if (timeoutId) {
-      clearTimeout(timeoutId);
+  workerStarting = (async (): Promise<Worker> => {
+    await access(helperPath, fsConstants.R_OK);
+
+    const child = spawn(powershellCommand, [
+      "-NoProfile",
+      "-ExecutionPolicy",
+      "Bypass",
+      "-File",
+      helperPath,
+      "-Worker"
+    ], {
+      shell: false,
+      stdio: ["pipe", "pipe", "pipe"],
+      windowsHide: true
+    });
+
+    const worker: Worker = {
+      child,
+      stdoutBuffer: "",
+      stderrBuffer: "",
+      queue: [],
+      exited: false,
+      killing: false
+    };
+
+    if (!child.stdout || !child.stderr || !child.stdin) {
+      throw new Error("Failed to attach pipes to PowerShell worker.");
     }
-  }
 
-  if (exitCode !== 0) {
-    throw new Error((stderr || stdout || `PowerShell helper exited with code ${exitCode}.`).trim());
-  }
+    child.stdout.setEncoding("utf8");
+    child.stderr.setEncoding("utf8");
+
+    child.stdout.on("data", (chunk: string) => {
+      worker.stdoutBuffer += chunk;
+      let newlineIndex: number;
+      while ((newlineIndex = worker.stdoutBuffer.indexOf("\n")) >= 0) {
+        const line = worker.stdoutBuffer.slice(0, newlineIndex).trim();
+        worker.stdoutBuffer = worker.stdoutBuffer.slice(newlineIndex + 1);
+        if (line.length === 0) continue;
+
+        const pending = worker.queue.shift();
+        if (!pending) {
+          // Stray output without a pending request — log and drop.
+          console.error(`PowerShell worker emitted unsolicited line: ${line}`);
+          continue;
+        }
+
+        clearTimeout(pending.timeout);
+        try {
+          const response = JSON.parse(line) as WorkerResponse;
+          if (response.ok) {
+            pending.resolve(response.result);
+          } else {
+            pending.reject(new Error(response.error || `PowerShell helper failed (action=${pending.action}).`));
+          }
+        } catch (error) {
+          pending.reject(new Error(
+            `PowerShell helper returned invalid JSON (action=${pending.action}): ${(error as Error).message}\nline: ${line}`
+          ));
+        }
+      }
+    });
+
+    child.stderr.on("data", (chunk: string) => {
+      worker.stderrBuffer += chunk;
+      // Keep buffer bounded to avoid unbounded growth on a chatty worker.
+      if (worker.stderrBuffer.length > 16384) {
+        worker.stderrBuffer = worker.stderrBuffer.slice(-8192);
+      }
+    });
+
+    const teardown = (reason: Error) => {
+      worker.exited = true;
+      const pending = worker.queue.splice(0);
+      for (const req of pending) {
+        clearTimeout(req.timeout);
+        req.reject(reason);
+      }
+      if (activeWorker === worker) {
+        activeWorker = null;
+      }
+    };
+
+    child.on("close", (code, signal) => {
+      const stderrTail = worker.stderrBuffer.trim();
+      const reason = worker.killing
+        ? new Error(`PowerShell helper was killed (action timed out).`)
+        : new Error(
+            `PowerShell helper exited unexpectedly (code=${code}, signal=${signal ?? "none"})${stderrTail ? `: ${stderrTail}` : ""}.`
+          );
+      teardown(reason);
+    });
+
+    child.on("error", (error: Error) => {
+      teardown(new Error(`PowerShell helper error: ${error.message}`));
+    });
+
+    await new Promise<void>((resolve, reject) => {
+      const onSpawn = () => {
+        child.off("error", onError);
+        resolve();
+      };
+      const onError = (error: Error) => {
+        child.off("spawn", onSpawn);
+        reject(error);
+      };
+      child.once("spawn", onSpawn);
+      child.once("error", onError);
+    });
+
+    activeWorker = worker;
+    return worker;
+  })();
 
   try {
-    return JSON.parse(stdout) as T;
-  } catch (error) {
-    throw new Error(`PowerShell helper returned invalid JSON: ${(error as Error).message}\n${stdout}`);
+    return await workerStarting;
+  } finally {
+    workerStarting = null;
+  }
+}
+
+function killWorker(worker: Worker, reason: string): void {
+  if (worker.exited || worker.killing) return;
+  worker.killing = true;
+  if (typeof worker.child.pid === "number") {
+    spawnSync("taskkill.exe", ["/PID", String(worker.child.pid), "/T", "/F"], {
+      shell: false,
+      windowsHide: true
+    });
+  } else {
+    worker.child.kill("SIGKILL");
+  }
+  console.error(`PowerShell worker killed: ${reason}`);
+}
+
+async function runHelper<T>(request: HelperRequest): Promise<T> {
+  const worker = await getWorker();
+
+  if (worker.exited || !worker.child.stdin || worker.child.stdin.destroyed) {
+    activeWorker = null;
+    throw new Error(`PowerShell helper not available (action=${request.action}).`);
+  }
+
+  return new Promise<T>((resolve, reject) => {
+    const timeout = setTimeout(() => {
+      const idx = worker.queue.findIndex((req) => req.timeout === timeout);
+      if (idx >= 0) {
+        worker.queue.splice(idx, 1);
+      }
+      // The request order is broken once a request times out — restart the worker
+      // so subsequent requests get correlated with their responses again.
+      killWorker(worker, `action=${request.action} exceeded ${HELPER_TIMEOUT_MS}ms`);
+      reject(new Error(`PowerShell helper timed out after ${HELPER_TIMEOUT_MS}ms (action=${request.action}).`));
+    }, HELPER_TIMEOUT_MS);
+
+    worker.queue.push({
+      resolve: resolve as (value: unknown) => void,
+      reject,
+      action: request.action,
+      timeout
+    });
+
+    const inputLine = `${JSON.stringify(request)}\n`;
+    if (!worker.child.stdin!.write(inputLine)) {
+      // Backpressure: wait for drain. The PS worker processes line-by-line so this
+      // is rare in practice, but we still handle it for correctness.
+      worker.child.stdin!.once("drain", () => undefined);
+    }
+  });
+}
+
+export function shutdownHelper(): void {
+  if (activeWorker && !activeWorker.exited) {
+    try {
+      activeWorker.child.stdin?.end();
+    } catch {
+      // ignore
+    }
   }
 }
 
@@ -420,4 +605,8 @@ function findPowerShellCommand(): string {
   });
 
   return pwsh.status === 0 ? "pwsh.exe" : "powershell.exe";
+}
+
+function minimizeWindow(hwnd: string): Promise<unknown> {
+  return runHelper({ action: "minimize-window", target: { hwnd } });
 }

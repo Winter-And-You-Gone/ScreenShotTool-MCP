@@ -15,7 +15,13 @@
     "smoke:type-text": "tsx tests/smoke-type-text.ts",
     "smoke:menu-click": "tsx tests/smoke-menu-click.ts",
     "smoke:no-cursor-click": "tsx tests/smoke-no-cursor-click.ts",
+    "smoke:print-capture": "tsx tests/smoke-print-capture.ts",
+    "smoke:p1-fixes": "tsx tests/smoke-p1-fixes.ts",
+    "smoke:perf": "tsx tests/smoke-perf.ts",
     "inspect": "npx @modelcontextprotocol/inspector node dist/index.js"
+  },
+  "engines": {
+    "node": ">=20"
   },
   "keywords": [
     "mcp",
