@@ -8,6 +8,7 @@ param(
 
 $ErrorActionPreference = "Stop"
 [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
+[Console]::InputEncoding = [System.Text.UTF8Encoding]::new($false)
 $OutputEncoding = [Console]::OutputEncoding
 
 Add-Type -AssemblyName System.Drawing
@@ -45,7 +46,7 @@ namespace ScreenshotTool {
     [DllImport("user32.dll")]
     public static extern bool IsIconic(IntPtr hWnd);
 
-    [DllImport("user32.dll", SetLastError = true)]
+    [DllImport("user32.dll", CharSet = CharSet.Unicode, EntryPoint = "GetWindowTextW", SetLastError = true)]
     public static extern int GetWindowText(IntPtr hWnd, StringBuilder lpString, int nMaxCount);
 
     [DllImport("user32.dll", SetLastError = true)]
@@ -57,7 +58,7 @@ namespace ScreenshotTool {
     [DllImport("user32.dll", SetLastError = true)]
     public static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint lpdwProcessId);
 
-    [DllImport("user32.dll", SetLastError = true)]
+    [DllImport("user32.dll", CharSet = CharSet.Unicode, EntryPoint = "GetClassNameW", SetLastError = true)]
     public static extern int GetClassName(IntPtr hWnd, StringBuilder lpClassName, int nMaxCount);
 
     [DllImport("user32.dll")]
@@ -147,7 +148,7 @@ namespace ScreenshotTool {
     [DllImport("user32.dll")]
     public static extern int GetMenuItemCount(IntPtr hMenu);
 
-    [DllImport("user32.dll")]
+    [DllImport("user32.dll", CharSet = CharSet.Unicode, EntryPoint = "GetMenuStringW")]
     public static extern int GetMenuString(IntPtr hMenu, uint uIDItem, StringBuilder lpString, int nMaxCount, uint uFlag);
 
     [DllImport("user32.dll")]
@@ -194,6 +195,39 @@ namespace ScreenshotTool {
       public int X;
       public int Y;
     }
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct GUITHREADINFO {
+      public uint cbSize;
+      public uint flags;
+      public IntPtr hwndActive;
+      public IntPtr hwndFocus;
+      public IntPtr hwndCapture;
+      public IntPtr hwndMenuOwner;
+      public IntPtr hwndMoveSize;
+      public IntPtr hwndCaret;
+      public RECT rcCaret;
+    }
+
+    [DllImport("user32.dll", SetLastError = true)]
+    public static extern bool GetGUIThreadInfo(uint idThread, out GUITHREADINFO lpgui);
+
+    [DllImport("user32.dll")]
+    public static extern bool EnumChildWindows(IntPtr hWndParent, EnumWindowsProc lpEnumFunc, IntPtr lParam);
+
+    public delegate void WinEventProc(IntPtr hWinEventHook, uint eventType, IntPtr hwnd, int idObject, int idChild, uint dwEventThread, uint dwmsEventTime);
+
+    [DllImport("user32.dll", SetLastError = true)]
+    public static extern IntPtr SetWinEventHook(uint eventMin, uint eventMax, IntPtr hmodWinEventProc, WinEventProc lpfnWinEventProc, uint idProcess, uint idThread, uint dwFlags);
+
+    [DllImport("user32.dll", SetLastError = true)]
+    public static extern bool UnhookWinEvent(IntPtr hWinEventHook);
+
+    [DllImport("user32.dll", SetLastError = true)]
+    public static extern bool AttachThreadInput(uint idAttach, uint idAttachTo, bool fAttach);
+
+    [DllImport("kernel32.dll")]
+    public static extern uint GetCurrentThreadId();
   }
 }
 "@
@@ -688,6 +722,17 @@ function Capture-Window {
     $captureMethod = ([string]$Target.captureMethod).ToLowerInvariant()
   }
 
+  $noActivate = $false
+  if ($Target.ContainsKey("noActivate") -and $null -ne $Target.noActivate) {
+    $noActivate = [bool]$Target.noActivate
+  }
+
+  # When noActivate is requested with screen capture, switch to PrintWindow
+  # instead — no z-order juggling, no visual flash.
+  if ($noActivate -and $captureMethod -eq "screen") {
+    $captureMethod = "print"
+  }
+
   $includeHidden = ($captureMethod -eq "print")
   $window = Resolve-TargetWindow -Target $Target -IncludeHidden:$includeHidden
 
@@ -699,31 +744,14 @@ function Capture-Window {
     return Capture-WindowPrint -Window $window -Region $region -OutputPath $OutputPath
   }
 
-  $noActivate = $false
-  if ($Target.ContainsKey("noActivate") -and $null -ne $Target.noActivate) {
-    $noActivate = [bool]$Target.noActivate
-  }
-
   $focus = $true
   if ($Target.ContainsKey("focus") -and $null -ne $Target.focus) {
     $focus = [bool]$Target.focus
   }
   $hwnd = [IntPtr]([int64]$window.hwnd)
   $previousForeground = [IntPtr]::Zero
-  $raisedZ = $false
 
-  if ($noActivate) {
-    # Raise window above overlapping ones without activating, so CopyFromScreen
-    # captures the right area but the user's foreground window doesn't change.
-    $SWP_NOSIZE = [uint32]0x0001
-    $SWP_NOMOVE = [uint32]0x0002
-    $SWP_NOACTIVATE = [uint32]0x0010
-    $hwndTop = [IntPtr]0
-    $flags = $SWP_NOSIZE -bor $SWP_NOMOVE -bor $SWP_NOACTIVATE
-    [ScreenshotTool.Native]::SetWindowPos($hwnd, $hwndTop, 0, 0, 0, 0, $flags) | Out-Null
-    $raisedZ = $true
-    Start-Sleep -Milliseconds 50
-  } elseif ($focus) {
+  if ($focus) {
     $previousForeground = [ScreenshotTool.Native]::GetForegroundWindow()
     Focus-Window $window
   }
@@ -760,14 +788,7 @@ function Capture-Window {
   try {
     return Save-Screenshot -X $captureX -Y $captureY -Width $captureWidth -Height $captureHeight -OutputPath $OutputPath -Target ("window:" + $window.hwnd) -Rect $rect
   } finally {
-    if ($noActivate -and $raisedZ) {
-      $SWP_NOSIZE = [uint32]0x0001
-      $SWP_NOMOVE = [uint32]0x0002
-      $SWP_NOACTIVATE = [uint32]0x0010
-      $hwndBottom = [IntPtr]1
-      $flags = $SWP_NOSIZE -bor $SWP_NOMOVE -bor $SWP_NOACTIVATE
-      [ScreenshotTool.Native]::SetWindowPos($hwnd, $hwndBottom, 0, 0, 0, 0, $flags) | Out-Null
-    } elseif ($focus -and $previousForeground -ne [IntPtr]::Zero -and $previousForeground -ne ([IntPtr]([int64]$window.hwnd))) {
+    if ($focus -and $previousForeground -ne [IntPtr]::Zero -and $previousForeground -ne ([IntPtr]([int64]$window.hwnd))) {
       [ScreenshotTool.Native]::SetForegroundWindow($previousForeground) | Out-Null
     }
   }
@@ -1585,28 +1606,80 @@ function Type-Text {
   $skipped = [System.Collections.ArrayList]::new()
   $hwnd = [IntPtr]([int64]$window.hwnd)
 
-  foreach ($ch in $text.ToCharArray()) {
-    if ($noActivate) {
-      # PostMessage WM_CHAR — no focus needed
-      $charCode = [uint16][int][char]$ch
-      if (-not (Post-CharMessage -Hwnd $hwnd -Char $charCode)) {
-        $skipped.Add([string]$ch) | Out-Null
-        continue
-      }
-    } else {
-      # SendInput KEYEVENTF_UNICODE — requires foreground focus
-      $scan = [uint16][int][char]$ch
-      if (-not (Send-UnicodeChar -Scan $scan)) {
-        $skipped.Add([string]$ch) | Out-Null
-        continue
+  if ($noActivate) {
+    # PostMessage WM_CHAR directly to the focused child control — no
+    # activation, no flash, no foreground switch.
+    #
+    # Strategy to find the right target hwnd:
+    #   1. GetGUIThreadInfo — works when the window is in the foreground.
+    #   2. When the window is in the background, hwndFocus is NULL, so
+    #      we fall back to enumerating child windows and picking the one
+    #      whose class name looks like an edit control (Scintilla, Edit,
+    #      RichEdit, TextBox, etc.).
+    $targetHwnd = $hwnd
+    $pidValue = [uint32]0
+    $threadId = [ScreenshotTool.Native]::GetWindowThreadProcessId($hwnd, [ref]$pidValue)
+    $guiInfo = New-Object ScreenshotTool.Native+GUITHREADINFO
+    $guiInfo.cbSize = [uint32][System.Runtime.InteropServices.Marshal]::SizeOf($guiInfo)
+    if ([ScreenshotTool.Native]::GetGUIThreadInfo([uint32]$threadId, [ref]$guiInfo)) {
+      if ($guiInfo.hwndFocus -ne [IntPtr]::Zero) {
+        $targetHwnd = $guiInfo.hwndFocus
       }
     }
 
-    if ($pressMs -gt 0) {
-      Start-Sleep -Milliseconds $pressMs
+    # If GetGUIThreadInfo didn't give us a focus child (window is in
+    # the background), search for an editable child control by class name.
+    if ($targetHwnd -eq $hwnd) {
+      $editClasses = @(
+        'Scintilla', 'Edit', 'RichEdit20W', 'RichEdit20A',
+        'RICHEDIT50W', 'RichEdit', 'TextBox', 'TEXTEDIT',
+        'ATL:006C0280', 'AfxWnd42su', 'NetUIHWND'
+      )
+      $foundChild = [IntPtr]::Zero
+      $enumProc = [ScreenshotTool.Native+EnumWindowsProc]{
+        param([IntPtr]$Child, [IntPtr]$LParam)
+        $cn = New-Object System.Text.StringBuilder 256
+        [ScreenshotTool.Native]::GetClassName($Child, $cn, $cn.Capacity) | Out-Null
+        $className = $cn.ToString()
+        foreach ($ec in $editClasses) {
+          if ($className -ieq $ec) {
+            $script:foundEditChild = $Child
+            return $false
+          }
+        }
+        return $true
+      }
+      $script:foundEditChild = [IntPtr]::Zero
+      [ScreenshotTool.Native]::EnumChildWindows($hwnd, $enumProc, [IntPtr]::Zero) | Out-Null
+      if ($script:foundEditChild -ne [IntPtr]::Zero) {
+        $targetHwnd = $script:foundEditChild
+      }
     }
-    if ($delayMs -gt 0) {
-      Start-Sleep -Milliseconds $delayMs
+
+    foreach ($ch in $text.ToCharArray()) {
+      $scan = [uint16][int][char]$ch
+      if (-not (Post-CharMessage -Hwnd $targetHwnd -Char $scan)) {
+        $skipped.Add([string]$ch) | Out-Null
+        continue
+      }
+
+      if ($pressMs -gt 0) {
+        Start-Sleep -Milliseconds $pressMs
+      }
+      if ($delayMs -gt 0) {
+        Start-Sleep -Milliseconds $delayMs
+      }
+    }
+
+    return [ordered]@{
+      typed = $true
+      target = "window:" + $window.hwnd
+      hwnd = $window.hwnd
+      title = $window.title
+      pid = $window.pid
+      textLength = $text.Length
+      skipped = @($skipped.ToArray())
+      timestamp = (Get-Date).ToUniversalTime().ToString("o")
     }
   }
 
@@ -1668,6 +1741,90 @@ function NoActivate-Minimize {
   }
 }
 
+function Wait-And-Suppress {
+  param([hashtable]$Target)
+
+  # Poll for a new window from the target process and immediately push it
+  # to HWND_BOTTOM on the very first sighting — all within the same PS
+  # call so there is no round-trip delay that would let the window flash
+  # on top of other windows.
+  $targetPid = [int]$Target.pid
+  $processName = $null
+  if ($Target.ContainsKey("processName") -and -not [string]::IsNullOrWhiteSpace($Target.processName)) {
+    $processName = Normalize-ProcessName $Target.processName
+  }
+  $existingHwnds = @()
+  if ($Target.ContainsKey("existingHwnds") -and $null -ne $Target.existingHwnds) {
+    $existingHwnds = @($Target.existingHwnds | ForEach-Object { [string]$_ })
+  }
+  $timeoutMs = 10000
+  if ($Target.ContainsKey("timeoutMs") -and $null -ne $Target.timeoutMs) {
+    $timeoutMs = [int]$Target.timeoutMs
+  }
+
+  $SWP_NOSIZE = [uint32]0x0001
+  $SWP_NOMOVE = [uint32]0x0002
+  $SWP_NOACTIVATE = [uint32]0x0010
+  $hwndBottom = [IntPtr]1
+  $pushFlags = $SWP_NOSIZE -bor $SWP_NOMOVE -bor $SWP_NOACTIVATE
+
+  $deadline = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() + $timeoutMs
+  $foundWindow = $null
+
+  while ([DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() -lt $deadline) {
+    $allVisible = Get-VisibleWindows
+
+    # Try by pid first
+    $byPid = @($allVisible | Where-Object { $_.pid -eq $targetPid })
+    if ($byPid.Count -gt 0) {
+      $foundWindow = $byPid[0]
+      break
+    }
+
+    # Try by processName + new hwnd
+    if ($null -ne $processName) {
+      $byName = @($allVisible | Where-Object {
+        $_.processName -ieq $processName -and -not $existingHwnds.Contains($_.hwnd)
+      })
+      if ($byName.Count -gt 0) {
+        $foundWindow = $byName[0]
+        break
+      }
+    }
+
+    Start-Sleep -Milliseconds 50
+  }
+
+  if ($null -eq $foundWindow) {
+    return [ordered]@{
+      found = $false
+      window = $null
+    }
+  }
+
+  # Immediately push to bottom — this runs in the same PS process so
+  # the delay between detecting the window and suppressing it is <1ms.
+  $hwnd = [IntPtr]([int64]$foundWindow.hwnd)
+  [ScreenshotTool.Native]::SetWindowPos($hwnd, $hwndBottom, 0, 0, 0, 0, $pushFlags) | Out-Null
+
+  # Restore the previous foreground window.  The new window likely stole
+  # focus when it appeared.  We use the Alt-key trick to bypass the
+  # SetForegroundWindow restriction, then restore the original foreground.
+  if ($Target.ContainsKey("previousForegroundHwnd") -and $null -ne $Target.previousForegroundHwnd) {
+    $prevFg = [IntPtr]([int64]$Target.previousForegroundHwnd)
+    if ($prevFg -ne [IntPtr]::Zero -and $prevFg -ne $hwnd) {
+      [ScreenshotTool.Native]::keybd_event([byte]0x12, 0, [uint32]0, [UIntPtr]::Zero)
+      [ScreenshotTool.Native]::keybd_event([byte]0x12, 0, [uint32]2, [UIntPtr]::Zero)
+      [ScreenshotTool.Native]::SetForegroundWindow($prevFg) | Out-Null
+    }
+  }
+
+  return [ordered]@{
+    found = $true
+    window = $foundWindow
+  }
+}
+
 function Invoke-Action {
   param([hashtable]$Request)
 
@@ -1705,6 +1862,9 @@ function Invoke-Action {
     }
     "noactivate-minimize" {
       return NoActivate-Minimize -Target $Request.target
+    }
+    "wait-and-suppress" {
+      return Wait-And-Suppress -Target $Request.target
     }
     default {
       throw "Unknown action: $($Request.action)"

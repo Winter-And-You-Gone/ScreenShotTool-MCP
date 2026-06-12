@@ -16,6 +16,14 @@ import type {
   SendKeyInput
 } from "./schemas.js";
 
+export type WaitAndSuppressInput = {
+  pid: number;
+  processName?: string;
+  existingHwnds?: string[];
+  previousForegroundHwnd?: string;
+  timeoutMs?: number;
+};
+
 export type Rect = {
   x: number;
   y: number;
@@ -130,6 +138,7 @@ type HelperRequest =
   | { action: "send-key"; target: SendKeyInput }
   | { action: "minimize-window"; target: { hwnd: string } }
   | { action: "noactivate-minimize"; target: { hwnd: string } }
+  | { action: "wait-and-suppress"; target: WaitAndSuppressInput }
 
 export function getDefaultOutputDir(): string {
   return defaultOutputDir
@@ -202,18 +211,53 @@ export async function launchApp(input: LaunchAppInput): Promise<{ pid: number; w
     return { pid: child.pid, window: null };
   }
 
-  const window = await waitForWindow(child.pid, processName, existingHwnds, input.timeoutMs, exitState);
+  let window: WindowInfo | null = null;
+
+  if (input.noActivate) {
+    // Capture the current foreground hwnd so we can restore it after
+    // the new window briefly steals focus.
+    const previousFgResult = spawnSync(powershellCommand, [
+      "-NoProfile", "-Command",
+      `Add-Type -TypeDefinition 'using System; using System.Runtime.InteropServices; public static class FG { [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow(); }'; [FG]::GetForegroundWindow().ToInt64().ToString()`
+    ], { encoding: "utf8", shell: false, windowsHide: true });
+    const previousFgHwnd = previousFgResult.stdout.trim();
+
+    // Use the atomic wait-and-suppress helper via a standalone PS process
+    // (not the worker), because the Alt+keybd_event trick for restoring
+    // the foreground window requires desktop access that the hidden worker
+    // process does not have.
+    try {
+      const suppressInput = JSON.stringify({
+        action: "wait-and-suppress",
+        target: {
+          pid: child.pid,
+          processName,
+          existingHwnds: [...existingHwnds],
+          previousForegroundHwnd: previousFgHwnd,
+          timeoutMs: input.timeoutMs
+        }
+      });
+      const suppressResult = spawnSync(powershellCommand, [
+        "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", helperPath,
+        "-InputJson", suppressInput
+      ], { encoding: "utf8", shell: false, windowsHide: true, timeout: input.timeoutMs + 5000 });
+      if (suppressResult.stdout) {
+        const parsed = JSON.parse(suppressResult.stdout.trim()) as { found: boolean; window: WindowInfo | null };
+        if (parsed.found) {
+          window = parsed.window;
+        }
+      }
+    } catch {
+      // Fallback: try the normal waitForWindow path.
+    }
+  }
+
+  if (!window) {
+    window = await waitForWindow(child.pid, processName, existingHwnds, input.timeoutMs, exitState);
+  }
 
   if (window === null && exitState.exited) {
     throw new Error(`Process exited before a window appeared (pid=${child.pid}, code=${exitState.code}, signal=${exitState.signal ?? "none"}).`);
-  }
-
-  if (input.noActivate && window) {
-    try {
-      await runHelper({ action: "noactivate-minimize", target: { hwnd: window.hwnd } });
-    } catch (error) {
-      console.error(`noActivate minimize failed for hwnd ${window.hwnd}: ${formatSpawnError(error)}`);
-    }
   }
 
   if (input.startMinimized && window) {
