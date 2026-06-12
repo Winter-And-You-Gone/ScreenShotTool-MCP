@@ -1,19 +1,19 @@
-# ScreenshotTool MCP
+# ScreenShotTool MCP
 
-Windows 本地截图 MCP Server，供 Codex、Claude Code 等 MCP 客户端通过 stdio 调用。首版支持启动 `.exe`、发现窗口、截取窗口或屏幕区域，并把 PNG 保存到本地 `outputs/` 目录。
+Windows 本地截图与窗口操控 MCP Server，供 Codex、Claude Code 等 MCP 客户端通过 stdio 调用。支持启动应用、发现窗口、截取窗口或屏幕区域、模拟鼠标/键盘操作、点击原生菜单，所有操作均可不抢焦点、不闪窗口地在后台完成。
 
 ## 功能
 
-- `launch_app`: 启动指定 `.exe`，可等待第一个可见窗口。`startMinimized:true` 让窗口最小化；`noActivate:true` 让窗口不抢占焦点、不置顶，完全不影响当前屏幕。
-- `list_windows`: 按 `pid`、进程名、标题关键字列出可见窗口。
-- `capture_window`: 截取窗口。`captureMethod:"print"` 用 `PrintWindow` 拍被遮挡/最小化窗口；`noActivate:true` 在 screen 模式下不抢焦点；`focus:false` 不做任何窗口激活。
-- `capture_screen_region`: 按屏幕绝对坐标截取矩形。
-- `click_window`: 按窗口相对坐标投递鼠标点击消息，不移动主机物理鼠标。
-- `move_mouse_window`: 按窗口相对坐标投递鼠标移动消息，不移动主机物理鼠标。
-- `click_menu_item`: 按原生菜单路径触发菜单命令，不移动主机物理鼠标。
-- `close_app`: 用 `taskkill /T /F` 终止指定 `pid` 及其子进程树。
-- `type_text`: 输入文本。默认用 `SendInput`（需窗口在前）；`noActivate:true` 改用 `PostMessage(WM_CHAR)`，窗口无需焦点。
-- `send_key`: 发送按键。`noActivate:true` 改用 `PostMessage(WM_KEYDOWN/WM_KEYUP)`，窗口无需焦点。
+- `launch_app` — 启动指定 `.exe`，可等待第一个可见窗口。`startMinimized:true` 让窗口最小化；`noActivate:true` 让窗口从出现瞬间就位于其他窗口后面，不抢占焦点、不遮挡当前屏幕。
+- `list_windows` — 按 `pid`、进程名、标题关键字列出可见窗口。
+- `capture_window` — 截取窗口。`captureMethod:"print"` 用 `PrintWindow` 拍被遮挡/最小化窗口；`noActivate:true` 自动使用 PrintWindow，不操作 z-order，不闪烁。
+- `capture_screen_region` — 按屏幕绝对坐标截取矩形。
+- `click_window` — 按窗口相对坐标投递鼠标点击消息，不移动主机物理鼠标。
+- `move_mouse_window` — 按窗口相对坐标投递鼠标移动消息，不移动主机物理鼠标。
+- `click_menu_item` — 按原生菜单路径触发菜单命令，支持中文菜单名，不移动主机物理鼠标。
+- `close_app` — 用 `taskkill /T /F` 终止指定 `pid` 及其子进程树。
+- `type_text` — 输入文本。`noActivate:true` 用 `PostMessage(WM_CHAR)` 直接投递到目标窗口的编辑控件，窗口无需焦点、无需前台。
+- `send_key` — 发送按键。`noActivate:true` 用 `PostMessage(WM_KEYDOWN/WM_KEYUP)`，窗口无需焦点。
 
 截图默认保存到：
 
@@ -32,6 +32,33 @@ X:\MCP\ScreenShotTool\outputs\YYYYMMDD-HHMMSS-xxxxxx.png
   "rect": { "x": 0, "y": 0, "width": 800, "height": 600 },
   "timestamp": "2026-05-24T04:00:00.0000000Z"
 }
+```
+
+## noActivate 模式
+
+所有涉及窗口交互的工具都支持 `noActivate:true`，实现**全程不打扰用户当前工作**：
+
+| 工具 | noActivate 行为 |
+|------|-----------------|
+| `launch_app` | 新窗口出现后立刻推到所有窗口后面（`HWND_BOTTOM`），并恢复用户原来的前台窗口。使用独立的 PS 进程 + Alt 键技巧绕过 `SetForegroundWindow` 限制。 |
+| `capture_window` | 自动切换到 `PrintWindow` 模式，从窗口绘制表面直接捕获，无需操作 z-order，不会导致窗口闪现。 |
+| `type_text` | 通过 `GetGUIThreadInfo` 定位焦点子控件（如 Scintilla、Edit），再用 `PostMessage(WM_CHAR)` 投递字符；窗口在后台时用 `EnumChildWindows` 按类名查找编辑控件。 |
+| `send_key` | 用 `PostMessage(WM_KEYDOWN/WM_KEYUP)` 代替 `keybd_event`，无需前台焦点。 |
+
+**完整示例——后台启动记事本、输入文字、截图、关闭，全程不闪不抢焦点：**
+
+```json
+// 1. 启动（noActivate，不抢焦点）
+{ "exePath": "C:\\Windows\\System32\\notepad.exe", "waitForWindow": true, "noActivate": true }
+
+// 2. 输入文字（noActivate，PostMessage WM_CHAR 直达编辑控件）
+{ "hwnd": "123456", "text": "Hello from background!", "noActivate": true }
+
+// 3. 截图（noActivate，PrintWindow 无闪烁）
+{ "hwnd": "123456", "noActivate": true, "captureMethod": "print" }
+
+// 4. 关闭
+{ "pid": 7890 }
 ```
 
 ## 安装与构建
@@ -113,6 +140,15 @@ npm start
 }
 ```
 
+截取被遮挡/最小化的窗口（PrintWindow）：
+
+```json
+{
+  "hwnd": "123456",
+  "captureMethod": "print"
+}
+```
+
 截取窗口内左上角区域：
 
 ```json
@@ -144,12 +180,12 @@ npm start
 
 `x` / `y` 是目标窗口左上角起算的物理像素坐标。`click_window` 会根据命中区域投递客户区或非客户区鼠标消息，不移动主机物理鼠标。常见流程是先 `capture_window` 看图，再估算要点击的窗口内坐标，调用 `click_window`，最后再次 `capture_window`。
 
-点击原生菜单项：
+点击原生菜单项（支持中文）：
 
 ```json
 {
   "titleContains": "Notepad3",
-  "path": ["帮助", "关于"]
+  "path": ["帮助(&H)", "关于(&A)..."]
 }
 ```
 
@@ -178,6 +214,12 @@ Windows 桌面 smoke test 会打开并关闭 Notepad：
 npm run smoke:notepad
 ```
 
+验证 noActivate 模式不抢焦点：
+
+```powershell
+npm run smoke:no-activate
+```
+
 验证无光标点击不会移动主机物理鼠标：
 
 ```powershell
@@ -196,7 +238,7 @@ npm run inspect
 - 只支持 Windows 桌面会话；需要 Node 20+。
 - 不做 OCR、图像比对。
 - 鼠标点击/悬停使用窗口消息模拟，不调用 `SetCursorPos` / `mouse_event`，不会抢主机物理鼠标；少数程序可能忽略窗口消息。
-- `type_text` 通过 `SendInput(KEYEVENTF_UNICODE)` 投递，绕过键盘布局，但可能被全局键盘钩子记录。
+- `type_text` 的 `noActivate` 模式通过 `PostMessage(WM_CHAR)` 投递，少数自绘编辑控件可能不响应 `WM_CHAR`。
 - `exePath` 要求绝对 `.exe` 路径。
 - `args` 必须是字符串数组，不接受拼接后的命令行。
 - 截图使用物理像素坐标；helper 会尝试启用 DPI aware，减少高 DPI 缩放偏差。

@@ -4,3 +4,4 @@ outputs/
 .env
 *.log
 npm-debug.log*
+.claude/
