@@ -202,3 +202,24 @@ test("click_menu_item requires a target and menu path", () => {
   assert.throws(() => clickMenuItemSchema.parse({ hwnd: "123", path: [] }));
   assert.throws(() => clickMenuItemSchema.parse({ path: ["帮助"] }));
 });
+
+test("launch_app accepts startMinimized and defaults to false", () => {
+  const without = launchAppSchema.parse({ exePath: "C:\\Windows\\System32\\notepad.exe" });
+  assert.equal(without.startMinimized, false);
+
+  const withFlag = launchAppSchema.parse({
+    exePath: "C:\\Windows\\System32\\notepad.exe",
+    startMinimized: true
+  });
+  assert.equal(withFlag.startMinimized, true);
+});
+
+test("capture_window accepts captureMethod and defaults to screen", () => {
+  const fallback = captureWindowSchema.parse({ hwnd: "1" });
+  assert.equal(fallback.captureMethod, "screen");
+
+  const print = captureWindowSchema.parse({ hwnd: "1", captureMethod: "print" });
+  assert.equal(print.captureMethod, "print");
+
+  assert.throws(() => captureWindowSchema.parse({ hwnd: "1", captureMethod: "invalid" }));
+});

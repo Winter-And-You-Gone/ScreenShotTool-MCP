@@ -32,6 +32,7 @@ import {
   launchApp,
   listWindows,
   moveMouseWindow,
+  shutdownHelper,
   typeText,
   sendKey
 } from "./windows.js";
@@ -92,7 +93,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     },
     {
       name: "type_text",
-      description: "Type text into a window via virtual keystrokes (keybd_event). The target window must be focused by this tool first.",
+      description: "Type text into a window via SendInput Unicode. The target window is focused first; supports any Unicode character (including CJK).",
       inputSchema: toolInputSchemas.type_text
     },
     {
@@ -178,5 +179,15 @@ function formatError(error: unknown): string {
 
 const transport = new StdioServerTransport();
 await server.connect(transport);
+
+for (const sig of ["SIGINT", "SIGTERM"] as const) {
+  process.once(sig, () => {
+    shutdownHelper();
+    process.exit(0);
+  });
+}
+process.once("exit", () => {
+  shutdownHelper();
+});
 
 console.error(`screenshottool-mcp ready. Default output directory: ${getDefaultOutputDir()}`);
