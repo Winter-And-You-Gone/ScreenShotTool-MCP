@@ -44,6 +44,9 @@ namespace ScreenshotTool {
     public static extern bool IsWindowVisible(IntPtr hWnd);
 
     [DllImport("user32.dll")]
+    public static extern bool IsWindow(IntPtr hWnd);
+
+    [DllImport("user32.dll")]
     public static extern bool IsIconic(IntPtr hWnd);
 
     [DllImport("user32.dll", CharSet = CharSet.Unicode, EntryPoint = "GetWindowTextW", SetLastError = true)]
@@ -550,11 +553,17 @@ function Resolve-TargetWindow {
     }
     $hwnd = [IntPtr]$parsedInt64
 
+    if (-not [ScreenshotTool.Native]::IsWindow($hwnd)) {
+      throw "No window found for hwnd $hwndText."
+    }
+
     $isVisible = [ScreenshotTool.Native]::IsWindowVisible($hwnd)
     $isIconic = [ScreenshotTool.Native]::IsIconic($hwnd)
     if ($isVisible -or $IncludeHidden) {
       $rect = New-Object ScreenshotTool.Native+RECT
-      [ScreenshotTool.Native]::GetWindowRect($hwnd, [ref]$rect) | Out-Null
+      if (-not [ScreenshotTool.Native]::GetWindowRect($hwnd, [ref]$rect)) {
+        throw "Failed to get window rect for hwnd $hwndText."
+      }
       $pidValue = [uint32]0
       [ScreenshotTool.Native]::GetWindowThreadProcessId($hwnd, [ref]$pidValue) | Out-Null
       $titleBuilder = New-Object System.Text.StringBuilder 256
@@ -853,8 +862,11 @@ function Capture-Window {
     # Without this, CopyFromScreen returns black pixels for out-of-bounds areas.
     $maxWidth = [int]$windowRect.width - [int]$region.x
     $maxHeight = [int]$windowRect.height - [int]$region.y
-    $captureWidth = [Math]::Max(1, [Math]::Min([int]$region.width, $maxWidth))
-    $captureHeight = [Math]::Max(1, [Math]::Min([int]$region.height, $maxHeight))
+    if ($maxWidth -le 0 -or $maxHeight -le 0) {
+      throw "Region is outside the window bounds."
+    }
+    $captureWidth = [Math]::Min([int]$region.width, $maxWidth)
+    $captureHeight = [Math]::Min([int]$region.height, $maxHeight)
   }
 
   $rect = [ordered]@{
@@ -1291,6 +1303,9 @@ function Click-Window {
   $windowRect = $window.rect
   $relativeX = [int]$Target.x
   $relativeY = [int]$Target.y
+  if ($relativeX -lt 0 -or $relativeX -ge [int]$windowRect.width -or $relativeY -lt 0 -or $relativeY -ge [int]$windowRect.height) {
+    throw "Coordinates ($relativeX, $relativeY) are outside the target window bounds (width=$($windowRect.width), height=$($windowRect.height)). Click coordinates are window-relative; out-of-bounds clicks would be routed to other windows."
+  }
   $screenX = [int]$windowRect.x + $relativeX
   $screenY = [int]$windowRect.y + $relativeY
   $button = "left"
@@ -1414,6 +1429,9 @@ function Move-MouseWindow {
   $windowRect = $window.rect
   $relativeX = [int]$Target.x
   $relativeY = [int]$Target.y
+  if ($relativeX -lt 0 -or $relativeX -ge [int]$windowRect.width -or $relativeY -lt 0 -or $relativeY -ge [int]$windowRect.height) {
+    throw "Coordinates ($relativeX, $relativeY) are outside the target window bounds (width=$($windowRect.width), height=$($windowRect.height)). Move coordinates are window-relative; out-of-bounds moves would be routed to other windows."
+  }
   $screenX = [int]$windowRect.x + $relativeX
   $screenY = [int]$windowRect.y + $relativeY
   $delayMs = 200
@@ -1689,115 +1707,71 @@ function Type-Text {
   $skipped = [System.Collections.ArrayList]::new()
   $hwnd = [IntPtr]([int64]$window.hwnd)
 
-  if ($noActivate) {
-    # PostMessage WM_CHAR directly to the focused child control — no
-    # activation, no flash, no foreground switch.
-    #
-    # Strategy to find the right target hwnd:
-    #   1. GetGUIThreadInfo — works when the window is in the foreground.
-    #   2. When the window is in the background, hwndFocus is NULL, so
-    #      we fall back to enumerating child windows and picking the one
-    #      whose class name looks like an edit control (Scintilla, Edit,
-    #      RichEdit, TextBox, etc.).
-    $targetHwnd = $hwnd
-    $pidValue = [uint32]0
-    $threadId = [ScreenshotTool.Native]::GetWindowThreadProcessId($hwnd, [ref]$pidValue)
-    $guiInfo = New-Object ScreenshotTool.Native+GUITHREADINFO
-    $guiInfo.cbSize = [uint32][System.Runtime.InteropServices.Marshal]::SizeOf($guiInfo)
-    if ([ScreenshotTool.Native]::GetGUIThreadInfo([uint32]$threadId, [ref]$guiInfo)) {
-      if ($guiInfo.hwndFocus -ne [IntPtr]::Zero) {
-        $targetHwnd = $guiInfo.hwndFocus
-      }
-    }
+  $targetHwnd = $hwnd
+  $targetClassName = ''
+  $editClassDefs = @{
+    'Scintilla'      = $false
+    'Edit'           = $true
+    'RichEdit20W'    = $true
+    'RichEdit20A'    = $true
+    'RICHEDIT50W'    = $true
+    'RichEdit'       = $true
+    'TEXTEDIT'       = $true
+    'TextBox'        = $false
+    'ATL:006C0280'   = $false
+    'AfxWnd42su'     = $false
+    'NetUIHWND'      = $false
+  }
 
-    # If GetGUIThreadInfo didn't give us a focus child (window is in
-    # the background), search for an editable child control by class name.
-    $targetClassName = ''
-    # Edit class definitions: each entry maps a class name to whether it
-    # supports EM_REPLACESEL for bulk text insertion.  Classes not listed
-    # here default to replaceSel=$false and fall through to per-char WM_CHAR.
-    $editClassDefs = @{
-      'Scintilla'      = $true
-      'Edit'           = $true
-      'RichEdit20W'    = $true
-      'RichEdit20A'    = $true
-      'RICHEDIT50W'    = $true
-      'RichEdit'       = $true
-      'TEXTEDIT'       = $true
-      'TextBox'        = $false
-      'ATL:006C0280'   = $false
-      'AfxWnd42su'     = $false
-      'NetUIHWND'      = $false
+  $pidValue = [uint32]0
+  $threadId = [ScreenshotTool.Native]::GetWindowThreadProcessId($hwnd, [ref]$pidValue)
+  $guiInfo = New-Object ScreenshotTool.Native+GUITHREADINFO
+  $guiInfo.cbSize = [uint32][System.Runtime.InteropServices.Marshal]::SizeOf($guiInfo)
+  if ([ScreenshotTool.Native]::GetGUIThreadInfo([uint32]$threadId, [ref]$guiInfo)) {
+    if ($guiInfo.hwndFocus -ne [IntPtr]::Zero) {
+      $targetHwnd = $guiInfo.hwndFocus
     }
-    if ($targetHwnd -eq $hwnd) {
-      $script:foundEditChild = [IntPtr]::Zero
-      $script:foundEditClass = ''
-      $enumProc = [ScreenshotTool.Native+EnumWindowsProc]{
-        param([IntPtr]$Child, [IntPtr]$LParam)
-        $cn = New-Object System.Text.StringBuilder 256
-        [ScreenshotTool.Native]::GetClassName($Child, $cn, $cn.Capacity) | Out-Null
-        $className = $cn.ToString()
-        foreach ($key in $editClassDefs.Keys) {
-          if ($className -ieq $key) {
-            $script:foundEditChild = $Child
-            $script:foundEditClass = $className
-            return $false
-          }
+  }
+
+  if ($targetHwnd -eq $hwnd) {
+    $script:foundEditChild = [IntPtr]::Zero
+    $script:foundEditClass = ''
+    $enumProc = [ScreenshotTool.Native+EnumWindowsProc]{
+      param([IntPtr]$Child, [IntPtr]$LParam)
+      $cn = New-Object System.Text.StringBuilder 256
+      [ScreenshotTool.Native]::GetClassName($Child, $cn, $cn.Capacity) | Out-Null
+      $className = $cn.ToString()
+      foreach ($key in $editClassDefs.Keys) {
+        if ($className -ieq $key) {
+          $script:foundEditChild = $Child
+          $script:foundEditClass = $className
+          return $false
         }
-        return $true
       }
-      [ScreenshotTool.Native]::EnumChildWindows($hwnd, $enumProc, [IntPtr]::Zero) | Out-Null
-      if ($script:foundEditChild -ne [IntPtr]::Zero) {
-        $targetHwnd = $script:foundEditChild
-        $targetClassName = $script:foundEditClass
-      }
-    } else {
-      $cnBuf = New-Object System.Text.StringBuilder 256
-      [ScreenshotTool.Native]::GetClassName($targetHwnd, $cnBuf, $cnBuf.Capacity) | Out-Null
-      $targetClassName = $cnBuf.ToString()
+      return $true
     }
-
-    # Edit-style controls that support EM_REPLACESEL can receive the entire
-    # text in one SendMessage call. The kernel marshals the string across
-    # process boundaries automatically, so we don't need WriteProcessMemory.
-    $EM_REPLACESEL = [uint32]0x00C2
-    $useReplaceSel = $false
-    if ($editClassDefs.ContainsKey($targetClassName)) {
-      $useReplaceSel = $editClassDefs[$targetClassName]
+    [ScreenshotTool.Native]::EnumChildWindows($hwnd, $enumProc, [IntPtr]::Zero) | Out-Null
+    if ($script:foundEditChild -ne [IntPtr]::Zero) {
+      $targetHwnd = $script:foundEditChild
+      $targetClassName = $script:foundEditClass
     }
+  } else {
+    $cnBuf = New-Object System.Text.StringBuilder 256
+    [ScreenshotTool.Native]::GetClassName($targetHwnd, $cnBuf, $cnBuf.Capacity) | Out-Null
+    $targetClassName = $cnBuf.ToString()
+  }
 
-    if ($useReplaceSel -and $text.Length -gt 0) {
-      [ScreenshotTool.Native]::SendMessageStr($targetHwnd, $EM_REPLACESEL, [IntPtr]1, $text) | Out-Null
-      if ($delayMs -gt 0) {
-        Start-Sleep -Milliseconds $delayMs
-      }
-      return [ordered]@{
-        typed = $true
-        target = "window:" + $window.hwnd
-        hwnd = $window.hwnd
-        title = $window.title
-        pid = $window.pid
-        textLength = $text.Length
-        skipped = @($skipped.ToArray())
-        timestamp = (Get-Date).ToUniversalTime().ToString("o")
-      }
+  $EM_REPLACESEL = [uint32]0x00C2
+  $useReplaceSel = $false
+  if ($editClassDefs.ContainsKey($targetClassName)) {
+    $useReplaceSel = $editClassDefs[$targetClassName]
+  }
+
+  if ($useReplaceSel -and $text.Length -gt 0) {
+    [ScreenshotTool.Native]::SendMessageStr($targetHwnd, $EM_REPLACESEL, [IntPtr]1, $text) | Out-Null
+    if ($delayMs -gt 0) {
+      Start-Sleep -Milliseconds $delayMs
     }
-
-    foreach ($ch in $text.ToCharArray()) {
-      $scan = [uint16][int][char]$ch
-      if (-not (Post-CharMessage -Hwnd $targetHwnd -Char $scan)) {
-        $skipped.Add([string]$ch) | Out-Null
-        continue
-      }
-
-      if ($pressMs -gt 0) {
-        Start-Sleep -Milliseconds $pressMs
-      }
-      if ($delayMs -gt 0) {
-        Start-Sleep -Milliseconds $delayMs
-      }
-    }
-
     return [ordered]@{
       typed = $true
       target = "window:" + $window.hwnd
@@ -1807,6 +1781,32 @@ function Type-Text {
       textLength = $text.Length
       skipped = @($skipped.ToArray())
       timestamp = (Get-Date).ToUniversalTime().ToString("o")
+    }
+  }
+
+  $useWindowMessage = $noActivate -or $targetHwnd -ne $hwnd
+  foreach ($ch in $text.ToCharArray()) {
+    $scan = [uint16][int][char]$ch
+    $sent = $false
+    try {
+      $sent = if ($useWindowMessage) {
+        Post-CharMessage -Hwnd $targetHwnd -Char $scan
+      } else {
+        Send-UnicodeChar $scan
+      }
+    } catch {
+      $sent = $false
+    }
+    if (-not $sent) {
+      $skipped.Add([string]$ch) | Out-Null
+      continue
+    }
+
+    if ($pressMs -gt 0) {
+      Start-Sleep -Milliseconds $pressMs
+    }
+    if ($delayMs -gt 0) {
+      Start-Sleep -Milliseconds $delayMs
     }
   }
 

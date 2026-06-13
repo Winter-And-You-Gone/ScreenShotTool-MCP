@@ -15,6 +15,7 @@ import {
   readClipboardSchema,
   writeClipboardSchema,
   getWindowStateSchema,
+  toolInputSchemas,
   waitForWindowSchema
 } from "../src/schemas.js";
 import { ensureOutputPath, getDefaultOutputDir, launchApp } from "../src/windows.js";
@@ -275,4 +276,59 @@ test("wait_for_window requires a target and accepts mode + timeout defaults", ()
   assert.throws(() => waitForWindowSchema.parse({ pid: 1, mode: "invalid" }));
   assert.throws(() => waitForWindowSchema.parse({ pid: 1, timeoutMs: 50 }));
   assert.throws(() => waitForWindowSchema.parse({ pid: 1, timeoutMs: 999_999 }));
+});
+
+test("schemas reject unknown fields to match additionalProperties:false", () => {
+  // Typos like outputpath instead of outputPath should be surfaced loudly,
+  // not silently dropped (which would route output to the default path).
+  assert.throws(() => captureWindowSchema.parse({
+    hwnd: "1",
+    outputpath: "C:\\Temp\\foo.png"
+  }), /unrecognized/i);
+
+  assert.throws(() => captureScreenRegionSchema.parse({
+    region: { x: 0, y: 0, width: 10, height: 10 },
+    outputpath: "C:\\Temp\\foo.png"
+  }), /unrecognized/i);
+
+  assert.throws(() => clickWindowSchema.parse({
+    hwnd: "1",
+    x: 0,
+    y: 0,
+    extra: true
+  }), /unrecognized/i);
+
+  assert.throws(() => typeTextSchema.parse({
+    hwnd: "1",
+    text: "x",
+    delay: 100
+  }), /unrecognized/i);
+
+  assert.throws(() => launchAppSchema.parse({
+    exePath: "C:\\x.exe",
+    extraField: "value"
+  }), /unrecognized/i);
+
+  assert.throws(() => readClipboardSchema.parse({
+    text: "not allowed"
+  }), /unrecognized/i);
+
+  assert.throws(() => captureWindowSchema.parse({
+    hwnd: "1",
+    region: { x: 0, y: 0, width: 10, height: 10, extra: true }
+  }), /unrecognized/i);
+});
+
+test("tool JSON schemas expose runtime selector and enum constraints", () => {
+  assert.deepEqual(toolInputSchemas.capture_window.anyOf, [
+    { required: ["hwnd"] },
+    { required: ["pid"] },
+    { required: ["processName"] },
+    { required: ["titleContains"] }
+  ]);
+  assert.deepEqual(toolInputSchemas.capture_window.properties.hwnd.anyOf, [
+    { type: "string" },
+    { type: "integer", minimum: 1 }
+  ]);
+  assert.deepEqual(toolInputSchemas.click_window.properties.button.enum, ["left", "right", "middle"]);
 });

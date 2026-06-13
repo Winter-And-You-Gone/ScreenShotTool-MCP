@@ -570,6 +570,7 @@ async function getWorker(): Promise<Worker> {
       stdio: ["pipe", "pipe", "pipe"],
       windowsHide: true
     });
+    child.unref();
 
     const worker: Worker = {
       child,
@@ -586,6 +587,9 @@ async function getWorker(): Promise<Worker> {
 
     child.stdout.setEncoding("utf8");
     child.stderr.setEncoding("utf8");
+    unrefStream(child.stdin);
+    unrefStream(child.stdout);
+    unrefStream(child.stderr);
 
     child.stdout.on("data", (chunk: string) => {
       worker.stdoutBuffer += chunk;
@@ -690,6 +694,10 @@ function killWorker(worker: Worker, reason: string): void {
   console.error(`PowerShell worker killed: ${reason}`);
 }
 
+function unrefStream(stream: NodeJS.ReadableStream | NodeJS.WritableStream | null): void {
+  (stream as { unref?: () => void } | null)?.unref?.();
+}
+
 async function runHelper<T>(request: HelperRequest): Promise<T> {
   const worker = await getWorker();
 
@@ -735,6 +743,9 @@ export function shutdownHelper(): void {
     }
   }
 }
+
+process.once("beforeExit", shutdownHelper);
+process.once("exit", shutdownHelper);
 
 function timestampForFile(date = new Date()): string {
   const pad = (value: number) => String(value).padStart(2, "0");

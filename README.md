@@ -140,7 +140,7 @@ npm run build
 
 ```powershell
 # 单元测试
-npm test                    # 期望 24/24 通过
+npm test                    # 期望全部通过
 
 # 启动 + 关闭 Notepad 的端到端测试
 npm run smoke:notepad

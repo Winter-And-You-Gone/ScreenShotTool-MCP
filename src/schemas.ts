@@ -47,7 +47,7 @@ export const regionSchema = z.object({
   y: nonNegativeInt,
   width: positiveInt,
   height: positiveInt
-});
+}).strict();
 
 export const launchAppSchema = z.object({
   exePath: z.string().min(1),
@@ -57,13 +57,13 @@ export const launchAppSchema = z.object({
   timeoutMs: optionalTimeout.default(10000),
   startMinimized: z.boolean().optional().default(false),
   noActivate: z.boolean().optional().default(false)
-});
+}).strict();
 
 export const listWindowsSchema = z.object({
   pid: z.number().int().positive().optional(),
   processName: z.string().min(1).optional(),
   titleContains: z.string().min(1).optional()
-});
+}).strict();
 
 export const captureWindowSchema = z.object({
   hwnd: z.union([z.string().min(1), z.number().int().positive()]).optional(),
@@ -75,7 +75,7 @@ export const captureWindowSchema = z.object({
   captureMethod: z.enum(["screen", "print"]).optional().default("screen"),
   noActivate: z.boolean().optional().default(false),
   outputPath: z.string().min(1).optional()
-}).refine(
+}).strict().refine(
   (value) => value.hwnd !== undefined || value.pid !== undefined || value.processName !== undefined || value.titleContains !== undefined,
   "Provide at least one of hwnd, pid, processName, or titleContains."
 );
@@ -83,7 +83,7 @@ export const captureWindowSchema = z.object({
 export const captureScreenRegionSchema = z.object({
   region: regionSchema,
   outputPath: z.string().min(1).optional()
-});
+}).strict();
 
 export const clickWindowSchema = z.object({
   hwnd: z.union([z.string().min(1), z.number().int().positive()]).optional(),
@@ -95,7 +95,7 @@ export const clickWindowSchema = z.object({
   button: z.enum(["left", "right", "middle"]).optional().default("left"),
   doubleClick: z.boolean().optional().default(false),
   delayMs: z.number().int().min(0).max(10000).optional().default(200)
-}).refine(
+}).strict().refine(
   (value) => value.hwnd !== undefined || value.pid !== undefined || value.processName !== undefined || value.titleContains !== undefined,
   "Provide at least one of hwnd, pid, processName, or titleContains."
 );
@@ -108,7 +108,7 @@ export const moveMouseWindowSchema = z.object({
   x: nonNegativeInt,
   y: nonNegativeInt,
   delayMs: z.number().int().min(0).max(10000).optional().default(200)
-}).refine(
+}).strict().refine(
   (value) => value.hwnd !== undefined || value.pid !== undefined || value.processName !== undefined || value.titleContains !== undefined,
   "Provide at least one of hwnd, pid, processName, or titleContains."
 );
@@ -120,14 +120,14 @@ export const clickMenuItemSchema = z.object({
   titleContains: z.string().min(1).optional(),
   path: z.array(z.string().min(1)).min(1),
   delayMs: z.number().int().min(0).max(10000).optional().default(500)
-}).refine(
+}).strict().refine(
   (value) => value.hwnd !== undefined || value.pid !== undefined || value.processName !== undefined || value.titleContains !== undefined,
   "Provide at least one of hwnd, pid, processName, or titleContains."
 );
 
 export const closeAppSchema = z.object({
   pid: z.number().int().positive()
-})
+}).strict();
 
 export const typeTextSchema = z.object({
   hwnd: z.union([z.string().min(1), z.number().int().positive()]).optional(),
@@ -138,10 +138,10 @@ export const typeTextSchema = z.object({
   delayMs: z.number().int().min(0).max(10000).optional().default(50),
   pressMs: z.number().int().min(0).max(5000).optional().default(30),
   noActivate: z.boolean().optional().default(false)
-}).refine(
+}).strict().refine(
   (value) => value.hwnd !== undefined || value.pid !== undefined || value.processName !== undefined || value.titleContains !== undefined,
   "Provide at least one of hwnd, pid, processName, or titleContains."
-)
+);
 
 export const sendKeySchema = z.object({
   hwnd: z.union([z.string().min(1), z.number().int().positive()]).optional(),
@@ -153,23 +153,23 @@ export const sendKeySchema = z.object({
   delayMs: z.number().int().min(0).max(10000).optional().default(50),
   pressMs: z.number().int().min(0).max(5000).optional().default(30),
   noActivate: z.boolean().optional().default(false)
-}).refine(
+}).strict().refine(
   (value) => value.hwnd !== undefined || value.pid !== undefined || value.processName !== undefined || value.titleContains !== undefined,
   "Provide at least one of hwnd, pid, processName, or titleContains."
 );
 
-export const readClipboardSchema = z.object({});
+export const readClipboardSchema = z.object({}).strict();
 
 export const writeClipboardSchema = z.object({
   text: z.string()
-});
+}).strict();
 
 export const getWindowStateSchema = z.object({
   hwnd: z.union([z.string().min(1), z.number().int().positive()]).optional(),
   pid: z.number().int().positive().optional(),
   processName: z.string().min(1).optional(),
   titleContains: z.string().min(1).optional()
-}).refine(
+}).strict().refine(
   (value) => value.hwnd !== undefined || value.pid !== undefined || value.processName !== undefined || value.titleContains !== undefined,
   "Provide at least one of hwnd, pid, processName, or titleContains."
 );
@@ -182,7 +182,7 @@ export const waitForWindowSchema = z.object({
   mode: z.enum(["appear", "disappear"]).optional().default("appear"),
   timeoutMs: z.number().int().min(100).max(300_000).optional().default(30_000),
   pollIntervalMs: z.number().int().min(50).max(10_000).optional().default(100)
-}).refine(
+}).strict().refine(
   (value) => value.hwnd !== undefined || value.pid !== undefined || value.processName !== undefined || value.titleContains !== undefined,
   "Provide at least one of hwnd, pid, processName, or titleContains."
 );
@@ -194,13 +194,28 @@ export type CaptureScreenRegionInput = z.infer<typeof captureScreenRegionSchema>
 export type ClickWindowInput = z.infer<typeof clickWindowSchema>;
 export type MoveMouseWindowInput = z.infer<typeof moveMouseWindowSchema>;
 export type ClickMenuItemInput = z.infer<typeof clickMenuItemSchema>;
-export type CloseAppInput = z.infer<typeof closeAppSchema>
-export type TypeTextInput = z.infer<typeof typeTextSchema>
+export type CloseAppInput = z.infer<typeof closeAppSchema>;
+export type TypeTextInput = z.infer<typeof typeTextSchema>;
 export type SendKeyInput = z.infer<typeof sendKeySchema>;
 export type ReadClipboardInput = z.infer<typeof readClipboardSchema>;
 export type WriteClipboardInput = z.infer<typeof writeClipboardSchema>;
 export type GetWindowStateInput = z.infer<typeof getWindowStateSchema>;
 export type WaitForWindowInput = z.infer<typeof waitForWindowSchema>;
+
+const hwndSchemaProperty = {
+  anyOf: [
+    { type: "string" },
+    { type: "integer", minimum: 1 }
+  ],
+  description: "Window handle from list_windows or launch_app. Numbers are accepted at runtime, but strings are safest for Codex."
+} as const;
+
+const atLeastOneSelectorAnyOf = [
+  { required: ["hwnd"] },
+  { required: ["pid"] },
+  { required: ["processName"] },
+  { required: ["titleContains"] }
+] as const;
 
 export const toolInputSchemas = {
   launch_app: {
@@ -229,7 +244,7 @@ export const toolInputSchemas = {
   capture_window: {
     type: "object",
     properties: {
-      hwnd: { type: "string", description: "Window handle from list_windows or launch_app. Numbers are accepted at runtime, but strings are safest for Codex." },
+      hwnd: { ...hwndSchemaProperty },
       pid: { type: "integer", minimum: 1 },
       processName: { type: "string" },
       titleContains: { type: "string" },
@@ -250,7 +265,8 @@ export const toolInputSchemas = {
       noActivate: { type: "boolean", default: false, description: "When true with captureMethod 'screen', the window is raised above overlapping windows without stealing keyboard focus, then restored after capture." },
       outputPath: { type: "string", description: "Optional absolute PNG output path." }
     },
-    additionalProperties: false
+    additionalProperties: false,
+    anyOf: atLeastOneSelectorAnyOf
   },
   capture_screen_region: {
     type: "object",
@@ -275,23 +291,24 @@ export const toolInputSchemas = {
   click_window: {
     type: "object",
     properties: {
-      hwnd: { type: "string", description: "Window handle from list_windows or launch_app. Numbers are accepted at runtime, but strings are safest for Codex." },
+      hwnd: { ...hwndSchemaProperty },
       pid: { type: "integer", minimum: 1 },
       processName: { type: "string" },
       titleContains: { type: "string" },
       x: { type: "integer", minimum: 0, description: "X coordinate relative to the target window top-left corner." },
       y: { type: "integer", minimum: 0, description: "Y coordinate relative to the target window top-left corner." },
-      button: { type: "string", default: "left", description: "Mouse button: left, right, or middle." },
+      button: { type: "string", enum: ["left", "right", "middle"], default: "left", description: "Mouse button: left, right, or middle." },
       doubleClick: { type: "boolean", default: false },
       delayMs: { type: "integer", minimum: 0, maximum: 10000, default: 200, description: "Delay after posting mouse messages, useful before taking the next screenshot." },
     },
     required: ["x", "y"],
-    additionalProperties: false
+    additionalProperties: false,
+    anyOf: atLeastOneSelectorAnyOf
   },
   move_mouse_window: {
     type: "object",
     properties: {
-      hwnd: { type: "string", description: "Window handle from list_windows or launch_app. Numbers are accepted at runtime, but strings are safest for Codex." },
+      hwnd: { ...hwndSchemaProperty },
       pid: { type: "integer", minimum: 1 },
       processName: { type: "string" },
       titleContains: { type: "string" },
@@ -300,12 +317,13 @@ export const toolInputSchemas = {
       delayMs: { type: "integer", minimum: 0, maximum: 10000, default: 200, description: "Delay after posting WM_MOUSEMOVE, useful before taking the next screenshot." }
     },
     required: ["x", "y"],
-    additionalProperties: false
+    additionalProperties: false,
+    anyOf: atLeastOneSelectorAnyOf
   },
   click_menu_item: {
     type: "object",
     properties: {
-      hwnd: { type: "string", description: "Window handle from list_windows or launch_app. Numbers are accepted at runtime, but strings are safest for Codex." },
+      hwnd: { ...hwndSchemaProperty },
       pid: { type: "integer", minimum: 1 },
       processName: { type: "string" },
       titleContains: { type: "string" },
@@ -318,7 +336,8 @@ export const toolInputSchemas = {
       delayMs: { type: "integer", minimum: 0, maximum: 10000, default: 500, description: "Delay after invoking the menu command." }
     },
     required: ["path"],
-    additionalProperties: false
+    additionalProperties: false,
+    anyOf: atLeastOneSelectorAnyOf
   },
   close_app: {
     type: "object",
@@ -331,7 +350,7 @@ export const toolInputSchemas = {
   type_text: {
     type: "object",
     properties: {
-      hwnd: { type: "string", description: "Window handle from list_windows or launch_app." },
+      hwnd: { ...hwndSchemaProperty, description: "Window handle from list_windows or launch_app." },
       pid: { type: "integer", minimum: 1 },
       processName: { type: "string" },
       titleContains: { type: "string" },
@@ -341,12 +360,13 @@ export const toolInputSchemas = {
       noActivate: { type: "boolean", default: false, description: "When true, sends WM_CHAR messages via PostMessage instead of SendInput, so the target window never needs focus. Some applications may not respond to posted messages." }
     },
     required: ["text"],
-    additionalProperties: false
+    additionalProperties: false,
+    anyOf: atLeastOneSelectorAnyOf
   },
   send_key: {
     type: "object",
     properties: {
-      hwnd: { type: "string", description: "Window handle from list_windows or launch_app." },
+      hwnd: { ...hwndSchemaProperty, description: "Window handle from list_windows or launch_app." },
       pid: { type: "integer", minimum: 1 },
       processName: { type: "string" },
       titleContains: { type: "string" },
@@ -363,7 +383,8 @@ export const toolInputSchemas = {
       noActivate: { type: "boolean", default: false, description: "When true, sends WM_KEYDOWN/WM_KEYUP via PostMessage instead of keybd_event, so the target window never needs focus. Some applications may not respond to posted messages." }
     },
     required: ["key"],
-    additionalProperties: false
+    additionalProperties: false,
+    anyOf: atLeastOneSelectorAnyOf
   },
   read_clipboard: {
     type: "object",
@@ -381,17 +402,18 @@ export const toolInputSchemas = {
   get_window_state: {
     type: "object",
     properties: {
-      hwnd: { type: "string", description: "Window handle from list_windows or launch_app. Numbers are accepted at runtime, but strings are safest for Codex." },
+      hwnd: { ...hwndSchemaProperty },
       pid: { type: "integer", minimum: 1 },
       processName: { type: "string" },
       titleContains: { type: "string" }
     },
-    additionalProperties: false
+    additionalProperties: false,
+    anyOf: atLeastOneSelectorAnyOf
   },
   wait_for_window: {
     type: "object",
     properties: {
-      hwnd: { type: "string", description: "Window handle to wait for. Useful with mode=disappear to wait until a specific window closes." },
+      hwnd: { ...hwndSchemaProperty, description: "Window handle to wait for. Useful with mode=disappear to wait until a specific window closes." },
       pid: { type: "integer", minimum: 1 },
       processName: { type: "string" },
       titleContains: { type: "string" },
@@ -399,6 +421,7 @@ export const toolInputSchemas = {
       timeoutMs: { type: "integer", minimum: 100, maximum: 300000, default: 30000, description: "Maximum time to wait. On timeout, the call returns found=false instead of throwing." },
       pollIntervalMs: { type: "integer", minimum: 50, maximum: 10000, default: 100, description: "Polling interval. Lower = faster response, higher CPU." }
     },
-    additionalProperties: false
+    additionalProperties: false,
+    anyOf: atLeastOneSelectorAnyOf
   }
 } as const;
