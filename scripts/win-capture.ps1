@@ -233,6 +233,55 @@ namespace ScreenshotTool {
 
     [DllImport("kernel32.dll")]
     public static extern uint GetCurrentThreadId();
+
+    // Clipboard APIs (Feature 5: read_clipboard / write_clipboard).
+    [DllImport("user32.dll", SetLastError = true)]
+    public static extern bool OpenClipboard(IntPtr hWndNewOwner);
+
+    [DllImport("user32.dll", SetLastError = true)]
+    public static extern bool CloseClipboard();
+
+    [DllImport("user32.dll", SetLastError = true)]
+    public static extern bool EmptyClipboard();
+
+    [DllImport("user32.dll", SetLastError = true)]
+    public static extern IntPtr GetClipboardData(uint uFormat);
+
+    [DllImport("user32.dll", SetLastError = true)]
+    public static extern IntPtr SetClipboardData(uint uFormat, IntPtr hMem);
+
+    [DllImport("user32.dll")]
+    public static extern bool IsClipboardFormatAvailable(uint format);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    public static extern IntPtr GlobalAlloc(uint uFlags, UIntPtr dwBytes);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    public static extern IntPtr GlobalLock(IntPtr hMem);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    public static extern bool GlobalUnlock(IntPtr hMem);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    public static extern IntPtr GlobalFree(IntPtr hMem);
+
+    [DllImport("kernel32.dll")]
+    public static extern UIntPtr GlobalSize(IntPtr hMem);
+
+    // Window state APIs (Feature 6: get_window_state).
+    [DllImport("user32.dll")]
+    public static extern bool IsZoomed(IntPtr hWnd);
+
+    // GetWindowLongPtrW does not exist in 32-bit user32.dll; provide both
+    // and let the caller pick at runtime.
+    [DllImport("user32.dll", EntryPoint = "GetWindowLongW", SetLastError = true)]
+    public static extern int GetWindowLong32(IntPtr hWnd, int nIndex);
+
+    [DllImport("user32.dll", EntryPoint = "GetWindowLongPtrW", SetLastError = true)]
+    public static extern IntPtr GetWindowLong64(IntPtr hWnd, int nIndex);
+
+    [DllImport("user32.dll", SetLastError = true)]
+    public static extern bool GetLayeredWindowAttributes(IntPtr hWnd, out uint crKey, out byte bAlpha, out uint dwFlags);
   }
 }
 "@
@@ -1813,6 +1862,300 @@ function NoActivate-Minimize {
   }
 }
 
+function Open-ClipboardWithRetry {
+  # OpenClipboard frequently fails when another process is briefly using the
+  # clipboard (e.g. during a Ctrl+C). Retry up to ~500ms before giving up.
+  $maxAttempts = 50
+  for ($i = 0; $i -lt $maxAttempts; $i++) {
+    if ([ScreenshotTool.Native]::OpenClipboard([IntPtr]::Zero)) {
+      return $true
+    }
+    Start-Sleep -Milliseconds 10
+  }
+  return $false
+}
+
+function Read-Clipboard {
+  param([hashtable]$Target)
+
+  $CF_UNICODETEXT = [uint32]13
+  $opened = $false
+  try {
+    if (-not (Open-ClipboardWithRetry)) {
+      throw "Failed to open clipboard after multiple retries."
+    }
+    $opened = $true
+
+    if (-not [ScreenshotTool.Native]::IsClipboardFormatAvailable($CF_UNICODETEXT)) {
+      return [ordered]@{
+        available = $false
+        text = ''
+        length = 0
+        timestamp = (Get-Date).ToUniversalTime().ToString("o")
+      }
+    }
+
+    $hData = [ScreenshotTool.Native]::GetClipboardData($CF_UNICODETEXT)
+    if ($hData -eq [IntPtr]::Zero) {
+      return [ordered]@{
+        available = $false
+        text = ''
+        length = 0
+        timestamp = (Get-Date).ToUniversalTime().ToString("o")
+      }
+    }
+
+    $ptr = [ScreenshotTool.Native]::GlobalLock($hData)
+    if ($ptr -eq [IntPtr]::Zero) {
+      throw "Failed to lock clipboard memory."
+    }
+    try {
+      $text = [System.Runtime.InteropServices.Marshal]::PtrToStringUni($ptr)
+      if ($null -eq $text) { $text = '' }
+      return [ordered]@{
+        available = $true
+        text = $text
+        length = $text.Length
+        timestamp = (Get-Date).ToUniversalTime().ToString("o")
+      }
+    } finally {
+      [ScreenshotTool.Native]::GlobalUnlock($hData) | Out-Null
+    }
+  } finally {
+    if ($opened) {
+      [ScreenshotTool.Native]::CloseClipboard() | Out-Null
+    }
+  }
+}
+
+function Write-Clipboard {
+  param([hashtable]$Target)
+
+  $text = ''
+  if ($Target.ContainsKey('text') -and $null -ne $Target.text) {
+    $text = [string]$Target.text
+  }
+
+  $CF_UNICODETEXT = [uint32]13
+  # GMEM_MOVEABLE (0x0002) | GMEM_ZEROINIT (0x0040) — required for SetClipboardData.
+  $GMEM_FLAGS = [uint32]0x0042
+
+  # UTF-16 byte count including the trailing null terminator.
+  $charCount = $text.Length + 1
+  $byteCount = $charCount * 2
+
+  $opened = $false
+  $hMem = [IntPtr]::Zero
+  $ownershipTransferred = $false
+  try {
+    if (-not (Open-ClipboardWithRetry)) {
+      throw "Failed to open clipboard after multiple retries."
+    }
+    $opened = $true
+
+    if (-not [ScreenshotTool.Native]::EmptyClipboard()) {
+      throw "Failed to empty clipboard."
+    }
+
+    $hMem = [ScreenshotTool.Native]::GlobalAlloc($GMEM_FLAGS, [UIntPtr]([uint64]$byteCount))
+    if ($hMem -eq [IntPtr]::Zero) {
+      throw "GlobalAlloc failed for $byteCount bytes."
+    }
+
+    $ptr = [ScreenshotTool.Native]::GlobalLock($hMem)
+    if ($ptr -eq [IntPtr]::Zero) {
+      throw "Failed to lock clipboard memory."
+    }
+    try {
+      # Encode as UTF-16LE without BOM, append null terminator.
+      $encoder = New-Object System.Text.UnicodeEncoding($false, $false)
+      $bytes = $encoder.GetBytes($text)
+      if ($bytes.Length -gt 0) {
+        [System.Runtime.InteropServices.Marshal]::Copy($bytes, 0, $ptr, $bytes.Length)
+      }
+      # Null terminator: GMEM_ZEROINIT zeroed the buffer, but be explicit.
+      $zero = [byte[]]@(0, 0)
+      $tail = [IntPtr]($ptr.ToInt64() + $bytes.Length)
+      [System.Runtime.InteropServices.Marshal]::Copy($zero, 0, $tail, 2)
+    } finally {
+      [ScreenshotTool.Native]::GlobalUnlock($hMem) | Out-Null
+    }
+
+    $setResult = [ScreenshotTool.Native]::SetClipboardData($CF_UNICODETEXT, $hMem)
+    if ($setResult -eq [IntPtr]::Zero) {
+      throw "SetClipboardData failed."
+    }
+    # Ownership transferred to the system — we must NOT free hMem.
+    $ownershipTransferred = $true
+
+    return [ordered]@{
+      written = $true
+      length = $text.Length
+      timestamp = (Get-Date).ToUniversalTime().ToString("o")
+    }
+  } finally {
+    if ($opened) {
+      [ScreenshotTool.Native]::CloseClipboard() | Out-Null
+    }
+    if ($hMem -ne [IntPtr]::Zero -and -not $ownershipTransferred) {
+      [ScreenshotTool.Native]::GlobalFree($hMem) | Out-Null
+    }
+  }
+}
+
+function Get-WindowState {
+  param([hashtable]$Target)
+
+  $window = Resolve-TargetWindow -Target $Target -IncludeHidden
+  $hwnd = [IntPtr]([int64]$window.hwnd)
+
+  $GWL_STYLE = -16
+  $GWL_EXSTYLE = -20
+  $WS_DISABLED = [int64]0x08000000
+  $WS_EX_TOPMOST = [int64]0x00000008
+  $WS_EX_TOOLWINDOW = [int64]0x00000080
+  $WS_EX_LAYERED = [int64]0x00080000
+  $WS_EX_TRANSPARENT = [int64]0x00000020
+  $WS_EX_NOACTIVATE = [int64]0x08000000
+
+  # GetWindowLongPtrW only exists in 64-bit builds; on 32-bit PowerShell,
+  # fall back to GetWindowLongW. Use [IntPtr]::Size to detect at runtime.
+  if ([IntPtr]::Size -eq 8) {
+    $style = [ScreenshotTool.Native]::GetWindowLong64($hwnd, $GWL_STYLE).ToInt64()
+    $exStyle = [ScreenshotTool.Native]::GetWindowLong64($hwnd, $GWL_EXSTYLE).ToInt64()
+  } else {
+    $style = [int64][ScreenshotTool.Native]::GetWindowLong32($hwnd, $GWL_STYLE)
+    $exStyle = [int64][ScreenshotTool.Native]::GetWindowLong32($hwnd, $GWL_EXSTYLE)
+  }
+  $maximized = [bool][ScreenshotTool.Native]::IsZoomed($hwnd)
+  $minimized = [bool][ScreenshotTool.Native]::IsIconic($hwnd)
+  $visible = [bool][ScreenshotTool.Native]::IsWindowVisible($hwnd)
+  $cloaked = Test-WindowCloaked $hwnd
+  $foreground = ([ScreenshotTool.Native]::GetForegroundWindow() -eq $hwnd)
+  $enabled = (($style -band $WS_DISABLED) -eq 0)
+  $topmost = (($exStyle -band $WS_EX_TOPMOST) -ne 0)
+  $toolWindow = (($exStyle -band $WS_EX_TOOLWINDOW) -ne 0)
+  $layered = (($exStyle -band $WS_EX_LAYERED) -ne 0)
+  $clickThrough = (($exStyle -band $WS_EX_TRANSPARENT) -ne 0)
+  $noActivate = (($exStyle -band $WS_EX_NOACTIVATE) -ne 0)
+
+  $alpha = 255
+  if ($layered) {
+    $crKey = [uint32]0
+    $bAlpha = [byte]0
+    $dwFlags = [uint32]0
+    if ([ScreenshotTool.Native]::GetLayeredWindowAttributes($hwnd, [ref]$crKey, [ref]$bAlpha, [ref]$dwFlags)) {
+      # LWA_ALPHA = 0x2 — alpha valid only when this flag is set.
+      if (($dwFlags -band 0x2) -ne 0) {
+        $alpha = [int]$bAlpha
+      }
+    }
+  }
+
+  return [ordered]@{
+    hwnd = $window.hwnd
+    title = $window.title
+    pid = $window.pid
+    processName = $window.processName
+    className = $window.className
+    rect = $window.rect
+    visible = $visible
+    minimized = $minimized
+    maximized = $maximized
+    foreground = $foreground
+    enabled = $enabled
+    topmost = $topmost
+    toolWindow = $toolWindow
+    layered = $layered
+    clickThrough = $clickThrough
+    noActivate = $noActivate
+    cloaked = $cloaked
+    alpha = $alpha
+    style = ('0x{0:X8}' -f ([uint32]($style -band 0xFFFFFFFF)))
+    exStyle = ('0x{0:X8}' -f ([uint32]($exStyle -band 0xFFFFFFFF)))
+    timestamp = (Get-Date).ToUniversalTime().ToString("o")
+  }
+}
+
+function Wait-ForWindow {
+  param([hashtable]$Target)
+
+  $mode = 'appear'
+  if ($Target.ContainsKey('mode') -and -not [string]::IsNullOrWhiteSpace($Target.mode)) {
+    $mode = [string]$Target.mode
+  }
+  if ($mode -ne 'appear' -and $mode -ne 'disappear') {
+    throw "mode must be 'appear' or 'disappear'."
+  }
+
+  $timeoutMs = 30000
+  if ($Target.ContainsKey('timeoutMs') -and $null -ne $Target.timeoutMs) {
+    $timeoutMs = [int]$Target.timeoutMs
+  }
+  $pollIntervalMs = 100
+  if ($Target.ContainsKey('pollIntervalMs') -and $null -ne $Target.pollIntervalMs) {
+    $pollIntervalMs = [int]$Target.pollIntervalMs
+    if ($pollIntervalMs -lt 50) { $pollIntervalMs = 50 }
+  }
+
+  # Build filter hashtable from selectors that are present.
+  $filters = @{}
+  foreach ($key in @('hwnd', 'pid', 'processName', 'titleContains')) {
+    if ($Target.ContainsKey($key) -and $null -ne $Target[$key]) {
+      $filters[$key] = $Target[$key]
+    }
+  }
+  if ($filters.Count -eq 0) {
+    throw "Provide at least one of hwnd, pid, processName, or titleContains."
+  }
+
+  $startMs = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
+  $deadline = $startMs + $timeoutMs
+
+  while ($true) {
+    $matched = @(Filter-Windows (Get-VisibleWindows) $filters)
+
+    if ($mode -eq 'appear') {
+      if ($matched.Count -gt 0) {
+        $elapsed = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() - $startMs
+        return [ordered]@{
+          found = $true
+          mode = $mode
+          window = $matched[0]
+          elapsedMs = [int]$elapsed
+          timestamp = (Get-Date).ToUniversalTime().ToString("o")
+        }
+      }
+    } else {
+      if ($matched.Count -eq 0) {
+        $elapsed = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() - $startMs
+        return [ordered]@{
+          found = $true
+          mode = $mode
+          window = $null
+          elapsedMs = [int]$elapsed
+          timestamp = (Get-Date).ToUniversalTime().ToString("o")
+        }
+      }
+    }
+
+    if ([DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() -ge $deadline) {
+      $elapsed = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() - $startMs
+      return [ordered]@{
+        found = $false
+        mode = $mode
+        window = $null
+        elapsedMs = [int]$elapsed
+        timeoutMs = $timeoutMs
+        timestamp = (Get-Date).ToUniversalTime().ToString("o")
+      }
+    }
+
+    Start-Sleep -Milliseconds $pollIntervalMs
+  }
+}
+
+
 function Wait-And-Suppress {
   param([hashtable]$Target)
 
@@ -1952,6 +2295,18 @@ function Invoke-Action {
     }
     "wait-and-suppress" {
       return Wait-And-Suppress -Target $Request.target
+    }
+    "read-clipboard" {
+      return Read-Clipboard -Target $Request.target
+    }
+    "write-clipboard" {
+      return Write-Clipboard -Target $Request.target
+    }
+    "get-window-state" {
+      return Get-WindowState -Target $Request.target
+    }
+    "wait-for-window" {
+      return Wait-ForWindow -Target $Request.target
     }
     default {
       throw "Unknown action: $($Request.action)"

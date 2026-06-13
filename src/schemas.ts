@@ -158,6 +158,35 @@ export const sendKeySchema = z.object({
   "Provide at least one of hwnd, pid, processName, or titleContains."
 );
 
+export const readClipboardSchema = z.object({});
+
+export const writeClipboardSchema = z.object({
+  text: z.string()
+});
+
+export const getWindowStateSchema = z.object({
+  hwnd: z.union([z.string().min(1), z.number().int().positive()]).optional(),
+  pid: z.number().int().positive().optional(),
+  processName: z.string().min(1).optional(),
+  titleContains: z.string().min(1).optional()
+}).refine(
+  (value) => value.hwnd !== undefined || value.pid !== undefined || value.processName !== undefined || value.titleContains !== undefined,
+  "Provide at least one of hwnd, pid, processName, or titleContains."
+);
+
+export const waitForWindowSchema = z.object({
+  hwnd: z.union([z.string().min(1), z.number().int().positive()]).optional(),
+  pid: z.number().int().positive().optional(),
+  processName: z.string().min(1).optional(),
+  titleContains: z.string().min(1).optional(),
+  mode: z.enum(["appear", "disappear"]).optional().default("appear"),
+  timeoutMs: z.number().int().min(100).max(300_000).optional().default(30_000),
+  pollIntervalMs: z.number().int().min(50).max(10_000).optional().default(100)
+}).refine(
+  (value) => value.hwnd !== undefined || value.pid !== undefined || value.processName !== undefined || value.titleContains !== undefined,
+  "Provide at least one of hwnd, pid, processName, or titleContains."
+);
+
 export type LaunchAppInput = z.infer<typeof launchAppSchema>;
 export type ListWindowsInput = z.infer<typeof listWindowsSchema>;
 export type CaptureWindowInput = z.infer<typeof captureWindowSchema>;
@@ -168,6 +197,10 @@ export type ClickMenuItemInput = z.infer<typeof clickMenuItemSchema>;
 export type CloseAppInput = z.infer<typeof closeAppSchema>
 export type TypeTextInput = z.infer<typeof typeTextSchema>
 export type SendKeyInput = z.infer<typeof sendKeySchema>;
+export type ReadClipboardInput = z.infer<typeof readClipboardSchema>;
+export type WriteClipboardInput = z.infer<typeof writeClipboardSchema>;
+export type GetWindowStateInput = z.infer<typeof getWindowStateSchema>;
+export type WaitForWindowInput = z.infer<typeof waitForWindowSchema>;
 
 export const toolInputSchemas = {
   launch_app: {
@@ -330,6 +363,42 @@ export const toolInputSchemas = {
       noActivate: { type: "boolean", default: false, description: "When true, sends WM_KEYDOWN/WM_KEYUP via PostMessage instead of keybd_event, so the target window never needs focus. Some applications may not respond to posted messages." }
     },
     required: ["key"],
+    additionalProperties: false
+  },
+  read_clipboard: {
+    type: "object",
+    properties: {},
+    additionalProperties: false
+  },
+  write_clipboard: {
+    type: "object",
+    properties: {
+      text: { type: "string", description: "UTF-16 text to place on the clipboard. Pass an empty string to clear text content. Newlines and CJK characters are supported." }
+    },
+    required: ["text"],
+    additionalProperties: false
+  },
+  get_window_state: {
+    type: "object",
+    properties: {
+      hwnd: { type: "string", description: "Window handle from list_windows or launch_app. Numbers are accepted at runtime, but strings are safest for Codex." },
+      pid: { type: "integer", minimum: 1 },
+      processName: { type: "string" },
+      titleContains: { type: "string" }
+    },
+    additionalProperties: false
+  },
+  wait_for_window: {
+    type: "object",
+    properties: {
+      hwnd: { type: "string", description: "Window handle to wait for. Useful with mode=disappear to wait until a specific window closes." },
+      pid: { type: "integer", minimum: 1 },
+      processName: { type: "string" },
+      titleContains: { type: "string" },
+      mode: { type: "string", enum: ["appear", "disappear"], default: "appear", description: "appear: return when any matching window exists. disappear: return when no matching window exists." },
+      timeoutMs: { type: "integer", minimum: 100, maximum: 300000, default: 30000, description: "Maximum time to wait. On timeout, the call returns found=false instead of throwing." },
+      pollIntervalMs: { type: "integer", minimum: 50, maximum: 10000, default: 100, description: "Polling interval. Lower = faster response, higher CPU." }
+    },
     additionalProperties: false
   }
 } as const;

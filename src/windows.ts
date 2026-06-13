@@ -13,7 +13,11 @@ import type {
   ListWindowsInput,
   MoveMouseWindowInput,
   TypeTextInput,
-  SendKeyInput
+  SendKeyInput,
+  ReadClipboardInput,
+  WriteClipboardInput,
+  GetWindowStateInput,
+  WaitForWindowInput
 } from "./schemas.js";
 
 export type WaitAndSuppressInput = {
@@ -114,6 +118,46 @@ export type SendKeyResult = {
   timestamp: string
 }
 
+export type ReadClipboardResult = {
+  available: boolean
+  text: string
+  length: number
+  timestamp: string
+}
+
+export type WriteClipboardResult = {
+  written: boolean
+  length: number
+  timestamp: string
+}
+
+export type WindowStateResult = WindowInfo & {
+  visible: boolean
+  minimized: boolean
+  maximized: boolean
+  foreground: boolean
+  enabled: boolean
+  topmost: boolean
+  toolWindow: boolean
+  layered: boolean
+  clickThrough: boolean
+  noActivate: boolean
+  cloaked: boolean
+  alpha: number
+  style: string
+  exStyle: string
+  timestamp: string
+}
+
+export type WaitForWindowResult = {
+  found: boolean
+  mode: "appear" | "disappear"
+  window: WindowInfo | null
+  elapsedMs: number
+  timeoutMs?: number
+  timestamp: string
+}
+
 type NativeMenuResult = {
   index: number;
   text: string;
@@ -139,6 +183,10 @@ type HelperRequest =
   | { action: "minimize-window"; target: { hwnd: string } }
   | { action: "noactivate-minimize"; target: { hwnd: string } }
   | { action: "wait-and-suppress"; target: WaitAndSuppressInput }
+  | { action: "read-clipboard"; target?: Record<string, unknown> }
+  | { action: "write-clipboard"; target: WriteClipboardInput }
+  | { action: "get-window-state"; target: GetWindowStateInput }
+  | { action: "wait-for-window"; target: Omit<WaitForWindowInput, "timeoutMs" | "pollIntervalMs"> & { timeoutMs?: number; pollIntervalMs?: number } }
 
 export function getDefaultOutputDir(): string {
   return defaultOutputDir
@@ -150,6 +198,28 @@ export async function typeText(input: TypeTextInput): Promise<TypeTextResult> {
 
 export async function sendKey(input: SendKeyInput): Promise<SendKeyResult> {
   return runHelper<SendKeyResult>({ action: "send-key", target: input })
+}
+
+export async function readClipboard(_input?: ReadClipboardInput): Promise<ReadClipboardResult> {
+  return runHelper<ReadClipboardResult>({ action: "read-clipboard", target: {} })
+}
+
+export async function writeClipboard(input: WriteClipboardInput): Promise<WriteClipboardResult> {
+  return runHelper<WriteClipboardResult>({ action: "write-clipboard", target: input })
+}
+
+export async function getWindowState(input: GetWindowStateInput): Promise<WindowStateResult> {
+  return runHelper<WindowStateResult>({ action: "get-window-state", target: input })
+}
+
+export async function waitForWindow(input: WaitForWindowInput): Promise<WaitForWindowResult> {
+  // Use the persistent worker process, but with an extended per-request
+  // timeout to accommodate long waits (up to 300s). This keeps the Node
+  // event loop unblocked so callers can schedule closeApp etc. in parallel.
+  return runHelper<WaitForWindowResult>(
+    { action: "wait-for-window", target: input },
+    (input.timeoutMs ?? 30_000) + 5000
+  );
 }
 
 export async function ensureExecutablePath(exePath: string): Promise<void> {
@@ -248,12 +318,12 @@ export async function launchApp(input: LaunchAppInput): Promise<{ pid: number; w
         }
       }
     } catch {
-      // Fallback: try the normal waitForWindow path.
+      // Fallback: try the normal pollForWindow path.
     }
   }
 
   if (!window) {
-    window = await waitForWindow(child.pid, processName, existingHwnds, input.timeoutMs, exitState);
+    window = await pollForWindow(child.pid, processName, existingHwnds, input.timeoutMs, exitState);
   }
 
   if (window === null && exitState.exited) {
@@ -312,7 +382,7 @@ export async function clickMenuItem(input: ClickMenuItemInput): Promise<ClickMen
   return runHelper<ClickMenuItemResult>({ action: "click-menu-item", target: input });
 }
 
-async function waitForWindow(
+async function pollForWindow(
   pid: number,
   processName: string,
   existingHwnds: Set<string>,
@@ -575,13 +645,15 @@ function killWorker(worker: Worker, reason: string): void {
   console.error(`PowerShell worker killed: ${reason}`);
 }
 
-async function runHelper<T>(request: HelperRequest): Promise<T> {
+async function runHelper<T>(request: HelperRequest, customTimeoutMs?: number): Promise<T> {
   const worker = await getWorker();
 
   if (worker.exited || !worker.child.stdin || worker.child.stdin.destroyed) {
     activeWorker = null;
     throw new Error(`PowerShell helper not available (action=${request.action}).`);
   }
+
+  const timeoutMs = customTimeoutMs ?? HELPER_TIMEOUT_MS;
 
   return new Promise<T>((resolve, reject) => {
     const timeout = setTimeout(() => {
@@ -591,9 +663,9 @@ async function runHelper<T>(request: HelperRequest): Promise<T> {
       }
       // The request order is broken once a request times out — restart the worker
       // so subsequent requests get correlated with their responses again.
-      killWorker(worker, `action=${request.action} exceeded ${HELPER_TIMEOUT_MS}ms`);
-      reject(new Error(`PowerShell helper timed out after ${HELPER_TIMEOUT_MS}ms (action=${request.action}).`));
-    }, HELPER_TIMEOUT_MS);
+      killWorker(worker, `action=${request.action} exceeded ${timeoutMs}ms`);
+      reject(new Error(`PowerShell helper timed out after ${timeoutMs}ms (action=${request.action}).`));
+    }, timeoutMs);
 
     worker.queue.push({
       resolve: resolve as (value: unknown) => void,

@@ -19,6 +19,9 @@
     "smoke:p1-fixes": "tsx tests/smoke-p1-fixes.ts",
     "smoke:perf": "tsx tests/smoke-perf.ts",
     "smoke:no-activate": "tsx tests/smoke-no-activate.ts",
+    "smoke:clipboard": "tsx tests/smoke-clipboard.ts",
+    "smoke:window-state": "tsx tests/smoke-window-state.ts",
+    "smoke:wait-for-window": "tsx tests/smoke-wait-for-window.ts",
     "inspect": "npx @modelcontextprotocol/inspector node dist/index.js"
   },
   "engines": {

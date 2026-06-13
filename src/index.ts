@@ -20,7 +20,11 @@ import {
   moveMouseWindowSchema,
   toolInputSchemas,
   typeTextSchema,
-  sendKeySchema
+  sendKeySchema,
+  readClipboardSchema,
+  writeClipboardSchema,
+  getWindowStateSchema,
+  waitForWindowSchema
 } from "./schemas.js";
 import {
   captureScreenRegion,
@@ -34,7 +38,11 @@ import {
   moveMouseWindow,
   shutdownHelper,
   typeText,
-  sendKey
+  sendKey,
+  readClipboard,
+  writeClipboard,
+  getWindowState,
+  waitForWindow
 } from "./windows.js";
 
 const server = new Server(
@@ -100,6 +108,26 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
       name: "send_key",
       description: "Send a keystroke with optional modifiers. noActivate uses PostMessage WM_KEYDOWN/WM_KEYUP so the target window doesn't need focus.",
       inputSchema: toolInputSchemas.send_key
+    },
+    {
+      name: "read_clipboard",
+      description: "Read the current text content of the Windows clipboard. Returns available=false when no text is on the clipboard.",
+      inputSchema: toolInputSchemas.read_clipboard
+    },
+    {
+      name: "write_clipboard",
+      description: "Write text to the Windows clipboard. Supports Unicode including CJK and newlines. Pass an empty string to clear the clipboard. Use before send_key Ctrl+V for faster input than type_text.",
+      inputSchema: toolInputSchemas.write_clipboard
+    },
+    {
+      name: "get_window_state",
+      description: "Query a window's state: minimized, maximized, foreground, topmost, enabled, layered/alpha, cloaked, etc. More detailed than list_windows.",
+      inputSchema: toolInputSchemas.get_window_state
+    },
+    {
+      name: "wait_for_window",
+      description: "Block until a matching window appears (mode=appear) or disappears (mode=disappear). Returns found=false on timeout instead of throwing. More efficient than client-side polling.",
+      inputSchema: toolInputSchemas.wait_for_window
     }
   ]
 }));
@@ -129,6 +157,14 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         return jsonResult(await typeText(parseArgs(typeTextSchema, args)))
       case "send_key":
         return jsonResult(await sendKey(parseArgs(sendKeySchema, args)))
+      case "read_clipboard":
+        return jsonResult(await readClipboard(parseArgs(readClipboardSchema, args)))
+      case "write_clipboard":
+        return jsonResult(await writeClipboard(parseArgs(writeClipboardSchema, args)))
+      case "get_window_state":
+        return jsonResult(await getWindowState(parseArgs(getWindowStateSchema, args)))
+      case "wait_for_window":
+        return jsonResult(await waitForWindow(parseArgs(waitForWindowSchema, args)))
       default:
         throw new McpError(ErrorCode.MethodNotFound, `Unknown tool: ${name}`);
     }

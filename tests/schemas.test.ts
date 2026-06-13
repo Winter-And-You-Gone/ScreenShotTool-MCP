@@ -11,7 +11,11 @@ import {
   listWindowsSchema,
   moveMouseWindowSchema,
   sendKeySchema,
-  typeTextSchema
+  typeTextSchema,
+  readClipboardSchema,
+  writeClipboardSchema,
+  getWindowStateSchema,
+  waitForWindowSchema
 } from "../src/schemas.js";
 import { ensureOutputPath, getDefaultOutputDir, launchApp } from "../src/windows.js";
 
@@ -229,4 +233,46 @@ test("noActivate defaults to false on launch_app, capture_window, type_text, sen
   assert.equal(captureWindowSchema.parse({ hwnd: "1" }).noActivate, false);
   assert.equal(typeTextSchema.parse({ hwnd: "1", text: "a" }).noActivate, false);
   assert.equal(sendKeySchema.parse({ hwnd: "1", key: "a" }).noActivate, false);
+});
+
+test("read_clipboard accepts empty input object", () => {
+  const parsed = readClipboardSchema.parse({});
+  assert.deepEqual(parsed, {});
+});
+
+test("write_clipboard requires text and accepts empty string", () => {
+  const empty = writeClipboardSchema.parse({ text: "" });
+  assert.equal(empty.text, "");
+
+  const nonEmpty = writeClipboardSchema.parse({ text: "hello 你好\nworld" });
+  assert.equal(nonEmpty.text, "hello 你好\nworld");
+
+  assert.throws(() => writeClipboardSchema.parse({}));
+});
+
+test("get_window_state requires a target selector", () => {
+  assert.throws(() => getWindowStateSchema.parse({}));
+
+  const byHwnd = getWindowStateSchema.parse({ hwnd: "12345" });
+  assert.equal(byHwnd.hwnd, "12345");
+
+  const byPid = getWindowStateSchema.parse({ pid: 1234 });
+  assert.equal(byPid.pid, 1234);
+});
+
+test("wait_for_window requires a target and accepts mode + timeout defaults", () => {
+  assert.throws(() => waitForWindowSchema.parse({}));
+
+  const withDefaults = waitForWindowSchema.parse({ processName: "notepad" });
+  assert.equal(withDefaults.mode, "appear");
+  assert.equal(withDefaults.timeoutMs, 30_000);
+  assert.equal(withDefaults.pollIntervalMs, 100);
+
+  const disappear = waitForWindowSchema.parse({ hwnd: "1", mode: "disappear", timeoutMs: 5000 });
+  assert.equal(disappear.mode, "disappear");
+  assert.equal(disappear.timeoutMs, 5000);
+
+  assert.throws(() => waitForWindowSchema.parse({ pid: 1, mode: "invalid" }));
+  assert.throws(() => waitForWindowSchema.parse({ pid: 1, timeoutMs: 50 }));
+  assert.throws(() => waitForWindowSchema.parse({ pid: 1, timeoutMs: 999_999 }));
 });
