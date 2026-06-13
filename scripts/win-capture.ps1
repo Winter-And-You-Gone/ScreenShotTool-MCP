@@ -133,6 +133,11 @@ namespace ScreenshotTool {
     [DllImport("user32.dll")]
     public static extern IntPtr SendMessage(IntPtr hWnd, uint Msg, IntPtr wParam, IntPtr lParam);
 
+    // EM_REPLACESEL (and other standard messages) — Windows marshals the
+    // string across process boundaries automatically.
+    [DllImport("user32.dll", CharSet = CharSet.Unicode, EntryPoint = "SendMessageW")]
+    public static extern IntPtr SendMessageStr(IntPtr hWnd, uint Msg, IntPtr wParam, string lParam);
+
     [DllImport("user32.dll", SetLastError = true)]
     public static extern bool ScreenToClient(IntPtr hWnd, ref POINT lpPoint);
 
@@ -486,17 +491,46 @@ function Resolve-TargetWindow {
     [switch]$IncludeHidden
   )
 
+  # Fast path: when an hwnd is provided, skip the expensive full window
+  # enumeration and construct the WindowInfo directly from Win32 calls.
+  if ($Target.ContainsKey("hwnd") -and $null -ne $Target.hwnd) {
+    $hwndText = ([string]$Target.hwnd).Trim()
+    $parsedInt64 = [int64]0
+    if (-not [int64]::TryParse($hwndText, [ref]$parsedInt64)) {
+      throw "Invalid hwnd value: '$hwndText'. Must be a numeric window handle."
+    }
+    $hwnd = [IntPtr]$parsedInt64
+
+    $isVisible = [ScreenshotTool.Native]::IsWindowVisible($hwnd)
+    $isIconic = [ScreenshotTool.Native]::IsIconic($hwnd)
+    if ($isVisible -or $IncludeHidden) {
+      $rect = New-Object ScreenshotTool.Native+RECT
+      [ScreenshotTool.Native]::GetWindowRect($hwnd, [ref]$rect) | Out-Null
+      $pidValue = [uint32]0
+      [ScreenshotTool.Native]::GetWindowThreadProcessId($hwnd, [ref]$pidValue) | Out-Null
+      $titleBuilder = New-Object System.Text.StringBuilder 256
+      [ScreenshotTool.Native]::GetWindowText($hwnd, $titleBuilder, $titleBuilder.Capacity) | Out-Null
+      $classBuilder = New-Object System.Text.StringBuilder 256
+      [ScreenshotTool.Native]::GetClassName($hwnd, $classBuilder, $classBuilder.Capacity) | Out-Null
+
+      return [ordered]@{
+        hwnd        = $hwndText
+        title       = $titleBuilder.ToString()
+        pid         = [int]$pidValue
+        processName = Get-WindowProcessName $pidValue
+        className   = $classBuilder.ToString()
+        rect        = Get-RectObject $rect
+        visible     = $isVisible
+        iconic      = $isIconic
+      }
+    }
+
+    throw "No window found for hwnd $hwndText."
+  }
+
   $windows = if ($IncludeHidden) { Get-AllWindows } else { Get-VisibleWindows }
   if ($null -eq $windows) { $windows = @() }
   $windows = @($windows)
-
-  if ($Target.ContainsKey("hwnd") -and $null -ne $Target.hwnd) {
-    $hwndText = ([string]$Target.hwnd).Trim()
-    foreach ($w in $windows) {
-      if ($w.hwnd -eq $hwndText) { return $w }
-    }
-    throw "No window found for hwnd $hwndText."
-  }
 
   $filtered = @(Filter-Windows $windows $Target)
   if ($filtered.Count -lt 1) {
@@ -1629,13 +1663,15 @@ function Type-Text {
 
     # If GetGUIThreadInfo didn't give us a focus child (window is in
     # the background), search for an editable child control by class name.
+    $targetClassName = ''
     if ($targetHwnd -eq $hwnd) {
       $editClasses = @(
         'Scintilla', 'Edit', 'RichEdit20W', 'RichEdit20A',
         'RICHEDIT50W', 'RichEdit', 'TextBox', 'TEXTEDIT',
         'ATL:006C0280', 'AfxWnd42su', 'NetUIHWND'
       )
-      $foundChild = [IntPtr]::Zero
+      $script:foundEditChild = [IntPtr]::Zero
+      $script:foundEditClass = ''
       $enumProc = [ScreenshotTool.Native+EnumWindowsProc]{
         param([IntPtr]$Child, [IntPtr]$LParam)
         $cn = New-Object System.Text.StringBuilder 256
@@ -1644,15 +1680,51 @@ function Type-Text {
         foreach ($ec in $editClasses) {
           if ($className -ieq $ec) {
             $script:foundEditChild = $Child
+            $script:foundEditClass = $className
             return $false
           }
         }
         return $true
       }
-      $script:foundEditChild = [IntPtr]::Zero
       [ScreenshotTool.Native]::EnumChildWindows($hwnd, $enumProc, [IntPtr]::Zero) | Out-Null
       if ($script:foundEditChild -ne [IntPtr]::Zero) {
         $targetHwnd = $script:foundEditChild
+        $targetClassName = $script:foundEditClass
+      }
+    } else {
+      $cnBuf = New-Object System.Text.StringBuilder 256
+      [ScreenshotTool.Native]::GetClassName($targetHwnd, $cnBuf, $cnBuf.Capacity) | Out-Null
+      $targetClassName = $cnBuf.ToString()
+    }
+
+    # Edit-style controls (Scintilla, standard Edit, RichEdit) accept
+    # EM_REPLACESEL with a single string. The kernel marshals the string
+    # across process boundaries, so we don't need WriteProcessMemory.
+    # Scintilla also responds to EM_REPLACESEL for legacy compatibility.
+    $EM_REPLACESEL = [uint32]0x00C2
+    $editLikeClasses = @(
+      'Scintilla', 'Edit', 'RichEdit20W', 'RichEdit20A',
+      'RICHEDIT50W', 'RichEdit', 'TEXTEDIT'
+    )
+    $useReplaceSel = $false
+    foreach ($ec in $editLikeClasses) {
+      if ($targetClassName -ieq $ec) { $useReplaceSel = $true; break }
+    }
+
+    if ($useReplaceSel -and $text.Length -gt 0) {
+      [ScreenshotTool.Native]::SendMessageStr($targetHwnd, $EM_REPLACESEL, [IntPtr]1, $text) | Out-Null
+      if ($delayMs -gt 0) {
+        Start-Sleep -Milliseconds $delayMs
+      }
+      return [ordered]@{
+        typed = $true
+        target = "window:" + $window.hwnd
+        hwnd = $window.hwnd
+        title = $window.title
+        pid = $window.pid
+        textLength = $text.Length
+        skipped = @($skipped.ToArray())
+        timestamp = (Get-Date).ToUniversalTime().ToString("o")
       }
     }
 
@@ -1749,13 +1821,9 @@ function Wait-And-Suppress {
   # call so there is no round-trip delay that would let the window flash
   # on top of other windows.
   $targetPid = [int]$Target.pid
-  $processName = $null
-  if ($Target.ContainsKey("processName") -and -not [string]::IsNullOrWhiteSpace($Target.processName)) {
-    $processName = Normalize-ProcessName $Target.processName
-  }
-  $existingHwnds = @()
+  $existingHwnds = New-Object System.Collections.Generic.HashSet[string]
   if ($Target.ContainsKey("existingHwnds") -and $null -ne $Target.existingHwnds) {
-    $existingHwnds = @($Target.existingHwnds | ForEach-Object { [string]$_ })
+    foreach ($h in @($Target.existingHwnds)) { $existingHwnds.Add([string]$h) | Out-Null }
   }
   $timeoutMs = 10000
   if ($Target.ContainsKey("timeoutMs") -and $null -ne $Target.timeoutMs) {
@@ -1769,54 +1837,73 @@ function Wait-And-Suppress {
   $pushFlags = $SWP_NOSIZE -bor $SWP_NOMOVE -bor $SWP_NOACTIVATE
 
   $deadline = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() + $timeoutMs
-  $foundWindow = $null
 
-  while ([DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() -lt $deadline) {
-    $allVisible = Get-VisibleWindows
-
-    # Try by pid first
-    $byPid = @($allVisible | Where-Object { $_.pid -eq $targetPid })
-    if ($byPid.Count -gt 0) {
-      $foundWindow = $byPid[0]
-      break
-    }
-
-    # Try by processName + new hwnd
-    if ($null -ne $processName) {
-      $byName = @($allVisible | Where-Object {
-        $_.processName -ieq $processName -and -not $existingHwnds.Contains($_.hwnd)
-      })
-      if ($byName.Count -gt 0) {
-        $foundWindow = $byName[0]
-        break
-      }
-    }
-
-    Start-Sleep -Milliseconds 50
+  # Lean enumeration callback: skip object construction, only check the bare
+  # minimum (PID + visibility + new hwnd + non-empty rect) and push to bottom
+  # the instant we find a match.
+  $foundHwnd = [IntPtr]::Zero
+  $script:foundTargetHwnd = [IntPtr]::Zero
+  $enumProc = [ScreenshotTool.Native+EnumWindowsProc]{
+    param([IntPtr]$Hwnd, [IntPtr]$LParam)
+    if (-not [ScreenshotTool.Native]::IsWindowVisible($Hwnd)) { return $true }
+    $pidValue = [uint32]0
+    [ScreenshotTool.Native]::GetWindowThreadProcessId($Hwnd, [ref]$pidValue) | Out-Null
+    if ([int]$pidValue -ne $targetPid) { return $true }
+    $hwndText = $Hwnd.ToInt64().ToString()
+    if ($existingHwnds.Contains($hwndText)) { return $true }
+    $rect = New-Object ScreenshotTool.Native+RECT
+    if (-not [ScreenshotTool.Native]::GetWindowRect($Hwnd, [ref]$rect)) { return $true }
+    if (($rect.Right - $rect.Left) -le 0 -or ($rect.Bottom - $rect.Top) -le 0) { return $true }
+    $script:foundTargetHwnd = $Hwnd
+    return $false
   }
 
-  if ($null -eq $foundWindow) {
+  while ([DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() -lt $deadline) {
+    $script:foundTargetHwnd = [IntPtr]::Zero
+    [ScreenshotTool.Native]::EnumWindows($enumProc, [IntPtr]::Zero) | Out-Null
+    if ($script:foundTargetHwnd -ne [IntPtr]::Zero) {
+      $foundHwnd = $script:foundTargetHwnd
+      break
+    }
+    Start-Sleep -Milliseconds 10
+  }
+
+  if ($foundHwnd -eq [IntPtr]::Zero) {
     return [ordered]@{
       found = $false
       window = $null
     }
   }
 
-  # Immediately push to bottom — this runs in the same PS process so
-  # the delay between detecting the window and suppressing it is <1ms.
-  $hwnd = [IntPtr]([int64]$foundWindow.hwnd)
-  [ScreenshotTool.Native]::SetWindowPos($hwnd, $hwndBottom, 0, 0, 0, 0, $pushFlags) | Out-Null
-
-  # Restore the previous foreground window.  The new window likely stole
-  # focus when it appeared.  We use the Alt-key trick to bypass the
-  # SetForegroundWindow restriction, then restore the original foreground.
+  # Restore previous foreground FIRST (so the user perceives no focus
+  # change), then push the new window to the bottom of the z-order.
   if ($Target.ContainsKey("previousForegroundHwnd") -and $null -ne $Target.previousForegroundHwnd) {
     $prevFg = [IntPtr]([int64]$Target.previousForegroundHwnd)
-    if ($prevFg -ne [IntPtr]::Zero -and $prevFg -ne $hwnd) {
+    if ($prevFg -ne [IntPtr]::Zero -and $prevFg -ne $foundHwnd) {
       [ScreenshotTool.Native]::keybd_event([byte]0x12, 0, [uint32]0, [UIntPtr]::Zero)
       [ScreenshotTool.Native]::keybd_event([byte]0x12, 0, [uint32]2, [UIntPtr]::Zero)
       [ScreenshotTool.Native]::SetForegroundWindow($prevFg) | Out-Null
     }
+  }
+  [ScreenshotTool.Native]::SetWindowPos($foundHwnd, $hwndBottom, 0, 0, 0, 0, $pushFlags) | Out-Null
+
+  # Now build the full WindowInfo for the response.
+  $rectFinal = New-Object ScreenshotTool.Native+RECT
+  [ScreenshotTool.Native]::GetWindowRect($foundHwnd, [ref]$rectFinal) | Out-Null
+  $pidFinal = [uint32]0
+  [ScreenshotTool.Native]::GetWindowThreadProcessId($foundHwnd, [ref]$pidFinal) | Out-Null
+  $titleBuilder = New-Object System.Text.StringBuilder 256
+  [ScreenshotTool.Native]::GetWindowText($foundHwnd, $titleBuilder, $titleBuilder.Capacity) | Out-Null
+  $classBuilder = New-Object System.Text.StringBuilder 256
+  [ScreenshotTool.Native]::GetClassName($foundHwnd, $classBuilder, $classBuilder.Capacity) | Out-Null
+
+  $foundWindow = [ordered]@{
+    hwnd        = $foundHwnd.ToInt64().ToString()
+    title       = $titleBuilder.ToString()
+    pid         = [int]$pidFinal
+    processName = Get-WindowProcessName $pidFinal
+    className   = $classBuilder.ToString()
+    rect        = Get-RectObject $rectFinal
   }
 
   return [ordered]@{
