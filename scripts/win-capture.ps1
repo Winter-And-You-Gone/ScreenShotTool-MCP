@@ -1713,12 +1713,23 @@ function Type-Text {
     # If GetGUIThreadInfo didn't give us a focus child (window is in
     # the background), search for an editable child control by class name.
     $targetClassName = ''
+    # Edit class definitions: each entry maps a class name to whether it
+    # supports EM_REPLACESEL for bulk text insertion.  Classes not listed
+    # here default to replaceSel=$false and fall through to per-char WM_CHAR.
+    $editClassDefs = @{
+      'Scintilla'      = $true
+      'Edit'           = $true
+      'RichEdit20W'    = $true
+      'RichEdit20A'    = $true
+      'RICHEDIT50W'    = $true
+      'RichEdit'       = $true
+      'TEXTEDIT'       = $true
+      'TextBox'        = $false
+      'ATL:006C0280'   = $false
+      'AfxWnd42su'     = $false
+      'NetUIHWND'      = $false
+    }
     if ($targetHwnd -eq $hwnd) {
-      $editClasses = @(
-        'Scintilla', 'Edit', 'RichEdit20W', 'RichEdit20A',
-        'RICHEDIT50W', 'RichEdit', 'TextBox', 'TEXTEDIT',
-        'ATL:006C0280', 'AfxWnd42su', 'NetUIHWND'
-      )
       $script:foundEditChild = [IntPtr]::Zero
       $script:foundEditClass = ''
       $enumProc = [ScreenshotTool.Native+EnumWindowsProc]{
@@ -1726,8 +1737,8 @@ function Type-Text {
         $cn = New-Object System.Text.StringBuilder 256
         [ScreenshotTool.Native]::GetClassName($Child, $cn, $cn.Capacity) | Out-Null
         $className = $cn.ToString()
-        foreach ($ec in $editClasses) {
-          if ($className -ieq $ec) {
+        foreach ($key in $editClassDefs.Keys) {
+          if ($className -ieq $key) {
             $script:foundEditChild = $Child
             $script:foundEditClass = $className
             return $false
@@ -1746,18 +1757,13 @@ function Type-Text {
       $targetClassName = $cnBuf.ToString()
     }
 
-    # Edit-style controls (Scintilla, standard Edit, RichEdit) accept
-    # EM_REPLACESEL with a single string. The kernel marshals the string
-    # across process boundaries, so we don't need WriteProcessMemory.
-    # Scintilla also responds to EM_REPLACESEL for legacy compatibility.
+    # Edit-style controls that support EM_REPLACESEL can receive the entire
+    # text in one SendMessage call. The kernel marshals the string across
+    # process boundaries automatically, so we don't need WriteProcessMemory.
     $EM_REPLACESEL = [uint32]0x00C2
-    $editLikeClasses = @(
-      'Scintilla', 'Edit', 'RichEdit20W', 'RichEdit20A',
-      'RICHEDIT50W', 'RichEdit', 'TEXTEDIT'
-    )
     $useReplaceSel = $false
-    foreach ($ec in $editLikeClasses) {
-      if ($targetClassName -ieq $ec) { $useReplaceSel = $true; break }
+    if ($editClassDefs.ContainsKey($targetClassName)) {
+      $useReplaceSel = $editClassDefs[$targetClassName]
     }
 
     if ($useReplaceSel -and $text.Length -gt 0) {
@@ -1876,7 +1882,7 @@ function Open-ClipboardWithRetry {
 }
 
 function Read-Clipboard {
-  param([hashtable]$Target)
+  # No target parameter — clipboard is a global resource.
 
   $CF_UNICODETEXT = [uint32]13
   $opened = $false
@@ -1967,16 +1973,13 @@ function Write-Clipboard {
       throw "Failed to lock clipboard memory."
     }
     try {
-      # Encode as UTF-16LE without BOM, append null terminator.
+      # Encode as UTF-16LE without BOM. The trailing null terminator is
+      # already provided by GMEM_ZEROINIT (the buffer was zeroed at alloc).
       $encoder = New-Object System.Text.UnicodeEncoding($false, $false)
       $bytes = $encoder.GetBytes($text)
       if ($bytes.Length -gt 0) {
         [System.Runtime.InteropServices.Marshal]::Copy($bytes, 0, $ptr, $bytes.Length)
       }
-      # Null terminator: GMEM_ZEROINIT zeroed the buffer, but be explicit.
-      $zero = [byte[]]@(0, 0)
-      $tail = [IntPtr]($ptr.ToInt64() + $bytes.Length)
-      [System.Runtime.InteropServices.Marshal]::Copy($zero, 0, $tail, 2)
     } finally {
       [ScreenshotTool.Native]::GlobalUnlock($hMem) | Out-Null
     }
@@ -2088,6 +2091,9 @@ function Wait-ForWindow {
     throw "mode must be 'appear' or 'disappear'."
   }
 
+  # Default poll interval is 100ms — keep in sync with waitForWindowSchema
+  # default in src/schemas.ts (the TS default normally wins because it's
+  # always present in the request, but this is a defensive fallback).
   $timeoutMs = 30000
   if ($Target.ContainsKey('timeoutMs') -and $null -ne $Target.timeoutMs) {
     $timeoutMs = [int]$Target.timeoutMs
@@ -2113,7 +2119,11 @@ function Wait-ForWindow {
   $deadline = $startMs + $timeoutMs
 
   while ($true) {
-    $matched = @(Filter-Windows (Get-VisibleWindows) $filters)
+    # Use Get-AllWindows so iconic/cloaked windows aren't silently skipped —
+    # critical for `disappear` mode (else minimizing the window would falsely
+    # report it gone) and for `appear` waiting on a window that starts
+    # minimized.
+    $matched = @(Filter-Windows (Get-AllWindows) $filters)
 
     if ($mode -eq 'appear') {
       if ($matched.Count -gt 0) {

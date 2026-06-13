@@ -46,6 +46,8 @@ export type WindowInfo = {
   processName: string;
   className: string;
   rect: Rect;
+  visible?: boolean;
+  iconic?: boolean;
 };
 
 export type CaptureResult = {
@@ -213,13 +215,56 @@ export async function getWindowState(input: GetWindowStateInput): Promise<Window
 }
 
 export async function waitForWindow(input: WaitForWindowInput): Promise<WaitForWindowResult> {
-  // Use the persistent worker process, but with an extended per-request
-  // timeout to accommodate long waits (up to 300s). This keeps the Node
-  // event loop unblocked so callers can schedule closeApp etc. in parallel.
-  return runHelper<WaitForWindowResult>(
-    { action: "wait-for-window", target: input },
-    (input.timeoutMs ?? 30_000) + 5000
-  );
+  // Run in a SEPARATE PowerShell process (not the shared worker) so that a
+  // long wait (up to 300 s) doesn't starve other MCP tool calls.  Using
+  // async spawn (not spawnSync) keeps the Node event loop unblocked so
+  // callers can schedule closeApp etc. in parallel.
+  const timeoutMs = (input.timeoutMs ?? 30_000) + 5000;
+  const request = JSON.stringify({ action: "wait-for-window", target: input });
+
+  return new Promise<WaitForWindowResult>((resolve, reject) => {
+    const child = spawn(powershellCommand, [
+      "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", helperPath,
+      "-InputJson", request
+    ], {
+      shell: false,
+      windowsHide: true,
+      stdio: ["pipe", "pipe", "pipe"]
+    });
+
+    let stdout = "";
+    let stderr = "";
+
+    const timer = setTimeout(() => {
+      child.kill();
+      reject(new Error(`wait_for_window timed out after ${timeoutMs}ms.`));
+    }, timeoutMs);
+
+    child.stdout?.setEncoding("utf8");
+    child.stderr?.setEncoding("utf8");
+
+    child.stdout?.on("data", (chunk: string) => { stdout += chunk; });
+    child.stderr?.on("data", (chunk: string) => { stderr += chunk; });
+
+    child.on("close", (code) => {
+      clearTimeout(timer);
+      const out = stdout.trim();
+      if (code !== 0 || !out) {
+        reject(new Error(`wait_for_window failed (code=${code}): ${(stderr || "").trim()}`));
+        return;
+      }
+      try {
+        resolve(JSON.parse(out) as WaitForWindowResult);
+      } catch (err) {
+        reject(new Error(`wait_for_window returned invalid JSON: ${(err as Error).message}`));
+      }
+    });
+
+    child.on("error", (err) => {
+      clearTimeout(timer);
+      reject(err);
+    });
+  });
 }
 
 export async function ensureExecutablePath(exePath: string): Promise<void> {
@@ -645,15 +690,13 @@ function killWorker(worker: Worker, reason: string): void {
   console.error(`PowerShell worker killed: ${reason}`);
 }
 
-async function runHelper<T>(request: HelperRequest, customTimeoutMs?: number): Promise<T> {
+async function runHelper<T>(request: HelperRequest): Promise<T> {
   const worker = await getWorker();
 
   if (worker.exited || !worker.child.stdin || worker.child.stdin.destroyed) {
     activeWorker = null;
     throw new Error(`PowerShell helper not available (action=${request.action}).`);
   }
-
-  const timeoutMs = customTimeoutMs ?? HELPER_TIMEOUT_MS;
 
   return new Promise<T>((resolve, reject) => {
     const timeout = setTimeout(() => {
@@ -663,9 +706,9 @@ async function runHelper<T>(request: HelperRequest, customTimeoutMs?: number): P
       }
       // The request order is broken once a request times out — restart the worker
       // so subsequent requests get correlated with their responses again.
-      killWorker(worker, `action=${request.action} exceeded ${timeoutMs}ms`);
-      reject(new Error(`PowerShell helper timed out after ${timeoutMs}ms (action=${request.action}).`));
-    }, timeoutMs);
+      killWorker(worker, `action=${request.action} exceeded ${HELPER_TIMEOUT_MS}ms`);
+      reject(new Error(`PowerShell helper timed out after ${HELPER_TIMEOUT_MS}ms (action=${request.action}).`));
+    }, HELPER_TIMEOUT_MS);
 
     worker.queue.push({
       resolve: resolve as (value: unknown) => void,
