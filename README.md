@@ -99,6 +99,29 @@ npm run dev
 npm start
 ```
 
+## 热重载
+
+`npm start` 启动的 MCP server 默认启用工具层热重载：每次 `tools/list` 或工具调用前会检查 `dist/schemas.js`、`dist/windows.js` 和 `scripts/win-capture.ps1` 的修改时间；如果发生变化，会重新加载工具模块，并重启长驻 PowerShell helper。这样修改截图/点击/窗口操作逻辑后，通常不用重启 Codex 或 Inspector。
+
+TypeScript 源码改动仍然需要先编译到 `dist/`。开发时可以另开一个终端运行：
+
+```powershell
+npm run build:watch
+```
+
+然后保持 MCP 客户端继续使用：
+
+```powershell
+npm start
+```
+
+热重载边界：
+
+- `scripts/win-capture.ps1` 改动：下一次工具调用直接生效。
+- `src/windows.ts` / `src/schemas.ts` 改动：`npm run build` 或 `npm run build:watch` 编译后，下一次工具调用生效。
+- `src/index.ts`、依赖、启动参数、MCP transport 层改动：仍需重启 MCP server。
+- 如需关闭热重载，可设置环境变量 `SCREENSHOTTOOL_HOT_RELOAD=0` 后再启动 server。
+
 ---
 
 ## 🤖 给 AI Agent 的安装指引

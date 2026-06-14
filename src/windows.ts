@@ -749,10 +749,31 @@ export function shutdownHelper(): void {
       // ignore
     }
   }
+  activeWorker = null;
+  helperShutdowns.delete(shutdownHelper);
 }
 
-process.once("beforeExit", shutdownHelper);
-process.once("exit", shutdownHelper);
+type HelperGlobal = typeof globalThis & {
+  __screenshotToolHelperShutdowns?: Set<() => void>;
+  __screenshotToolHelperCleanupRegistered?: boolean;
+};
+
+const helperGlobal = globalThis as HelperGlobal;
+const helperShutdowns = helperGlobal.__screenshotToolHelperShutdowns ?? new Set<() => void>();
+helperGlobal.__screenshotToolHelperShutdowns = helperShutdowns;
+helperShutdowns.add(shutdownHelper);
+
+if (!helperGlobal.__screenshotToolHelperCleanupRegistered) {
+  helperGlobal.__screenshotToolHelperCleanupRegistered = true;
+  process.once("beforeExit", shutdownAllHelpers);
+  process.once("exit", shutdownAllHelpers);
+}
+
+function shutdownAllHelpers(): void {
+  for (const shutdown of [...helperShutdowns]) {
+    shutdown();
+  }
+}
 
 function timestampForFile(date = new Date()): string {
   const pad = (value: number) => String(value).padStart(2, "0");

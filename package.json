@@ -8,6 +8,7 @@
   },
   "scripts": {
     "build": "tsc -p tsconfig.json",
+    "build:watch": "tsc -p tsconfig.json --watch --preserveWatchOutput",
     "dev": "tsx src/index.ts",
     "start": "node dist/index.js",
     "test": "node --test --import tsx tests/*.test.ts",
