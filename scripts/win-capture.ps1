@@ -2055,6 +2055,9 @@ function Get-WindowState {
     }
   }
 
+  $styleHex = Format-WindowLongHex $style
+  $exStyleHex = Format-WindowLongHex $exStyle
+
   return [ordered]@{
     hwnd = $window.hwnd
     title = $window.title
@@ -2074,10 +2077,21 @@ function Get-WindowState {
     noActivate = $noActivate
     cloaked = $cloaked
     alpha = $alpha
-    style = ('0x{0:X8}' -f ([uint32]($style -band 0xFFFFFFFF)))
-    exStyle = ('0x{0:X8}' -f ([uint32]($exStyle -band 0xFFFFFFFF)))
+    style = $styleHex
+    exStyle = $exStyleHex
     timestamp = (Get-Date).ToUniversalTime().ToString("o")
   }
+}
+
+function Format-WindowLongHex {
+  param([int64]$Value)
+
+  $mask32 = [int64]4294967295
+  if ($Value -lt 0) {
+    $Value = $Value + 4294967296
+  }
+  $normalized = $Value -band $mask32
+  return '0x{0:X8}' -f ([uint32]$normalized)
 }
 
 function Wait-ForWindow {

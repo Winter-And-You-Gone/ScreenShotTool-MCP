@@ -61,7 +61,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
   tools: [
     {
       name: "launch_app",
-      description: "Launch a Windows .exe and optionally wait for its first visible window. Use noActivate to prevent the window from stealing focus.",
+      description: "Launch a Windows .exe and optionally wait for its first visible window. Use noActivate for best-effort background launch.",
       inputSchema: toolInputSchemas.launch_app
     },
     {

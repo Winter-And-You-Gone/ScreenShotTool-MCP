@@ -226,8 +226,8 @@ export const toolInputSchemas = {
       cwd: { type: "string", description: "Optional working directory for the process." },
       waitForWindow: { type: "boolean", default: true, description: "Wait for the first visible window for the process." },
       timeoutMs: { type: "integer", minimum: 100, maximum: 120000, default: 10000 },
-      startMinimized: { type: "boolean", default: false, description: "Start the process minimized. The window will not appear on top." },
-      noActivate: { type: "boolean", default: false, description: "When true, the window is placed at the bottom of the z-order without receiving focus. Combines well with startMinimized for fully non-intrusive launches." }
+      startMinimized: { type: "boolean", default: false, description: "After the first window is found, request minimized/background presentation. Some apps may briefly show during startup." },
+      noActivate: { type: "boolean", default: false, description: "Best-effort background launch: restore the previous foreground window and push the new window to the bottom of the z-order without activation when possible." }
     },
     required: ["exePath"],
     additionalProperties: false
@@ -262,7 +262,7 @@ export const toolInputSchemas = {
       },
       focus: { type: "boolean", default: true, description: "Bring the window to the foreground before capturing. Set false to preserve open menus, popups, or transient UI." },
       captureMethod: { type: "string", enum: ["screen", "print"], default: "screen", description: "Capture method: 'screen' uses CopyFromScreen (needs visible area), 'print' uses PrintWindow API (captures window content even behind other windows)." },
-      noActivate: { type: "boolean", default: false, description: "When true with captureMethod 'screen', the window is raised above overlapping windows without stealing keyboard focus, then restored after capture." },
+      noActivate: { type: "boolean", default: false, description: "When true, prefer non-activating capture. With captureMethod 'screen', the helper falls back to PrintWindow to avoid changing foreground/z-order." },
       outputPath: { type: "string", description: "Optional absolute PNG output path." }
     },
     additionalProperties: false,

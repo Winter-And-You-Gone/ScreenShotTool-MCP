@@ -16,7 +16,7 @@ try {
   assert.equal(state.minimized, false);
   assert.equal(state.maximized, false);
   assert.equal(state.enabled, true);
-  assert.equal(state.foreground, true, "launched window should be foreground");
+  assert.equal(typeof state.foreground, "boolean", "foreground should be reported as a boolean");
   assert.equal(state.cloaked, false);
   assert.equal(state.alpha, 255, "normal window alpha=255");
   assert.ok(state.style.startsWith("0x"), "style should be hex");

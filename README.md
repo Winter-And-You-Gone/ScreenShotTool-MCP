@@ -1,10 +1,10 @@
 # ScreenShotTool MCP
 
-Windows 本地截图与窗口操控 MCP Server，供 Codex、Claude Code 等 MCP 客户端通过 stdio 调用。支持启动应用、发现窗口、截取窗口或屏幕区域、模拟鼠标/键盘操作、点击原生菜单，所有操作均可不抢焦点、不闪窗口地在后台完成。
+Windows 本地截图与窗口操控 MCP Server，供 Codex、Claude Code 等 MCP 客户端通过 stdio 调用。支持启动应用、发现窗口、截取窗口或屏幕区域、模拟鼠标/键盘操作、点击原生菜单。多数窗口操作支持 best-effort 后台模式：尽量不抢焦点、不移动鼠标、不改变用户当前前台窗口。
 
 ## 功能
 
-- `launch_app` — 启动指定 `.exe`，可等待第一个可见窗口。`startMinimized:true` 让窗口最小化；`noActivate:true` 让窗口从出现瞬间就位于其他窗口后面，不抢占焦点、不遮挡当前屏幕。
+- `launch_app` — 启动指定 `.exe`，可等待第一个可见窗口。`noActivate:true` 会在发现新窗口后恢复原前台窗口，并把目标窗口压到 z-order 底部；`startMinimized:true` 会在发现窗口后请求后台/最小化呈现。少数程序启动时仍可能短暂置顶或自行抢焦点。
 - `list_windows` — 按 `pid`、进程名、标题关键字列出可见窗口。
 - `capture_window` — 截取窗口。`captureMethod:"print"` 用 `PrintWindow` 拍被遮挡/最小化窗口；`noActivate:true` 自动使用 PrintWindow，不操作 z-order，不闪烁。
 - `capture_screen_region` — 按屏幕绝对坐标截取矩形。
@@ -34,31 +34,50 @@ X:\MCP\ScreenShotTool\outputs\YYYYMMDD-HHMMSS-xxxxxx.png
 }
 ```
 
-## noActivate 模式
+## 后台模式
 
-所有涉及窗口交互的工具都支持 `noActivate:true`，实现**全程不打扰用户当前工作**：
+后台操作推荐显式传入 `noActivate:true`，截图时再配合 `captureMethod:"print"` 和 `focus:false`。这是一组 Win32 best-effort 策略，不是操作系统级沙箱：如果目标程序启动时主动调用 `SetForegroundWindow`、忽略窗口消息、或安全策略禁止后台输入，工具只能尽量恢复原前台窗口并把目标窗口压到底层。
 
 | 工具 | noActivate 行为 |
 |------|-----------------|
-| `launch_app` | 新窗口出现后立刻推到所有窗口后面（`HWND_BOTTOM`），并恢复用户原来的前台窗口。使用独立的 PS 进程 + Alt 键技巧绕过 `SetForegroundWindow` 限制。 |
+| `launch_app` | 新窗口出现后尽快推到所有窗口后面（`HWND_BOTTOM`），并恢复用户原来的前台窗口。使用独立的 PS 进程 + Alt 键技巧绕过 `SetForegroundWindow` 限制。 |
 | `capture_window` | 自动切换到 `PrintWindow` 模式，从窗口绘制表面直接捕获，无需操作 z-order，不会导致窗口闪现。 |
 | `type_text` | 通过 `GetGUIThreadInfo` 定位焦点子控件（如 Scintilla、Edit），再用 `PostMessage(WM_CHAR)` 投递字符；窗口在后台时用 `EnumChildWindows` 按类名查找编辑控件。 |
 | `send_key` | 用 `PostMessage(WM_KEYDOWN/WM_KEYUP)` 代替 `keybd_event`，无需前台焦点。 |
 
-**完整示例——后台启动记事本、输入文字、截图、关闭，全程不闪不抢焦点：**
+**完整示例——后台启动记事本、输入文字、截图、关闭：**
 
 ```json
-// 1. 启动（noActivate，不抢焦点）
-{ "exePath": "C:\\Windows\\System32\\notepad.exe", "waitForWindow": true, "noActivate": true }
+// 1. 启动（best-effort 不抢焦点，并压到底层）
+{ "exePath": "C:\\Windows\\System32\\notepad.exe", "waitForWindow": true, "noActivate": true, "startMinimized": true }
 
 // 2. 输入文字（noActivate，PostMessage WM_CHAR 直达编辑控件）
 { "hwnd": "123456", "text": "Hello from background!", "noActivate": true }
 
-// 3. 截图（noActivate，PrintWindow 无闪烁）
-{ "hwnd": "123456", "noActivate": true, "captureMethod": "print" }
+// 3. 截图（PrintWindow，不把窗口拉到前台）
+{ "hwnd": "123456", "focus": false, "noActivate": true, "captureMethod": "print" }
 
 // 4. 关闭
 { "pid": 7890 }
+```
+
+VaporView 这类 Qt 程序建议使用同一套参数：
+
+```json
+// launch_app
+{
+  "exePath": "X:\\Project\\GPS\\VaporView\\build\\Release\\VaporView.exe",
+  "waitForWindow": true,
+  "timeoutMs": 10000,
+  "noActivate": true,
+  "startMinimized": true
+}
+
+// click_window: 本身使用窗口消息，不移动物理鼠标
+{ "hwnd": "123456", "x": 535, "y": 50, "delayMs": 300 }
+
+// capture_window
+{ "hwnd": "123456", "focus": false, "noActivate": true, "captureMethod": "print" }
 ```
 
 ## 安装与构建
