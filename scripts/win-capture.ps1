@@ -47,6 +47,9 @@ namespace ScreenshotTool {
     public static extern bool IsWindow(IntPtr hWnd);
 
     [DllImport("user32.dll")]
+    public static extern bool IsChild(IntPtr hWndParent, IntPtr hWnd);
+
+    [DllImport("user32.dll")]
     public static extern bool IsIconic(IntPtr hWnd);
 
     [DllImport("user32.dll", CharSet = CharSet.Unicode, EntryPoint = "GetWindowTextW", SetLastError = true)]
@@ -968,13 +971,7 @@ function Resolve-MouseMessageTarget {
     [int]$ScreenY
   )
 
-  $screenPoint = New-Object ScreenshotTool.Native+POINT
-  $screenPoint.X = $ScreenX
-  $screenPoint.Y = $ScreenY
-  $targetHwnd = [ScreenshotTool.Native]::WindowFromPoint($screenPoint)
-  if ($targetHwnd -eq [IntPtr]::Zero) {
-    $targetHwnd = $Hwnd
-  }
+  $targetHwnd = Find-WindowTreePointTarget -Hwnd $Hwnd -ScreenX $ScreenX -ScreenY $ScreenY
 
   $screenLParam = New-MouseLParam -X $ScreenX -Y $ScreenY
   $hitTest = [ScreenshotTool.Native]::SendMessage($targetHwnd, 0x0084, [IntPtr]::Zero, $screenLParam).ToInt32()
@@ -1002,6 +999,74 @@ function Resolve-MouseMessageTarget {
     wParam = $hitTest
     lParam = $screenLParam
   }
+}
+
+function Find-WindowTreePointTarget {
+  param(
+    [IntPtr]$Hwnd,
+    [int]$ScreenX,
+    [int]$ScreenY
+  )
+
+  $script:pointTargetHwnd = $Hwnd
+  $script:pointTargetArea = [int64]::MaxValue
+
+  $enumProc = [ScreenshotTool.Native+EnumWindowsProc]{
+    param([IntPtr]$Child, [IntPtr]$LParam)
+    if (-not [ScreenshotTool.Native]::IsWindowVisible($Child)) {
+      return $true
+    }
+
+    $rect = New-Object ScreenshotTool.Native+RECT
+    if (-not [ScreenshotTool.Native]::GetWindowRect($Child, [ref]$rect)) {
+      return $true
+    }
+
+    if ($ScreenX -lt $rect.Left -or $ScreenX -ge $rect.Right -or $ScreenY -lt $rect.Top -or $ScreenY -ge $rect.Bottom) {
+      return $true
+    }
+
+    $width = [int64]($rect.Right - $rect.Left)
+    $height = [int64]($rect.Bottom - $rect.Top)
+    if ($width -le 0 -or $height -le 0) {
+      return $true
+    }
+
+    $area = $width * $height
+    if ($area -le $script:pointTargetArea) {
+      $script:pointTargetArea = $area
+      $script:pointTargetHwnd = $Child
+    }
+    return $true
+  }
+
+  [ScreenshotTool.Native]::EnumChildWindows($Hwnd, $enumProc, [IntPtr]::Zero) | Out-Null
+  return $script:pointTargetHwnd
+}
+
+function Get-WindowFromScreenPoint {
+  param(
+    [int]$ScreenX,
+    [int]$ScreenY
+  )
+
+  $screenPoint = New-Object ScreenshotTool.Native+POINT
+  $screenPoint.X = $ScreenX
+  $screenPoint.Y = $ScreenY
+  return [ScreenshotTool.Native]::WindowFromPoint($screenPoint)
+}
+
+function Test-HwndInWindowTree {
+  param(
+    [IntPtr]$Root,
+    [IntPtr]$Candidate
+  )
+
+  if ($Candidate -eq [IntPtr]::Zero) {
+    return $false
+  }
+
+  return $Candidate -eq $Root -or [ScreenshotTool.Native]::IsChild($Root, $Candidate)
 }
 
 function Post-MouseMessage {
@@ -1355,7 +1420,12 @@ function Click-Window {
     }
   }
 
-  $uiaInvoked = Invoke-MenuItemAtPoint -ScreenX $screenX -ScreenY $screenY
+  $topAtPoint = Get-WindowFromScreenPoint -ScreenX $screenX -ScreenY $screenY
+  $pointOwnedByTarget = Test-HwndInWindowTree -Root $hwnd -Candidate $topAtPoint
+  $uiaInvoked = $false
+  if ($pointOwnedByTarget) {
+    $uiaInvoked = Invoke-MenuItemAtPoint -ScreenX $screenX -ScreenY $screenY
+  }
   $nativeMenu = $null
   if (-not $uiaInvoked -and -not $messageTarget.client -and [int]$messageTarget.wParam -eq 5) {
     $nativeMenu = Get-TopMenuItemAtPoint -Hwnd $hwnd -ScreenX $screenX -ScreenY $screenY

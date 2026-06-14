@@ -68,6 +68,13 @@ export type ClickResult = {
   button: "left" | "right" | "middle"
   doubleClick: boolean
   method: "post_message" | "native_menu_command"
+  messageTarget?: {
+    hwnd: string
+    className: string
+    client: boolean
+    hitTest: number
+    uiaInvoked: boolean
+  }
   nativeMenu?: NativeMenuResult
   windowPoint: { x: number; y: number }
   screenPoint: { x: number; y: number }
