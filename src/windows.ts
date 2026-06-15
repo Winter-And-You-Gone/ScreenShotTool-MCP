@@ -167,6 +167,11 @@ export type WaitForWindowResult = {
   timestamp: string
 }
 
+type WaitAndSuppressResult = {
+  found: boolean
+  window: WindowInfo | null
+}
+
 type NativeMenuResult = {
   index: number;
   text: string;
@@ -190,7 +195,7 @@ type HelperRequest =
   | { action: "type-text"; target: TypeTextInput }
   | { action: "send-key"; target: SendKeyInput }
   | { action: "minimize-window"; target: { hwnd: string } }
-  | { action: "noactivate-minimize"; target: { hwnd: string } }
+  | { action: "noactivate-minimize"; target: { hwnd: string; previousForegroundHwnd?: string } }
   | { action: "wait-and-suppress"; target: WaitAndSuppressInput }
   | { action: "read-clipboard"; target?: Record<string, unknown> }
   | { action: "write-clipboard"; target: WriteClipboardInput }
@@ -227,51 +232,11 @@ export async function waitForWindow(input: WaitForWindowInput): Promise<WaitForW
   // async spawn (not spawnSync) keeps the Node event loop unblocked so
   // callers can schedule closeApp etc. in parallel.
   const timeoutMs = (input.timeoutMs ?? 30_000) + 5000;
-  const request = JSON.stringify({ action: "wait-for-window", target: input });
-
-  return new Promise<WaitForWindowResult>((resolve, reject) => {
-    const child = spawn(powershellCommand, [
-      "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", helperPath,
-      "-InputJson", request
-    ], {
-      shell: false,
-      windowsHide: true,
-      stdio: ["pipe", "pipe", "pipe"]
-    });
-
-    let stdout = "";
-    let stderr = "";
-
-    const timer = setTimeout(() => {
-      child.kill();
-      reject(new Error(`wait_for_window timed out after ${timeoutMs}ms.`));
-    }, timeoutMs);
-
-    child.stdout?.setEncoding("utf8");
-    child.stderr?.setEncoding("utf8");
-
-    child.stdout?.on("data", (chunk: string) => { stdout += chunk; });
-    child.stderr?.on("data", (chunk: string) => { stderr += chunk; });
-
-    child.on("close", (code) => {
-      clearTimeout(timer);
-      const out = stdout.trim();
-      if (code !== 0 || !out) {
-        reject(new Error(`wait_for_window failed (code=${code}): ${(stderr || "").trim()}`));
-        return;
-      }
-      try {
-        resolve(JSON.parse(out) as WaitForWindowResult);
-      } catch (err) {
-        reject(new Error(`wait_for_window returned invalid JSON: ${(err as Error).message}`));
-      }
-    });
-
-    child.on("error", (err) => {
-      clearTimeout(timer);
-      reject(err);
-    });
-  });
+  return runStandaloneHelper<WaitForWindowResult>(
+    { action: "wait-for-window", target: input },
+    timeoutMs,
+    "wait_for_window"
+  );
 }
 
 export async function ensureExecutablePath(exePath: string): Promise<void> {
@@ -334,6 +299,7 @@ export async function launchApp(input: LaunchAppInput): Promise<{ pid: number; w
   }
 
   let window: WindowInfo | null = null;
+  let previousForegroundHwnd: string | undefined;
 
   if (input.noActivate) {
     // Capture the current foreground hwnd so we can restore it after
@@ -342,32 +308,29 @@ export async function launchApp(input: LaunchAppInput): Promise<{ pid: number; w
       "-NoProfile", "-Command",
       `Add-Type -TypeDefinition 'using System; using System.Runtime.InteropServices; public static class FG { [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow(); }'; [FG]::GetForegroundWindow().ToInt64().ToString()`
     ], { encoding: "utf8", shell: false, windowsHide: true });
-    const previousFgHwnd = previousFgResult.stdout.trim();
+    previousForegroundHwnd = previousFgResult.stdout.trim();
 
     // Use the atomic wait-and-suppress helper via a standalone PS process
     // (not the worker), because the Alt+keybd_event trick for restoring
     // the foreground window requires desktop access that the hidden worker
     // process does not have.
     try {
-      const suppressInput = JSON.stringify({
-        action: "wait-and-suppress",
-        target: {
-          pid: child.pid,
-          processName,
-          existingHwnds: [...existingHwnds],
-          previousForegroundHwnd: previousFgHwnd,
-          timeoutMs: input.timeoutMs
-        }
-      });
-      const suppressResult = spawnSync(powershellCommand, [
-        "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", helperPath,
-        "-InputJson", suppressInput
-      ], { encoding: "utf8", shell: false, windowsHide: true, timeout: input.timeoutMs + 5000 });
-      if (suppressResult.stdout) {
-        const parsed = JSON.parse(suppressResult.stdout.trim()) as { found: boolean; window: WindowInfo | null };
-        if (parsed.found) {
-          window = parsed.window;
-        }
+      const suppressResult = await runStandaloneHelper<WaitAndSuppressResult>(
+        {
+          action: "wait-and-suppress",
+          target: {
+            pid: child.pid,
+            processName,
+            existingHwnds: [...existingHwnds],
+            previousForegroundHwnd,
+            timeoutMs: input.timeoutMs
+          }
+        },
+        input.timeoutMs + 5000,
+        "wait_and_suppress"
+      );
+      if (suppressResult.found) {
+        window = suppressResult.window;
       }
     } catch {
       // Fallback: try the normal pollForWindow path.
@@ -384,7 +347,7 @@ export async function launchApp(input: LaunchAppInput): Promise<{ pid: number; w
 
   if (input.startMinimized && window) {
     try {
-      await minimizeWindow(window.hwnd, input.noActivate);
+      await minimizeWindow(window.hwnd, input.noActivate, previousForegroundHwnd);
     } catch (error) {
       console.error(`startMinimized failed for hwnd ${window.hwnd}: ${formatSpawnError(error)}`);
     }
@@ -741,6 +704,75 @@ async function runHelper<T>(request: HelperRequest): Promise<T> {
   });
 }
 
+async function runStandaloneHelper<T>(request: HelperRequest, timeoutMs: number, label: string): Promise<T> {
+  const requestJson = JSON.stringify(request);
+
+  return new Promise<T>((resolve, reject) => {
+    const child = spawn(powershellCommand, [
+      "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", helperPath,
+      "-InputJson", requestJson
+    ], {
+      shell: false,
+      windowsHide: true,
+      stdio: ["pipe", "pipe", "pipe"]
+    });
+
+    let stdout = "";
+    let stderr = "";
+    let settled = false;
+
+    const finish = (callback: () => void) => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      clearTimeout(timer);
+      callback();
+    };
+
+    const timer = setTimeout(() => {
+      if (typeof child.pid === "number") {
+        spawnSync("taskkill.exe", ["/PID", String(child.pid), "/T", "/F"], {
+          shell: false,
+          windowsHide: true
+        });
+      } else {
+        child.kill();
+      }
+      finish(() => {
+        reject(new Error(`${label} timed out after ${timeoutMs}ms.`));
+      });
+    }, timeoutMs);
+
+    child.stdout?.setEncoding("utf8");
+    child.stderr?.setEncoding("utf8");
+
+    child.stdout?.on("data", (chunk: string) => { stdout += chunk; });
+    child.stderr?.on("data", (chunk: string) => { stderr += chunk; });
+
+    child.on("close", (code) => {
+      finish(() => {
+        const out = stdout.trim();
+        if (code !== 0 || !out) {
+          reject(new Error(`${label} failed (code=${code}): ${(stderr || "").trim()}`));
+          return;
+        }
+        try {
+          resolve(JSON.parse(out) as T);
+        } catch (err) {
+          reject(new Error(`${label} returned invalid JSON: ${(err as Error).message}`));
+        }
+      });
+    });
+
+    child.on("error", (err) => {
+      finish(() => {
+        reject(err);
+      });
+    });
+  });
+}
+
 export function shutdownHelper(): void {
   if (activeWorker && !activeWorker.exited) {
     try {
@@ -814,7 +846,10 @@ function findPowerShellCommand(): string {
   return pwsh.status === 0 ? "pwsh.exe" : "powershell.exe";
 }
 
-function minimizeWindow(hwnd: string, noActivate = false): Promise<unknown> {
+function minimizeWindow(hwnd: string, noActivate = false, previousForegroundHwnd?: string): Promise<unknown> {
   const action = noActivate ? "noactivate-minimize" : "minimize-window";
-  return runHelper({ action, target: { hwnd } });
+  const target = noActivate && previousForegroundHwnd
+    ? { hwnd, previousForegroundHwnd }
+    : { hwnd };
+  return runHelper({ action, target });
 }

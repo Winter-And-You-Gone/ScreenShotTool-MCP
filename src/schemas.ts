@@ -3,6 +3,8 @@ import { z } from "zod";
 const positiveInt = z.number().int().positive();
 const nonNegativeInt = z.number().int().nonnegative();
 const optionalTimeout = z.number().int().min(100).max(120000).optional();
+const maxTypeTextLength = 1000;
+const maxTypeTextEstimatedMs = 55000;
 const namedSendKeys = [
   "esc",
   "escape",
@@ -134,13 +136,16 @@ export const typeTextSchema = z.object({
   pid: z.number().int().positive().optional(),
   processName: z.string().min(1).optional(),
   titleContains: z.string().min(1).optional(),
-  text: z.string().min(1),
+  text: z.string().min(1).max(maxTypeTextLength),
   delayMs: z.number().int().min(0).max(10000).optional().default(50),
   pressMs: z.number().int().min(0).max(5000).optional().default(30),
   noActivate: z.boolean().optional().default(false)
 }).strict().refine(
   (value) => value.hwnd !== undefined || value.pid !== undefined || value.processName !== undefined || value.titleContains !== undefined,
   "Provide at least one of hwnd, pid, processName, or titleContains."
+).refine(
+  (value) => value.text.length * (value.delayMs + value.pressMs) <= maxTypeTextEstimatedMs,
+  "Estimated type_text duration is too long; reduce text length, delayMs, or pressMs, or send the text in smaller chunks."
 );
 
 export const sendKeySchema = z.object({
@@ -354,7 +359,7 @@ export const toolInputSchemas = {
       pid: { type: "integer", minimum: 1 },
       processName: { type: "string" },
       titleContains: { type: "string" },
-      text: { type: "string", minLength: 1, description: "Text to type into the target window. Sent via SendInput Unicode, so any Unicode character including CJK is supported." },
+      text: { type: "string", minLength: 1, maxLength: maxTypeTextLength, description: "Text to type into the target window. Sent via SendInput Unicode, so any Unicode character including CJK is supported." },
       delayMs: { type: "integer", minimum: 0, maximum: 10000, default: 50, description: "Delay between keystrokes in milliseconds." },
       pressMs: { type: "integer", minimum: 0, maximum: 5000, default: 30, description: "Duration of each key press in milliseconds." },
       noActivate: { type: "boolean", default: false, description: "When true, sends WM_CHAR messages via PostMessage instead of SendInput, so the target window never needs focus. Some applications may not respond to posted messages." }

@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { stat } from "node:fs/promises";
 import { spawnSync } from "node:child_process";
 
-import { captureWindow, closeApp, launchApp, listWindows, sendKey, typeText } from "../src/windows.js";
+import { captureWindow, closeApp, getWindowState, launchApp, sendKey, typeText } from "../src/windows.js";
 import { testExePath } from "./helpers.js";
 
 function foregroundHwnd(): string {
@@ -40,10 +40,10 @@ console.log("foreground before:", beforeHwnd);
     // OS never briefly activated it. A hard assert on foreground is fragile.
     console.log("  foreground after launch:", afterHwnd, "(same as before =", afterHwnd === beforeHwnd, ")");
 
-    // Verify the window was placed at HWND_BOTTOM by checking it's not in
-    // the visible windows list (it was pushed behind other windows).
-    const vis = await listWindows({ pid: r.pid });
-    console.log("  visible windows for pid:", vis.length, "(0 = window behind others)");
+    const state = await getWindowState({ hwnd: r.window.hwnd });
+    assert.equal(state.minimized, true, "startMinimized should leave the window iconic");
+    assert.equal(state.foreground, false, "noActivate start should not leave the target foregrounded");
+    console.log("  minimized:", state.minimized, "foreground:", state.foreground);
   } finally {
     await closeApp(r.pid).catch(() => undefined);
   }

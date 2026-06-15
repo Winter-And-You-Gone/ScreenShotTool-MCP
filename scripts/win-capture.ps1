@@ -380,6 +380,8 @@ function Get-RectObject {
 }
 
 function Get-VisibleWindows {
+  param([switch]$IncludeUntitled)
+
   $windows = [System.Collections.ArrayList]::new()
 
   $callback = [ScreenshotTool.Native+EnumWindowsProc]{
@@ -394,7 +396,7 @@ function Get-VisibleWindows {
     }
 
     $title = Get-WindowTitle $Hwnd
-    if ([string]::IsNullOrWhiteSpace($title)) {
+    if (-not $IncludeUntitled -and [string]::IsNullOrWhiteSpace($title)) {
       return $true
     }
 
@@ -589,7 +591,7 @@ function Resolve-TargetWindow {
     throw "No window found for hwnd $hwndText."
   }
 
-  $windows = if ($IncludeHidden) { Get-AllWindows } else { Get-VisibleWindows }
+  $windows = if ($IncludeHidden) { Get-AllWindows } else { Get-VisibleWindows -IncludeUntitled }
   if ($null -eq $windows) { $windows = @() }
   $windows = @($windows)
 
@@ -1898,10 +1900,12 @@ function Minimize-Window {
   $window = Resolve-TargetWindow -Target $Target -IncludeHidden
   $hwnd = [IntPtr]([int64]$window.hwnd)
   $SW_MINIMIZE = 6
-  $ok = [bool][ScreenshotTool.Native]::ShowWindow($hwnd, $SW_MINIMIZE)
+  [ScreenshotTool.Native]::ShowWindow($hwnd, $SW_MINIMIZE) | Out-Null
+  Start-Sleep -Milliseconds 50
+  $minimized = [bool][ScreenshotTool.Native]::IsIconic($hwnd)
 
   return [ordered]@{
-    minimized = $ok
+    minimized = $minimized
     target = "window:" + $window.hwnd
     hwnd = $window.hwnd
     title = $window.title
@@ -1913,22 +1917,32 @@ function Minimize-Window {
 function NoActivate-Minimize {
   param([hashtable]$Target)
 
-  $window = Resolve-TargetWindow -Target $Target
+  $window = Resolve-TargetWindow -Target $Target -IncludeHidden
   $hwnd = [IntPtr]([int64]$window.hwnd)
 
-  # Show without activating, then push to bottom of z-order without activating.
-  $SW_SHOWNOACTIVATE = 4
+  # Minimize without activating, then keep the target behind other windows.
+  $SW_SHOWMINNOACTIVE = 7
   $SWP_NOSIZE = [uint32]0x0001
   $SWP_NOMOVE = [uint32]0x0002
   $SWP_NOACTIVATE = [uint32]0x0010
   $hwndBottom = [IntPtr]1
   $flags = $SWP_NOSIZE -bor $SWP_NOMOVE -bor $SWP_NOACTIVATE
 
-  [ScreenshotTool.Native]::ShowWindow($hwnd, $SW_SHOWNOACTIVATE) | Out-Null
+  [ScreenshotTool.Native]::ShowWindow($hwnd, $SW_SHOWMINNOACTIVE) | Out-Null
   [ScreenshotTool.Native]::SetWindowPos($hwnd, $hwndBottom, 0, 0, 0, 0, $flags) | Out-Null
+  if ($Target.ContainsKey("previousForegroundHwnd") -and $null -ne $Target.previousForegroundHwnd) {
+    $prevFg = [IntPtr]([int64]$Target.previousForegroundHwnd)
+    if ($prevFg -ne [IntPtr]::Zero -and $prevFg -ne $hwnd -and [ScreenshotTool.Native]::IsWindow($prevFg)) {
+      [ScreenshotTool.Native]::keybd_event([byte]0x12, 0, [uint32]0, [UIntPtr]::Zero)
+      [ScreenshotTool.Native]::keybd_event([byte]0x12, 0, [uint32]2, [UIntPtr]::Zero)
+      [ScreenshotTool.Native]::SetForegroundWindow($prevFg) | Out-Null
+    }
+  }
+  Start-Sleep -Milliseconds 50
+  $minimized = [bool][ScreenshotTool.Native]::IsIconic($hwnd)
 
   return [ordered]@{
-    minimized = $true
+    minimized = $minimized
     noActivate = $true
     target = "window:" + $window.hwnd
     hwnd = $window.hwnd
@@ -2358,7 +2372,8 @@ function Invoke-Action {
       if ($Request.ContainsKey("filters") -and $null -ne $Request.filters) {
         $filters = $Request.filters
       }
-      return @(Filter-Windows (Get-VisibleWindows) $filters)
+      $includeUntitled = $filters.ContainsKey("pid") -or $filters.ContainsKey("processName")
+      return @(Filter-Windows (Get-VisibleWindows -IncludeUntitled:$includeUntitled) $filters)
     }
     "capture-window" {
       return Capture-Window -Target $Request.target -OutputPath $Request.outputPath

@@ -227,7 +227,7 @@ npm run smoke:no-activate
 
 - ❌ 不要自动 `git pull` 升级——可能引入 break change
 - ❌ 不要修改 `outputs/`、`dist/`、`.claude/` 目录——都被 gitignore
-- ❌ 不要给 `type_text` 传超长字符串（>1000 字符），分段发送更可靠
+- ❌ 不要给 `type_text` 传超长字符串（单次最多 1000 字符，且会按 `delayMs + pressMs` 拒绝预计过慢的请求），分段发送更可靠
 - ❌ 不要在 `click_window` 之后立刻 `capture_window`——加 `delayMs: 200` 给 UI 重绘时间
 
 ---

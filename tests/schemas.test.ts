@@ -142,6 +142,28 @@ test("type_text requires text and target selector", () => {
   assert.equal(parsed.pressMs, 30);
 });
 
+test("type_text rejects oversized or too-slow single requests", () => {
+  assert.throws(() => typeTextSchema.parse({
+    hwnd: "123",
+    text: "x".repeat(1001)
+  }));
+
+  assert.throws(() => typeTextSchema.parse({
+    hwnd: "123",
+    text: "x".repeat(1000),
+    delayMs: 50,
+    pressMs: 30
+  }), /Estimated type_text duration/);
+
+  const parsed = typeTextSchema.parse({
+    hwnd: "123",
+    text: "x".repeat(1000),
+    delayMs: 20,
+    pressMs: 20
+  });
+  assert.equal(parsed.text.length, 1000);
+});
+
 test("send_key requires key and target selector", () => {
   assert.throws(() => sendKeySchema.parse({ key: "f" }));
 
