@@ -2372,18 +2372,23 @@ function Build-WindowInfoFromHwnd {
 function Wait-And-Suppress {
   param([hashtable]$Target)
 
-  # Poll for a new window from the target process and immediately push it
-  # to HWND_BOTTOM on the very first sighting — all within the same PS
-  # call so there is no round-trip delay that would let the window flash
-  # on top of other windows.
   $targetPid = [int]$Target.pid
   $existingHwnds = New-Object System.Collections.Generic.HashSet[string]
   if ($Target.ContainsKey("existingHwnds") -and $null -ne $Target.existingHwnds) {
     foreach ($h in @($Target.existingHwnds)) { $existingHwnds.Add([string]$h) | Out-Null }
   }
+
   $timeoutMs = 10000
   if ($Target.ContainsKey("timeoutMs") -and $null -ne $Target.timeoutMs) {
     $timeoutMs = [int]$Target.timeoutMs
+  }
+  # After finding the first new window, continue suppressing for this long
+  # (catches multi-window apps and self-reactivation — Bugs 2 and 3).
+  $SUSTAIN_MS = 3000
+
+  $previousForegroundHwnd = [IntPtr]::Zero
+  if ($Target.ContainsKey("previousForegroundHwnd") -and $null -ne $Target.previousForegroundHwnd) {
+    $previousForegroundHwnd = [IntPtr]([int64]$Target.previousForegroundHwnd)
   }
 
   $SWP_NOSIZE = [uint32]0x0001
@@ -2392,13 +2397,21 @@ function Wait-And-Suppress {
   $hwndBottom = [IntPtr]1
   $pushFlags = $SWP_NOSIZE -bor $SWP_NOMOVE -bor $SWP_NOACTIVATE
 
-  $deadline = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() + $timeoutMs
+  $startMs = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
+  $deadline = $startMs + $timeoutMs
 
-  # Lean enumeration callback: skip object construction, only check the bare
-  # minimum (PID + visibility + new hwnd + non-empty rect) and push to bottom
-  # the instant we find a match.
-  $foundHwnd = [IntPtr]::Zero
-  $script:foundTargetHwnd = [IntPtr]::Zero
+  # Known hwnds discovered *during this call* (for re-activation detection).
+  $script:suppressKnownHwnds = New-Object System.Collections.Generic.HashSet[string]
+  $script:suppressLastFoundWindow = $null
+  $sustainDeadline = $null  # set after first new window is found
+
+  # Pre-populate known hwnds from caller (pollForWindow fallback sends its
+  # found window via `knownHwnd` so we can sustain-suppress it immediately).
+  if ($Target.ContainsKey("knownHwnd") -and -not [string]::IsNullOrWhiteSpace($Target.knownHwnd)) {
+    $script:suppressKnownHwnds.Add([string]$Target.knownHwnd) | Out-Null
+    $sustainDeadline = $startMs + $SUSTAIN_MS
+  }
+
   $enumProc = [ScreenshotTool.Native+EnumWindowsProc]{
     param([IntPtr]$Hwnd, [IntPtr]$LParam)
     if (-not [ScreenshotTool.Native]::IsWindowVisible($Hwnd)) { return $true }
@@ -2407,65 +2420,80 @@ function Wait-And-Suppress {
     if ([int]$pidValue -ne $targetPid) { return $true }
     $hwndText = $Hwnd.ToInt64().ToString()
     if ($existingHwnds.Contains($hwndText)) { return $true }
+
+    # ── Already-known window: foreground-steal check ──
+    if ($script:suppressKnownHwnds.Contains($hwndText)) {
+      if ([ScreenshotTool.Native]::GetForegroundWindow() -eq $Hwnd) {
+        # App re-activated itself (Bug 3). Push to bottom and restore.
+        [ScreenshotTool.Native]::SetWindowPos($Hwnd, [IntPtr]1, 0, 0, 0, 0, $pushFlags) | Out-Null
+        if ($previousForegroundHwnd -ne [IntPtr]::Zero -and $previousForegroundHwnd -ne $Hwnd) {
+          [ScreenshotTool.Native]::keybd_event([byte]0x12, 0, [uint32]0, [UIntPtr]::Zero)
+          [ScreenshotTool.Native]::keybd_event([byte]0x12, 0, [uint32]2, [UIntPtr]::Zero)
+          [ScreenshotTool.Native]::SetForegroundWindow($previousForegroundHwnd) | Out-Null
+        }
+      }
+      return $true
+    }
+
+    # ── New window ──
     $rect = New-Object ScreenshotTool.Native+RECT
     if (-not [ScreenshotTool.Native]::GetWindowRect($Hwnd, [ref]$rect)) { return $true }
     if (($rect.Right - $rect.Left) -le 0 -or ($rect.Bottom - $rect.Top) -le 0) { return $true }
-    $script:foundTargetHwnd = $Hwnd
-    return $false
+
+    # Push to HWND_BOTTOM immediately.
+    [ScreenshotTool.Native]::SetWindowPos($Hwnd, $hwndBottom, 0, 0, 0, 0, $pushFlags) | Out-Null
+
+    # Restore previous foreground.
+    [ScreenshotTool.Native]::keybd_event([byte]0x12, 0, [uint32]0, [UIntPtr]::Zero)
+    [ScreenshotTool.Native]::keybd_event([byte]0x12, 0, [uint32]2, [UIntPtr]::Zero)
+    if ($previousForegroundHwnd -ne [IntPtr]::Zero -and $previousForegroundHwnd -ne $Hwnd) {
+      [ScreenshotTool.Native]::SetForegroundWindow($previousForegroundHwnd) | Out-Null
+    }
+
+    # Register as known and build WindowInfo for return.
+    $script:suppressKnownHwnds.Add($hwndText) | Out-Null
+    $titleBuilder = New-Object System.Text.StringBuilder 256
+    [ScreenshotTool.Native]::GetWindowText($Hwnd, $titleBuilder, $titleBuilder.Capacity) | Out-Null
+    $classBuilder = New-Object System.Text.StringBuilder 256
+    [ScreenshotTool.Native]::GetClassName($Hwnd, $classBuilder, $classBuilder.Capacity) | Out-Null
+    $script:suppressLastFoundWindow = [ordered]@{
+      hwnd        = $hwndText
+      title       = $titleBuilder.ToString()
+      pid         = [int]$pidValue
+      processName = Get-WindowProcessName $pidValue
+      className   = $classBuilder.ToString()
+      rect        = Get-RectObject $rect
+    }
+
+    # Set sustain deadline 3s from first discovery.
+    if ($null -eq $sustainDeadline) {
+      $sustainDeadline = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() + $SUSTAIN_MS
+    }
+
+    return $true  # keep looking (multi-window apps — Bug 2)
   }
 
-  while ([DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() -lt $deadline) {
-    $script:foundTargetHwnd = [IntPtr]::Zero
+  while ($true) {
     [ScreenshotTool.Native]::EnumWindows($enumProc, [IntPtr]::Zero) | Out-Null
-    if ($script:foundTargetHwnd -ne [IntPtr]::Zero) {
-      $foundHwnd = $script:foundTargetHwnd
-      break
+
+    $now = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
+    if ($null -ne $sustainDeadline) {
+      if ($now -ge $sustainDeadline) { break }
+    } else {
+      if ($now -ge $deadline) { break }
     }
-    Start-Sleep -Milliseconds 10
+
+    Start-Sleep -Milliseconds 50
   }
 
-  if ($foundHwnd -eq [IntPtr]::Zero) {
-    return [ordered]@{
-      found = $false
-      window = $null
-    }
-  }
+  $result = $script:suppressLastFoundWindow
+  $script:suppressKnownHwnds = $null
+  $script:suppressLastFoundWindow = $null
 
-  # Restore previous foreground FIRST (so the user perceives no focus
-  # change), then push the new window to the bottom of the z-order.
-  if ($Target.ContainsKey("previousForegroundHwnd") -and $null -ne $Target.previousForegroundHwnd) {
-    $prevFg = [IntPtr]([int64]$Target.previousForegroundHwnd)
-    if ($prevFg -ne [IntPtr]::Zero -and $prevFg -ne $foundHwnd) {
-      [ScreenshotTool.Native]::keybd_event([byte]0x12, 0, [uint32]0, [UIntPtr]::Zero)
-      [ScreenshotTool.Native]::keybd_event([byte]0x12, 0, [uint32]2, [UIntPtr]::Zero)
-      [ScreenshotTool.Native]::SetForegroundWindow($prevFg) | Out-Null
-    }
+  if ($null -eq $result) {
+    return [ordered]@{ found = $false; window = $null }
   }
-  [ScreenshotTool.Native]::SetWindowPos($foundHwnd, $hwndBottom, 0, 0, 0, 0, $pushFlags) | Out-Null
-
-  # Now build the full WindowInfo for the response.
-  $rectFinal = New-Object ScreenshotTool.Native+RECT
-  [ScreenshotTool.Native]::GetWindowRect($foundHwnd, [ref]$rectFinal) | Out-Null
-  $pidFinal = [uint32]0
-  [ScreenshotTool.Native]::GetWindowThreadProcessId($foundHwnd, [ref]$pidFinal) | Out-Null
-  $titleBuilder = New-Object System.Text.StringBuilder 256
-  [ScreenshotTool.Native]::GetWindowText($foundHwnd, $titleBuilder, $titleBuilder.Capacity) | Out-Null
-  $classBuilder = New-Object System.Text.StringBuilder 256
-  [ScreenshotTool.Native]::GetClassName($foundHwnd, $classBuilder, $classBuilder.Capacity) | Out-Null
-
-  $foundWindow = [ordered]@{
-    hwnd        = $foundHwnd.ToInt64().ToString()
-    title       = $titleBuilder.ToString()
-    pid         = [int]$pidFinal
-    processName = Get-WindowProcessName $pidFinal
-    className   = $classBuilder.ToString()
-    rect        = Get-RectObject $rectFinal
-  }
-
-  return [ordered]@{
-    found = $true
-    window = $foundWindow
-  }
+  return [ordered]@{ found = $true; window = $result }
 }
 
 function Invoke-Action {

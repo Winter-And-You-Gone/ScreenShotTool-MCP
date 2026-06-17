@@ -26,6 +26,8 @@ export type WaitAndSuppressInput = {
   existingHwnds?: string[];
   previousForegroundHwnd?: string;
   timeoutMs?: number;
+  // When set, skip polling and just suppress this known hwnd + any new ones
+  knownHwnd?: string;
 };
 
 export type Rect = {
@@ -300,6 +302,7 @@ export async function launchApp(input: LaunchAppInput): Promise<{ pid: number; w
 
   let window: WindowInfo | null = null;
   let previousForegroundHwnd: string | undefined;
+  let suppressRan = false;
 
   if (input.noActivate) {
     // Capture the current foreground hwnd so we can restore it after
@@ -310,10 +313,9 @@ export async function launchApp(input: LaunchAppInput): Promise<{ pid: number; w
     ], { encoding: "utf8", shell: false, windowsHide: true });
     previousForegroundHwnd = previousFgResult.stdout.trim();
 
-    // Use the atomic wait-and-suppress helper via a standalone PS process
-    // (not the worker), because the Alt+keybd_event trick for restoring
-    // the foreground window requires desktop access that the hidden worker
-    // process does not have.
+    // Phase 1: wait-and-suppress polls for the first window, pushes it to
+    // HWND_BOTTOM, restores previous foreground, then continues suppressing
+    // for ~3s more (catches multi-window apps and self-reactivation).
     try {
       const suppressResult = await runStandaloneHelper<WaitAndSuppressResult>(
         {
@@ -326,19 +328,45 @@ export async function launchApp(input: LaunchAppInput): Promise<{ pid: number; w
             timeoutMs: input.timeoutMs
           }
         },
-        input.timeoutMs + 5000,
+        input.timeoutMs + 8000, // timeout + 3s sustain + padding
         "wait_and_suppress"
       );
+      suppressRan = true;
       if (suppressResult.found) {
         window = suppressResult.window;
       }
     } catch {
-      // Fallback: try the normal pollForWindow path.
+      // suppressRan stays false — fall through to pollForWindow
     }
   }
 
   if (!window) {
     window = await pollForWindow(child.pid, processName, existingHwnds, input.timeoutMs, exitState);
+  }
+
+  // Bug 1 fix: when the app started too slowly for the initial Wait-And-Suppress
+  // call but pollForWindow found it, the window is sitting on top with no
+  // suppression. Fire a second, short suppression pass with the known hwnd.
+  if (input.noActivate && window && !suppressRan) {
+    try {
+      await runStandaloneHelper<WaitAndSuppressResult>(
+        {
+          action: "wait-and-suppress",
+          target: {
+            pid: child.pid,
+            processName,
+            existingHwnds: [...existingHwnds],
+            previousForegroundHwnd,
+            knownHwnd: window.hwnd,  // skip polling, go straight to sustained suppression
+            timeoutMs: 5000           // 5s is enough for sustain phase
+          }
+        },
+        10000,
+        "wait_and_suppress_fallback"
+      );
+    } catch {
+      // Best-effort only
+    }
   }
 
   if (window === null && exitState.exited) {
