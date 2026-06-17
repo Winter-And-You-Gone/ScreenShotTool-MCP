@@ -492,7 +492,15 @@ async function spawnApp(input: LaunchAppInput, cwd?: string): Promise<ReturnType
   return child;
 }
 
-const HELPER_TIMEOUT_MS = 60000;
+// Hard timeout for a single request on the shared PowerShell worker.
+//
+// Must exceed the slowest request the schema can produce. The type_text
+// schema (src/schemas.ts) caps estimated work at maxTypeTextEstimatedMs
+// (55s), and PowerShell's Start-Sleep plus per-char overhead drifts a few
+// seconds above the estimate at the limit. 90s gives comfortable headroom
+// so a legitimately large type_text never trips the worker kill switch
+// (which would also nuke any other queued requests on the same worker).
+const HELPER_TIMEOUT_MS = 90000;
 
 type WorkerResponseOk = { ok: true; result: unknown };
 type WorkerResponseErr = { ok: false; error: string };

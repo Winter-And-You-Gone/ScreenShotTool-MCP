@@ -5,6 +5,10 @@ const nonNegativeInt = z.number().int().nonnegative();
 const optionalTimeout = z.number().int().min(100).max(120000).optional();
 const maxTypeTextLength = 1000;
 const maxTypeTextEstimatedMs = 55000;
+// Clipboard writes go through GlobalAlloc + Marshal.Copy with no chunking,
+// so cap the payload to bound memory use. 1M chars (2 MiB UTF-16) is far
+// above any realistic paste target while preventing accidental abuse.
+const maxClipboardTextLength = 1_000_000;
 const namedSendKeys = [
   "esc",
   "escape",
@@ -166,7 +170,7 @@ export const sendKeySchema = z.object({
 export const readClipboardSchema = z.object({}).strict();
 
 export const writeClipboardSchema = z.object({
-  text: z.string()
+  text: z.string().max(maxClipboardTextLength)
 }).strict();
 
 export const getWindowStateSchema = z.object({
@@ -359,7 +363,7 @@ export const toolInputSchemas = {
       pid: { type: "integer", minimum: 1 },
       processName: { type: "string" },
       titleContains: { type: "string" },
-      text: { type: "string", minLength: 1, maxLength: maxTypeTextLength, description: "Text to type into the target window. Sent via SendInput Unicode, so any Unicode character including CJK is supported." },
+      text: { type: "string", minLength: 1, maxLength: maxTypeTextLength, description: "Text to type into the target window. Sent via SendInput Unicode, so any Unicode character including CJK is supported. For standard Edit/RichEdit controls the helper may use EM_REPLACESEL, which replaces the current selection (if any) rather than appending at the caret; send an empty selection-clearing keystroke first if you need a pure insert." },
       delayMs: { type: "integer", minimum: 0, maximum: 10000, default: 50, description: "Delay between keystrokes in milliseconds." },
       pressMs: { type: "integer", minimum: 0, maximum: 5000, default: 30, description: "Duration of each key press in milliseconds." },
       noActivate: { type: "boolean", default: false, description: "When true, sends WM_CHAR messages via PostMessage instead of SendInput, so the target window never needs focus. Some applications may not respond to posted messages." }
@@ -399,7 +403,7 @@ export const toolInputSchemas = {
   write_clipboard: {
     type: "object",
     properties: {
-      text: { type: "string", description: "UTF-16 text to place on the clipboard. Pass an empty string to clear text content. Newlines and CJK characters are supported." }
+      text: { type: "string", maxLength: maxClipboardTextLength, description: "UTF-16 text to place on the clipboard. Pass an empty string to clear text content. Newlines and CJK characters are supported. Capped at 1,000,000 characters." }
     },
     required: ["text"],
     additionalProperties: false

@@ -7,6 +7,7 @@ import {
   ListToolsRequestSchema,
   McpError
 } from "@modelcontextprotocol/sdk/types.js";
+import { readFileSync } from "node:fs";
 import { stat } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -26,10 +27,25 @@ const runtimeRoot = ["dist", "src"].includes(path.basename(moduleRoot)) ? path.d
 const hotReloadEnabled = process.env.SCREENSHOTTOOL_HOT_RELOAD !== "0";
 let runtimeCache: RuntimeModules | null = null;
 
+// Single source of truth for the server version: read from package.json once
+// at startup so it can't drift from the npm package version.
+const packageVersion = readPackageVersion();
+
+function readPackageVersion(): string {
+  const packageJsonPath = path.join(runtimeRoot, "package.json");
+  try {
+    const content = readFileSync(packageJsonPath, "utf8");
+    const parsed = JSON.parse(content) as { version?: unknown };
+    return typeof parsed.version === "string" && parsed.version.length > 0 ? parsed.version : "0.0.0";
+  } catch {
+    return "0.0.0";
+  }
+}
+
 const server = new Server(
   {
     name: "screenshottool-mcp",
-    version: "0.1.0"
+    version: packageVersion
   },
   {
     capabilities: {
@@ -85,7 +101,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       },
       {
         name: "type_text",
-        description: "Type text into a window via SendInput Unicode. noActivate uses PostMessage WM_CHAR so the target window doesn't need focus.",
+        description: "Type text into a window via SendInput Unicode. noActivate uses PostMessage WM_CHAR so the target window doesn't need focus. For standard Edit/RichEdit controls EM_REPLACESEL may be used, which replaces the current selection rather than inserting at the caret.",
         inputSchema: schemas.toolInputSchemas.type_text
       },
       {
@@ -190,7 +206,17 @@ async function loadRuntime(): Promise<RuntimeModules> {
   return runtimeCache;
 }
 
+// Cache the computed runtime version for up to 1s. Every tools/list and every
+// tool call would otherwise stat 3 files; on a busy MCP client that's a steady
+// stream of syscalls for information that changes at human-edit speed.
+const RUNTIME_VERSION_CACHE_MS = 1000;
+let cachedRuntimeVersion: { value: string; expiresAt: number } | null = null;
+
 async function runtimeVersion(): Promise<string> {
+  if (cachedRuntimeVersion && cachedRuntimeVersion.expiresAt > Date.now()) {
+    return cachedRuntimeVersion.value;
+  }
+
   const sourceExt = path.basename(moduleRoot) === "dist" ? ".js" : ".ts";
   const files = [
     path.join(moduleRoot, `schemas${sourceExt}`),
@@ -198,7 +224,10 @@ async function runtimeVersion(): Promise<string> {
     path.join(runtimeRoot, "scripts", "win-capture.ps1")
   ];
   const versions = await Promise.all(files.map(async (file) => `${path.basename(file)}:${await fileMtimeMs(file)}`));
-  return versions.join("|");
+  const value = versions.join("|");
+
+  cachedRuntimeVersion = { value, expiresAt: Date.now() + RUNTIME_VERSION_CACHE_MS };
+  return value;
 }
 
 async function fileMtimeMs(file: string): Promise<number> {

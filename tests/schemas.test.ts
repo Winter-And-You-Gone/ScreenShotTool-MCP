@@ -273,6 +273,16 @@ test("write_clipboard requires text and accepts empty string", () => {
   assert.throws(() => writeClipboardSchema.parse({}));
 });
 
+test("write_clipboard rejects oversized payloads", () => {
+  // Exactly at the cap is accepted, one character over is rejected. Keeps the
+  // GlobalAlloc + Marshal.Copy path bounded so a runaway caller can't OOM
+  // the worker or the clipboard.
+  const atCap = writeClipboardSchema.parse({ text: "x".repeat(1_000_000) });
+  assert.equal(atCap.text.length, 1_000_000);
+
+  assert.throws(() => writeClipboardSchema.parse({ text: "x".repeat(1_000_001) }));
+});
+
 test("get_window_state requires a target selector", () => {
   assert.throws(() => getWindowStateSchema.parse({}));
 

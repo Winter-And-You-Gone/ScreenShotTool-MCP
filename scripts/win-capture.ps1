@@ -444,8 +444,12 @@ function Test-WindowCloaked {
 
 function Get-AllWindows {
   $windows = [System.Collections.ArrayList]::new()
+  # ApplicationFrameWindow wraps UWP apps and usually also exposes a child
+  # Windows.UI.Core.CoreWindow that carries the real title. Both must be
+  # excluded or we double-count UWP windows in Get-AllWindows (used by
+  # wait_for_window / get_window_state).
   $excludedClasses = @(
-    'ApplicationFrameWindow_skip',
+    'ApplicationFrameWindow',
     'Windows.UI.Core.CoreWindow',
     'Shell_TrayWnd',
     'Shell_SecondaryTrayWnd',
@@ -1575,6 +1579,11 @@ function Resolve-CharacterKey {
     return $null
   }
 
+  # The send_key schema restricts characters to printable ASCII ([\x20-\x7E]),
+  # so the shift map below is keyed on the US keyboard layout. That is the only
+  # layout that can ever produce these characters from a single physical key
+  # plus optional Shift, so this mapping is exhaustive for the accepted input
+  # set regardless of the user's actual keyboard layout.
   $keyMap = @{
     '0' = 0x30; '1' = 0x31; '2' = 0x32; '3' = 0x33; '4' = 0x34
     '5' = 0x35; '6' = 0x36; '7' = 0x37; '8' = 0x38; '9' = 0x39
@@ -2216,50 +2225,146 @@ function Wait-ForWindow {
   $startMs = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
   $deadline = $startMs + $timeoutMs
 
+  # Pre-resolve the filter inputs so the polling loop can do the cheapest
+  # possible check per candidate window. Get-Process (called inside
+  # Get-AllWindows -> Get-WindowProcessName) is the dominant cost on a busy
+  # desktop; with a 100ms poll and 300s timeout it can fire ~150k times.
+  # Instead we enumerate raw windows here and only build the full WindowInfo
+  # once we actually have a match.
+  $filterHwnd = $null
+  $filterPid = $null
+  $filterProcessName = $null
+  $filterTitleContains = $null
+  $hasHwnd = $filters.ContainsKey('hwnd') -and $null -ne $filters.hwnd
+  $hasPid = $filters.ContainsKey('pid') -and $null -ne $filters.pid
+  $hasProcessName = $filters.ContainsKey('processName') -and -not [string]::IsNullOrWhiteSpace($filters.processName)
+  $hasTitle = $filters.ContainsKey('titleContains') -and -not [string]::IsNullOrWhiteSpace($filters.titleContains)
+  if ($hasHwnd)   { $filterHwnd = [int64]([string]$filters.hwnd).Trim() }
+  if ($hasPid)    { $filterPid = [int]$filters.pid }
+  if ($hasProcessName) { $filterProcessName = (Normalize-ProcessName $filters.processName) }
+  if ($hasTitle)  { $filterTitleContains = [string]$filters.titleContains }
+
+  # Excluded classes — keep in sync with Get-AllWindows. We can't reuse that
+  # function because it constructs full objects + calls Get-Process per window.
+  $excludedClasses = @(
+    'ApplicationFrameWindow',
+    'Windows.UI.Core.CoreWindow',
+    'Shell_TrayWnd',
+    'Shell_SecondaryTrayWnd',
+    'WorkerW',
+    'Progman',
+    'TaskListThumbnailWnd',
+    'MSCTFIME UI',
+    'IME'
+  )
+
+  $matchWindowState = [ordered]@{ hwnd = [IntPtr]::Zero }
+  $enumProc = [ScreenshotTool.Native+EnumWindowsProc]{
+    param([IntPtr]$Hwnd, [IntPtr]$LParam)
+
+    # Skip cloaked windows — but only when not filtering by hwnd. An hwnd
+    # filter targets a specific known window and should still be visible to
+    # the matcher even if cloaked.
+    if (-not $hasHwnd -and (Test-WindowCloaked $Hwnd)) { return $true }
+
+    $className = Get-WindowClassName $Hwnd
+    if (-not $hasHwnd -and $excludedClasses -contains $className) { return $true }
+
+    if ($hasHwnd) {
+      if ($Hwnd.ToInt64() -ne $filterHwnd) { return $true }
+    } else {
+      $pidValue = [uint32]0
+      [ScreenshotTool.Native]::GetWindowThreadProcessId($Hwnd, [ref]$pidValue) | Out-Null
+      if ($hasPid -and [int]$pidValue -ne $filterPid) { return $true }
+      if ($hasProcessName) {
+        # Avoid Get-Process here unless the processName filter is the only
+        # selector — resolving a process name per window per poll is the
+        # exact cost we are trying to eliminate. Fall back to it only when
+        # the caller actually asked for a processName match.
+        $resolved = (Get-WindowProcessName $pidValue)
+        if ($resolved -ine $filterProcessName) { return $true }
+      }
+      if ($hasTitle) {
+        $title = Get-WindowTitle $Hwnd
+        if ($title.IndexOf($filterTitleContains, [StringComparison]::OrdinalIgnoreCase) -lt 0) { return $true }
+      } else {
+        # No title filter: still require a visible, non-zero-area window so
+        # we don't match stray WorkerW-style ghosts. Iconic windows ARE
+        # accepted (disappear-mode must still see a minimized window).
+        if (-not [ScreenshotTool.Native]::IsWindowVisible($Hwnd)) { return $true }
+      }
+    }
+
+    $matchWindowState.hwnd = $Hwnd
+    return $false
+  }
+
   while ($true) {
-    # Use Get-AllWindows so iconic/cloaked windows aren't silently skipped —
-    # critical for `disappear` mode (else minimizing the window would falsely
-    # report it gone) and for `appear` waiting on a window that starts
-    # minimized.
-    $matched = @(Filter-Windows (Get-AllWindows) $filters)
+    $matchWindowState.hwnd = [IntPtr]::Zero
+    [ScreenshotTool.Native]::EnumWindows($enumProc, [IntPtr]::Zero) | Out-Null
+    $matchedNow = $matchWindowState.hwnd -ne [IntPtr]::Zero
+
+    $elapsed = [int]([DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() - $startMs)
 
     if ($mode -eq 'appear') {
-      if ($matched.Count -gt 0) {
-        $elapsed = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() - $startMs
+      if ($matchedNow) {
         return [ordered]@{
           found = $true
           mode = $mode
-          window = $matched[0]
-          elapsedMs = [int]$elapsed
+          window = (Build-WindowInfoFromHwnd $matchWindowState.hwnd)
+          elapsedMs = $elapsed
           timestamp = (Get-Date).ToUniversalTime().ToString("o")
         }
       }
     } else {
-      if ($matched.Count -eq 0) {
-        $elapsed = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() - $startMs
+      if (-not $matchedNow) {
         return [ordered]@{
           found = $true
           mode = $mode
           window = $null
-          elapsedMs = [int]$elapsed
+          elapsedMs = $elapsed
           timestamp = (Get-Date).ToUniversalTime().ToString("o")
         }
       }
     }
 
     if ([DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() -ge $deadline) {
-      $elapsed = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() - $startMs
       return [ordered]@{
         found = $false
         mode = $mode
         window = $null
-        elapsedMs = [int]$elapsed
+        elapsedMs = $elapsed
         timeoutMs = $timeoutMs
         timestamp = (Get-Date).ToUniversalTime().ToString("o")
       }
     }
 
     Start-Sleep -Milliseconds $pollIntervalMs
+  }
+}
+
+
+function Build-WindowInfoFromHwnd {
+  param([IntPtr]$Hwnd)
+
+  $rect = New-Object ScreenshotTool.Native+RECT
+  if (-not [ScreenshotTool.Native]::GetWindowRect($Hwnd, [ref]$rect)) {
+    throw "Failed to get window rect."
+  }
+  $pidValue = [uint32]0
+  [ScreenshotTool.Native]::GetWindowThreadProcessId($Hwnd, [ref]$pidValue) | Out-Null
+  $titleBuilder = New-Object System.Text.StringBuilder 256
+  [ScreenshotTool.Native]::GetWindowText($Hwnd, $titleBuilder, $titleBuilder.Capacity) | Out-Null
+  $classBuilder = New-Object System.Text.StringBuilder 256
+  [ScreenshotTool.Native]::GetClassName($Hwnd, $classBuilder, $classBuilder.Capacity) | Out-Null
+
+  return [ordered]@{
+    hwnd        = $Hwnd.ToInt64().ToString()
+    title       = $titleBuilder.ToString()
+    pid         = [int]$pidValue
+    processName = Get-WindowProcessName $pidValue
+    className   = $classBuilder.ToString()
+    rect        = Get-RectObject $rect
   }
 }
 

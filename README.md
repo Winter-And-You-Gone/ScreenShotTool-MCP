@@ -12,8 +12,12 @@ Windows 本地截图与窗口操控 MCP Server，供 Codex、Claude Code 等 MCP
 - `move_mouse_window` — 按窗口相对坐标投递鼠标移动消息，不移动主机物理鼠标。
 - `click_menu_item` — 按原生菜单路径触发菜单命令，支持中文菜单名，不移动主机物理鼠标。
 - `close_app` — 用 `taskkill /T /F` 终止指定 `pid` 及其子进程树。
-- `type_text` — 输入文本。`noActivate:true` 用 `PostMessage(WM_CHAR)` 直接投递到目标窗口的编辑控件，窗口无需焦点、无需前台。
+- `type_text` — 输入文本。`noActivate:true` 用 `PostMessage(WM_CHAR)` 直接投递到目标窗口的编辑控件，窗口无需焦点、无需前台。注意：对标准 Edit/RichEdit 控件可能走 `EM_REPLACESEL`，会**替换当前选区**而不是在光标处插入；若需要纯插入，先发一个取消选区的按键即可。
 - `send_key` — 发送按键。`noActivate:true` 用 `PostMessage(WM_KEYDOWN/WM_KEYUP)`，窗口无需焦点。
+- `read_clipboard` — 读取 Windows 剪贴板文本。无文本时返回 `available:false`。
+- `write_clipboard` — 写文本到剪贴板（支持 Unicode、CJK、换行；传空串清空）。上限 1,000,000 字符。配合 `send_key` 的 Ctrl+V 比逐字符 `type_text` 快很多。
+- `get_window_state` — 查询单个窗口的详细状态（minimized/maximized/foreground/topmost/layered/cloaked/style 等），比 `list_windows` 信息更全。
+- `wait_for_window` — 阻塞等待匹配窗口出现 (`mode:"appear"`) 或消失 (`mode:"disappear"`)。超时返回 `found:false` 而不是抛错，比客户端轮询高效。
 
 截图默认保存到：
 
@@ -166,8 +170,22 @@ npm run build
   "mcpServers": {
     "screenshottool": {
       "command": "node",
-      "args": ["X:\\MCP\\ScreenShotTool-MCP\\dist\\index.js"],
-      "cwd": "X:\\MCP\\ScreenShotTool-MCP"
+      "args": ["X:\\MCP\\ScreenShotTool\\dist\\index.js"],
+      "cwd": "X:\\MCP\\ScreenShotTool"
+    }
+  }
+}
+```
+
+开发期也可以用 `tsx` 直接运行 TypeScript 源码（无需每次构建）：
+
+```json
+{
+  "mcpServers": {
+    "screenshottool": {
+      "command": "npx",
+      "args": ["tsx", "X:\\MCP\\ScreenShotTool\\src\\index.ts"],
+      "cwd": "X:\\MCP\\ScreenShotTool"
     }
   }
 }
@@ -229,38 +247,6 @@ npm run smoke:no-activate
 - ❌ 不要修改 `outputs/`、`dist/`、`.claude/` 目录——都被 gitignore
 - ❌ 不要给 `type_text` 传超长字符串（单次最多 1000 字符，且会按 `delayMs + pressMs` 拒绝预计过慢的请求），分段发送更可靠
 - ❌ 不要在 `click_window` 之后立刻 `capture_window`——加 `delayMs: 200` 给 UI 重绘时间
-
----
-
-## Codex / Claude Code 配置示例
-
-构建后，把 MCP Server 配到客户端的 `mcpServers` 中：
-
-```json
-{
-  "mcpServers": {
-    "screenshottool": {
-      "command": "node",
-      "args": ["X:\\MCP\\ScreenShotTool\\dist\\index.js"],
-      "cwd": "X:\\MCP\\ScreenShotTool"
-    }
-  }
-}
-```
-
-也可以开发期使用 `tsx`：
-
-```json
-{
-  "mcpServers": {
-    "screenshottool": {
-      "command": "npx",
-      "args": ["tsx", "X:\\MCP\\ScreenShotTool\\src\\index.ts"],
-      "cwd": "X:\\MCP\\ScreenShotTool"
-    }
-  }
-}
-```
 
 ## 示例调用
 
@@ -395,3 +381,4 @@ npm run inspect
 - `args` 必须是字符串数组，不接受拼接后的命令行。
 - 截图使用物理像素坐标；helper 会尝试启用 DPI aware，减少高 DPI 缩放偏差。
 - 服务器进程持有一个长驻 PowerShell helper 进程，命中第一次启动后，后续每次工具调用约几十毫秒；helper 异常退出时会按需重启。
+- **请求模型**：长驻 worker 是串行的——所有走 `runHelper` 的工具调用（除 `wait_for_window`、`wait-and-suppress` 外）共享一个 stdin，后者处理完前一个请求才会响应下一个。长时间操作（如超长 `type_text`）会阻塞后续调用。`wait_for_window` 走独立 PS 进程，不阻塞其他工具。
