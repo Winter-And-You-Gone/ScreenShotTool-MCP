@@ -71,12 +71,12 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       },
       {
         name: "capture_window",
-        description: "Capture a window by hwnd, pid, process name, or title substring. captureMethod 'print' works on occluded/minimized windows. noActivate avoids stealing focus.",
+        description: "Capture a window by hwnd, pid, process name, or title substring. 'screen' mode copies visible screen pixels (subject to occlusion — captures whatever is on top). 'print' mode uses PrintWindow (works on occluded/minimized windows, but cannot capture separate top-level windows like Qt tooltips, popups, or Electron child windows). noActivate avoids stealing focus.",
         inputSchema: schemas.toolInputSchemas.capture_window
       },
       {
         name: "capture_screen_region",
-        description: "Capture a screen-space rectangle in physical pixels.",
+        description: "Capture a screen-space rectangle in physical pixels. Copies whatever is currently visible at that screen region — if other windows occlude the target, the occluder is captured instead. Subject to multi-monitor coordinate and DPI considerations.",
         inputSchema: schemas.toolInputSchemas.capture_screen_region
       },
       {
@@ -91,7 +91,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       },
       {
         name: "move_mouse_window",
-        description: "Post a WM_MOUSEMOVE message to a window-relative coordinate without moving the physical cursor, useful for hover states before taking a screenshot.",
+        description: "Post a WM_MOUSEMOVE message to a window-relative coordinate without moving the physical cursor. NOTE: does not trigger tooltips in Qt/Electron apps — those read the real system cursor position (QCursor::pos()), not window messages. For reliable hover-driven UI in such apps, use a programmatic test hook or real cursor instead.",
         inputSchema: schemas.toolInputSchemas.move_mouse_window
       },
       {

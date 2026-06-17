@@ -383,3 +383,17 @@ npm run inspect
 - 服务器进程持有一个长驻 PowerShell helper 进程，命中第一次启动后，后续每次工具调用约几十毫秒；helper 异常退出时会按需重启。
 - **请求模型**：长驻 worker 是串行的——所有走 `runHelper` 的工具调用（除 `wait_for_window`、`wait-and-suppress` 外）共享一个 stdin，后者处理完前一个请求才会响应下一个。长时间操作（如超长 `type_text`）会阻塞后续调用。`wait_for_window` 走独立 PS 进程，不阻塞其他工具。
 - **后台模式的极限**：`noActivate` 的持续压制最多持续约 3 秒。如果目标应用在启动 3 秒后才主动调用 `SetForegroundWindow`（极少见，多见于延迟加载插件或开机自启注册），窗口仍可能抢到前台。这是应用行为，工具侧已做到了合理覆盖。
+
+### 截图模式与遮挡 / tooltip 的关键限制（Qt、Electron 类应用特别注意）
+
+下面几条是 Win32 API 层面的硬限制，反复换参数也不会改变结果。**遇到这些场景时，应该在程序里换验证方式，而不是反复截图。**
+
+- **`capture_window` 的 `screen` 模式按屏幕可见像素拷贝（`Graphics.CopyFromScreen`）**：它根本不看 hwnd，只看那块屏幕矩形当时显示了什么。如果目标窗口被遮挡、不在前台、或多显示器坐标偏移，就会抓到遮挡物。这是物理限制，工具层无法绕过。
+- **`capture_window` 的 `print` 模式（`PrintWindow`）只绘制目标 hwnd 及其子窗口的客户区**：抓不到**独立顶层窗口**——典型例子是 Qt 的 `Qt::ToolTip`、`Qt::Popup` 弹窗、Electron 的子窗口、独立的下拉菜单。这些是带 `WS_EX_TOOLWINDOW` 的独立 hwnd，不在主窗口的子窗口树里，`EnumChildWindows` 也找不到。
+- **`move_mouse_window` 用 `PostMessage(WM_MOUSEMOVE)` 投递窗口消息，但 Qt/Electron 的 tooltip 由 `QCursor::pos()` + hover 定时器驱动**：窗口消息不更新系统鼠标位置，所以 Qt 看到鼠标"还在别处"，不会启动 hover 计时器，**不会出现 tooltip**。这个工具对 Qt/Electron 的 hover 触发**基本无效**。
+- **`capture_screen_region` 同 `screen` 模式**：按屏幕可见像素截取，受多显示器坐标、DPI、前台遮挡影响。如果目标区域被别的窗口盖住，截到的就是遮挡物。
+
+**结论**：本工具适合抓**稳定的窗口内容**。对于「hover 触发 + 独立顶层 tooltip + 多显示器/遮挡」这类组合场景（典型如 Qt 应用），更可靠的验证方式是：
+1. 在目标程序里临时加测试入口，强制显示 tooltip/弹窗后再截图；
+2. 用真实鼠标 + 可交互录屏；
+3. 让目标程序把要验证的 UI 状态写到日志/文件，工具读文件而非看图。
