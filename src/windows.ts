@@ -299,13 +299,13 @@ export async function launchApp(input: LaunchAppInput): Promise<{ pid: number; w
 
   let window: WindowInfo | null = null;
   let previousForegroundHwnd: string | undefined;
+  let suppressRan = false;
 
   if (input.noActivate) {
-    // Use the wait-and-suppress helper via the shared worker (pre-warmed,
-    // all C# types already compiled, zero cold-start delay). The PS script
-    // captures GetForegroundWindow internally, polls for the first new
-    // window, pushes to HWND_BOTTOM, restores previous foreground, then
-    // sustains suppression for ~3s (multi-window, self-reactivation).
+    // Phase 1: wait-and-suppress via the shared worker (pre-warmed, zero
+    // cold-start). Captures previous foreground internally, polls for the
+    // first new window, pushes to HWND_BOTTOM, then sustains suppression
+    // for min(8s, timeoutMs) to cover delayed self-activation.
     try {
       const suppressResult = await runHelper<WaitAndSuppressResult>(
         {
@@ -318,16 +318,39 @@ export async function launchApp(input: LaunchAppInput): Promise<{ pid: number; w
           }
         }
       );
+      suppressRan = true;
       if (suppressResult.found) {
         window = suppressResult.window;
       }
     } catch {
-      // Best-effort fallthrough to pollForWindow
+      // suppressRan stays false — fall through
     }
   }
 
   if (!window) {
     window = await pollForWindow(child.pid, processName, existingHwnds, input.timeoutMs, exitState);
+  }
+
+  // Phase 2: when Phase 1 timed out (app started slowly) but pollForWindow
+  // found a window, fire a short suppression pass. The window is not in
+  // existingHwnds (those were captured pre-spawn), so Wait-And-Suppress
+  // will find it as "new", push it to HWND_BOTTOM, and sustain for 8s.
+  if (input.noActivate && window && !suppressRan) {
+    try {
+      await runHelper<WaitAndSuppressResult>(
+        {
+          action: "wait-and-suppress",
+          target: {
+            pid: child.pid,
+            processName,
+            existingHwnds: [...existingHwnds],
+            timeoutMs: 8000
+          }
+        }
+      );
+    } catch {
+      // Best-effort
+    }
   }
 
   if (window === null && exitState.exited) {

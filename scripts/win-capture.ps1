@@ -2410,9 +2410,11 @@ function Wait-And-Suppress {
   if ($Target.ContainsKey("timeoutMs") -and $null -ne $Target.timeoutMs) {
     $timeoutMs = [int]$Target.timeoutMs
   }
-  # After finding the first new window, continue suppressing for this long
-  # (catches multi-window apps and self-reactivation).
-  $SUSTAIN_MS = 3000
+  # After finding the first new window, continue suppressing for the rest
+  # of the timeoutMs period (or at least 8s, whichever is longer). Many apps
+  # — especially Qt-based ones like VaporView — take 5-10s to finish loading
+  # plugins and may self-activate long after the first window appears.
+  $SUSTAIN_MS = [Math]::Max(8000, $timeoutMs)
 
   # Capture the current foreground window right here — zero cold start because
   # the shared worker already has all C# types compiled and loaded.
