@@ -619,8 +619,36 @@ function Focus-Window {
   $flags = [uint32]($swpNoSize -bor $swpNoMove)
 
   [ScreenshotTool.Native]::ShowWindow($hwnd, $swRestore) | Out-Null
-  [ScreenshotTool.Native]::SetWindowPos($hwnd, $hwndTopMost, 0, 0, 0, 0, $flags) | Out-Null
-  [ScreenshotTool.Native]::SetWindowPos($hwnd, $hwndNoTopMost, 0, 0, 0, 0, $flags) | Out-Null
+
+  # ── TOPMOST trick ──
+  # Temporarily setting HWND_TOPMOST then clearing HWND_NOTOPMOST is a
+  # well-known Win32 pattern to reliably bring a window to the foreground
+  # despite Windows' foreground-lock policy. The danger is that if the
+  # NOTOPMOST call fails, the window is left with WS_EX_TOPMOST and stays
+  # permanently above all other windows — "霸占顶层".
+  #
+  # We use try/finally + post-verification to guarantee the style is
+  # always cleared, even if the process is interrupted between the two
+  # SetWindowPos calls.
+  try {
+    [ScreenshotTool.Native]::SetWindowPos($hwnd, $hwndTopMost, 0, 0, 0, 0, $flags) | Out-Null
+    [ScreenshotTool.Native]::SetWindowPos($hwnd, $hwndNoTopMost, 0, 0, 0, 0, $flags) | Out-Null
+  } finally {
+    # Verify TOPMOST was cleared, and if not, retry.
+    $gwlExStyle = -20
+    $wsExTopMost = [int64]0x00000008
+    $exStyle = if ([IntPtr]::Size -eq 8) {
+      [ScreenshotTool.Native]::GetWindowLong64($hwnd, $gwlExStyle).ToInt64()
+    } else {
+      [int64][ScreenshotTool.Native]::GetWindowLong32($hwnd, $gwlExStyle)
+    }
+    if (($exStyle -band $wsExTopMost) -ne 0) {
+      [ScreenshotTool.Native]::SetWindowPos($hwnd, $hwndNoTopMost, 0, 0, 0, 0, $flags) | Out-Null
+      # Log so we can detect patterns
+      Write-Warning "Focus-Window: TOPMOST was stuck, retried NOTOPMOST for hwnd $($hwnd.ToInt64())"
+    }
+  }
+
   [ScreenshotTool.Native]::BringWindowToTop($hwnd) | Out-Null
   [ScreenshotTool.Native]::SetForegroundWindow($hwnd) | Out-Null
   Start-Sleep -Milliseconds 150
