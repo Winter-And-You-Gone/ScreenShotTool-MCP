@@ -24,10 +24,7 @@ export type WaitAndSuppressInput = {
   pid: number;
   processName?: string;
   existingHwnds?: string[];
-  previousForegroundHwnd?: string;
   timeoutMs?: number;
-  // When set, skip polling and just suppress this known hwnd + any new ones
-  knownHwnd?: string;
 };
 
 export type Rect = {
@@ -302,71 +299,35 @@ export async function launchApp(input: LaunchAppInput): Promise<{ pid: number; w
 
   let window: WindowInfo | null = null;
   let previousForegroundHwnd: string | undefined;
-  let suppressRan = false;
 
   if (input.noActivate) {
-    // Capture the current foreground hwnd so we can restore it after
-    // the new window briefly steals focus.
-    const previousFgResult = spawnSync(powershellCommand, [
-      "-NoProfile", "-Command",
-      `Add-Type -TypeDefinition 'using System; using System.Runtime.InteropServices; public static class FG { [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow(); }'; [FG]::GetForegroundWindow().ToInt64().ToString()`
-    ], { encoding: "utf8", shell: false, windowsHide: true });
-    previousForegroundHwnd = previousFgResult.stdout.trim();
-
-    // Phase 1: wait-and-suppress polls for the first window, pushes it to
-    // HWND_BOTTOM, restores previous foreground, then continues suppressing
-    // for ~3s more (catches multi-window apps and self-reactivation).
+    // Use the wait-and-suppress helper via the shared worker (pre-warmed,
+    // all C# types already compiled, zero cold-start delay). The PS script
+    // captures GetForegroundWindow internally, polls for the first new
+    // window, pushes to HWND_BOTTOM, restores previous foreground, then
+    // sustains suppression for ~3s (multi-window, self-reactivation).
     try {
-      const suppressResult = await runStandaloneHelper<WaitAndSuppressResult>(
+      const suppressResult = await runHelper<WaitAndSuppressResult>(
         {
           action: "wait-and-suppress",
           target: {
             pid: child.pid,
             processName,
             existingHwnds: [...existingHwnds],
-            previousForegroundHwnd,
             timeoutMs: input.timeoutMs
           }
-        },
-        input.timeoutMs + 8000, // timeout + 3s sustain + padding
-        "wait_and_suppress"
+        }
       );
-      suppressRan = true;
       if (suppressResult.found) {
         window = suppressResult.window;
       }
     } catch {
-      // suppressRan stays false — fall through to pollForWindow
+      // Best-effort fallthrough to pollForWindow
     }
   }
 
   if (!window) {
     window = await pollForWindow(child.pid, processName, existingHwnds, input.timeoutMs, exitState);
-  }
-
-  // Bug 1 fix: when the app started too slowly for the initial Wait-And-Suppress
-  // call but pollForWindow found it, the window is sitting on top with no
-  // suppression. Fire a second, short suppression pass with the known hwnd.
-  if (input.noActivate && window && !suppressRan) {
-    try {
-      await runStandaloneHelper<WaitAndSuppressResult>(
-        {
-          action: "wait-and-suppress",
-          target: {
-            pid: child.pid,
-            processName,
-            existingHwnds: [...existingHwnds],
-            previousForegroundHwnd,
-            knownHwnd: window.hwnd,  // skip polling, go straight to sustained suppression
-            timeoutMs: 5000           // 5s is enough for sustain phase
-          }
-        },
-        10000,
-        "wait_and_suppress_fallback"
-      );
-    } catch {
-      // Best-effort only
-    }
   }
 
   if (window === null && exitState.exited) {

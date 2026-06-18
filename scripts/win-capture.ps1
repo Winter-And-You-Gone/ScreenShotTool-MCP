@@ -2411,13 +2411,12 @@ function Wait-And-Suppress {
     $timeoutMs = [int]$Target.timeoutMs
   }
   # After finding the first new window, continue suppressing for this long
-  # (catches multi-window apps and self-reactivation — Bugs 2 and 3).
+  # (catches multi-window apps and self-reactivation).
   $SUSTAIN_MS = 3000
 
-  $previousForegroundHwnd = [IntPtr]::Zero
-  if ($Target.ContainsKey("previousForegroundHwnd") -and $null -ne $Target.previousForegroundHwnd) {
-    $previousForegroundHwnd = [IntPtr]([int64]$Target.previousForegroundHwnd)
-  }
+  # Capture the current foreground window right here — zero cold start because
+  # the shared worker already has all C# types compiled and loaded.
+  $previousForegroundHwnd = [ScreenshotTool.Native]::GetForegroundWindow()
 
   $SWP_NOSIZE = [uint32]0x0001
   $SWP_NOMOVE = [uint32]0x0002
@@ -2433,13 +2432,6 @@ function Wait-And-Suppress {
   $script:suppressLastFoundWindow = $null
   $sustainDeadline = $null  # set after first new window is found
 
-  # Pre-populate known hwnds from caller (pollForWindow fallback sends its
-  # found window via `knownHwnd` so we can sustain-suppress it immediately).
-  if ($Target.ContainsKey("knownHwnd") -and -not [string]::IsNullOrWhiteSpace($Target.knownHwnd)) {
-    $script:suppressKnownHwnds.Add([string]$Target.knownHwnd) | Out-Null
-    $sustainDeadline = $startMs + $SUSTAIN_MS
-  }
-
   $enumProc = [ScreenshotTool.Native+EnumWindowsProc]{
     param([IntPtr]$Hwnd, [IntPtr]$LParam)
     if (-not [ScreenshotTool.Native]::IsWindowVisible($Hwnd)) { return $true }
@@ -2452,7 +2444,7 @@ function Wait-And-Suppress {
     # ── Already-known window: foreground-steal check ──
     if ($script:suppressKnownHwnds.Contains($hwndText)) {
       if ([ScreenshotTool.Native]::GetForegroundWindow() -eq $Hwnd) {
-        # App re-activated itself (Bug 3). Push to bottom and restore.
+        # App re-activated itself. Push to bottom and restore previous.
         [ScreenshotTool.Native]::SetWindowPos($Hwnd, [IntPtr]1, 0, 0, 0, 0, $pushFlags) | Out-Null
         if ($previousForegroundHwnd -ne [IntPtr]::Zero -and $previousForegroundHwnd -ne $Hwnd) {
           [ScreenshotTool.Native]::keybd_event([byte]0x12, 0, [uint32]0, [UIntPtr]::Zero)
@@ -2471,7 +2463,7 @@ function Wait-And-Suppress {
     # Push to HWND_BOTTOM immediately.
     [ScreenshotTool.Native]::SetWindowPos($Hwnd, $hwndBottom, 0, 0, 0, 0, $pushFlags) | Out-Null
 
-    # Restore previous foreground.
+    # Restore previous foreground (Alt-keybd_event trick).
     [ScreenshotTool.Native]::keybd_event([byte]0x12, 0, [uint32]0, [UIntPtr]::Zero)
     [ScreenshotTool.Native]::keybd_event([byte]0x12, 0, [uint32]2, [UIntPtr]::Zero)
     if ($previousForegroundHwnd -ne [IntPtr]::Zero -and $previousForegroundHwnd -ne $Hwnd) {
@@ -2498,7 +2490,7 @@ function Wait-And-Suppress {
       $sustainDeadline = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() + $SUSTAIN_MS
     }
 
-    return $true  # keep looking (multi-window apps — Bug 2)
+    return $true
   }
 
   while ($true) {
