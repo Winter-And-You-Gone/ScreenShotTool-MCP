@@ -389,12 +389,30 @@ export async function listWindows(filters: ListWindowsInput = {}): Promise<Windo
 export async function captureWindow(input: CaptureWindowInput): Promise<CaptureResult> {
   const outputPath = await ensureOutputPath(input.outputPath);
   const { outputPath: _outputPath, ...target } = input;
-  return runHelper<CaptureResult>({ action: "capture-window", target, outputPath });
+  // Capture runs in a SEPARATE PowerShell process (not the shared worker).
+  // PrintWindow/CopyFromScreen can block synchronously on an unresponsive
+  // target window (e.g. an Electron/Qt app that isn't pumping messages), and
+  // when that happens on the shared worker it stalls the entire FIFO queue —
+  // every subsequent MCP tool call (list_windows, click_window, ...) waits
+  // behind it until the 90s kill switch trips. Client gateways typically 504
+  // before that, surfacing as "input/output 0, status 504". Running capture
+  // standalone isolates the stall: a hung capture dies alone at its own
+  // (shorter) timeout and other tools keep working. Cost is ~1s cold start per
+  // capture, which is negligible next to the cost of a wedged MCP server.
+  return runStandaloneHelper<CaptureResult>(
+    { action: "capture-window", target, outputPath },
+    CAPTURE_TIMEOUT_MS,
+    "capture_window"
+  );
 }
 
 export async function captureScreenRegion(input: CaptureScreenRegionInput): Promise<CaptureResult> {
   const outputPath = await ensureOutputPath(input.outputPath);
-  return runHelper<CaptureResult>({ action: "capture-screen-region", region: input.region, outputPath });
+  return runStandaloneHelper<CaptureResult>(
+    { action: "capture-screen-region", region: input.region, outputPath },
+    CAPTURE_TIMEOUT_MS,
+    "capture_screen_region"
+  );
 }
 
 export async function clickWindow(input: ClickWindowInput): Promise<ClickResult> {
@@ -513,6 +531,20 @@ async function spawnApp(input: LaunchAppInput, cwd?: string): Promise<ReturnType
 // so a legitimately large type_text never trips the worker kill switch
 // (which would also nuke any other queued requests on the same worker).
 const HELPER_TIMEOUT_MS = 90000;
+
+// Timeout for standalone capture requests (capture_window / capture_screen_region).
+//
+// Capture is fundamentally different from the other actions: it can block
+// synchronously inside Win32 on an unresponsive target window — PrintWindow
+// sends WM_PRINT and waits for the target to render, CopyFromScreen + focus
+// restore waits on SetForegroundWindow. If the target's UI thread is stuck
+// (loading, modal dialog, hung renderer), the call hangs indefinitely.
+//
+// Capture itself should complete in well under 5s in the normal case; 20s is
+// a generous ceiling that still catches genuine hangs well before client
+// gateways 504 (typically 30-60s). A timed-out capture is killed via
+// taskkill /T /F in runStandaloneHelper, so it can't leak.
+const CAPTURE_TIMEOUT_MS = 20000;
 
 type WorkerResponseOk = { ok: true; result: unknown };
 type WorkerResponseErr = { ok: false; error: string };
