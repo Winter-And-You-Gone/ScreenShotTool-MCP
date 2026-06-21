@@ -525,26 +525,6 @@ async function spawnApp(input: LaunchAppInput, cwd?: string): Promise<ReturnType
   return child;
 }
 
-// Per-action timeout for the shared PowerShell worker (runHelper).
-//
-// Quick operations (click, list, clipboard, etc.) normally finish in < 1s
-// and should never take more than 15s.  type-text is the outlier: the schema
-// caps estimated work at maxTypeTextEstimatedMs (55s), and PowerShell's
-// Start-Sleep plus per-char overhead drifts a few seconds above the estimate,
-// so 90s gives comfortable headroom.
-//
-// wait-and-suppress can sustain suppression for max(8s, timeoutMs) after
-// the first window is found; with timeoutMs up to 120s that's 240s, but the
-// caller (launchApp) already limits its own wall-clock timeout. 120,000ms
-// ensures Wait-And-Suppress isn't prematurely killed during legitimately
-// long suppression windows.
-const ACTION_TIMEOUT_MS: Readonly<Record<string, number>> = {
-  "type-text": 90000,
-  "wait-and-suppress": 120000,
-};
-/** Default timeout for quick worker operations (click, list, menu, etc.). */
-const QUICK_OPERATION_TIMEOUT = 15000;
-
 // Timeout for standalone capture requests (capture_window / capture_screen_region).
 //
 // Capture is fundamentally different from the other actions: it can block
@@ -735,9 +715,15 @@ function unrefStream(stream: NodeJS.ReadableStream | NodeJS.WritableStream | nul
 
 async function runHelper<T>(request: HelperRequest): Promise<T> {
   const worker = await getWorker();
-  const timeoutMs = request.action in ACTION_TIMEOUT_MS
-    ? ACTION_TIMEOUT_MS[request.action]!
-    : QUICK_OPERATION_TIMEOUT;
+  const timeoutMs = request.action === "type-text"
+    ? 90000
+    : request.action === "wait-and-suppress"
+      ? 120000
+      : request.action === "click-window"
+        || request.action === "move-mouse-window"
+        || request.action === "click-menu-item"
+        ? 12000
+        : 5000;
 
   if (worker.exited || !worker.child.stdin || worker.child.stdin.destroyed) {
     activeWorker = null;
