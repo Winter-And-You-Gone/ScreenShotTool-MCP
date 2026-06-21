@@ -298,7 +298,6 @@ export async function launchApp(input: LaunchAppInput): Promise<{ pid: number; w
   }
 
   let window: WindowInfo | null = null;
-  let previousForegroundHwnd: string | undefined;
   let suppressRan = false;
 
   if (input.noActivate) {
@@ -359,7 +358,7 @@ export async function launchApp(input: LaunchAppInput): Promise<{ pid: number; w
 
   if (input.startMinimized && window) {
     try {
-      await minimizeWindow(window.hwnd, input.noActivate, previousForegroundHwnd);
+      await minimizeWindow(window.hwnd, input.noActivate);
     } catch (error) {
       console.error(`startMinimized failed for hwnd ${window.hwnd}: ${formatSpawnError(error)}`);
     }
@@ -898,10 +897,7 @@ function findPowerShellCommand(): string {
   return pwsh.status === 0 ? "pwsh.exe" : "powershell.exe";
 }
 
-function minimizeWindow(hwnd: string, noActivate = false, previousForegroundHwnd?: string): Promise<unknown> {
+function minimizeWindow(hwnd: string, noActivate = false): Promise<unknown> {
   const action = noActivate ? "noactivate-minimize" : "minimize-window";
-  const target = noActivate && previousForegroundHwnd
-    ? { hwnd, previousForegroundHwnd }
-    : { hwnd };
-  return runHelper({ action, target });
+  return runHelper({ action, target: { hwnd } });
 }

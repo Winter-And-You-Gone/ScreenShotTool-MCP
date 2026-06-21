@@ -71,7 +71,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       },
       {
         name: "capture_window",
-        description: "Capture a window by hwnd, pid, process name, or title substring. 'screen' mode copies visible screen pixels (subject to occlusion — captures whatever is on top). 'print' mode uses PrintWindow (works on occluded/minimized windows, but cannot capture separate top-level windows like Qt tooltips, popups, or Electron child windows). noActivate avoids stealing focus.",
+        description: "Capture a window by hwnd, pid, process name, or title substring. 'print' mode (default) uses PrintWindow API — works on occluded/minimized windows, but cannot capture separate top-level windows like Qt tooltips, popups, or Electron child windows. 'screen' mode uses CopyFromScreen (requires visible area, captures whatever is on top); only use when print fails or you need to capture separate popup/tooltip windows. noActivate avoids stealing focus.",
         inputSchema: schemas.toolInputSchemas.capture_window
       },
       {

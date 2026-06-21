@@ -6,7 +6,7 @@ Windows 本地截图与窗口操控 MCP Server，供 Codex、Claude Code 等 MCP
 
 - `launch_app` — 启动指定 `.exe`，可等待第一个可见窗口。`noActivate:true` 会在发现新窗口后恢复原前台窗口，并把目标窗口压到 z-order 底部；`startMinimized:true` 会在发现窗口后请求后台/最小化呈现。少数程序启动时仍可能短暂置顶或自行抢焦点。
 - `list_windows` — 按 `pid`、进程名、标题关键字列出可见窗口。
-- `capture_window` — 截取窗口。`captureMethod:"print"` 用 `PrintWindow` 拍被遮挡/最小化窗口；`noActivate:true` 自动使用 PrintWindow，不操作 z-order，不闪烁。
+- `capture_window` — 截取窗口。**默认使用 `captureMethod:"print"`（PrintWindow API）**，可截取被遮挡或最小化的窗口，推荐优先使用。仅当 `print` 模式抓不到的场景（如需要捕获 Qt ToolTip、Electron 子窗口等独立顶层弹窗）才改为 `captureMethod:"screen"`。`noActivate:true` 自动使用 PrintWindow，不操作 z-order，不闪烁。
 - `capture_screen_region` — 按屏幕绝对坐标截取矩形。
 - `click_window` — 按窗口相对坐标投递鼠标点击消息，不移动主机物理鼠标。
 - `move_mouse_window` — 按窗口相对坐标投递鼠标移动消息，不移动主机物理鼠标。
@@ -58,8 +58,8 @@ X:\MCP\ScreenShotTool\outputs\YYYYMMDD-HHMMSS-xxxxxx.png
 // 2. 输入文字（noActivate，PostMessage WM_CHAR 直达编辑控件）
 { "hwnd": "123456", "text": "Hello from background!", "noActivate": true }
 
-// 3. 截图（PrintWindow，不把窗口拉到前台）
-{ "hwnd": "123456", "focus": false, "noActivate": true, "captureMethod": "print" }
+// 3. 截图（默认 PrintWindow，不把窗口拉到前台）
+{ "hwnd": "123456", "focus": false, "noActivate": true }
 
 // 4. 关闭
 { "pid": 7890 }
@@ -80,8 +80,8 @@ VaporView 这类 Qt 程序建议使用同一套参数：
 // click_window: 本身使用窗口消息，不移动物理鼠标
 { "hwnd": "123456", "x": 535, "y": 50, "delayMs": 300 }
 
-// capture_window
-{ "hwnd": "123456", "focus": false, "noActivate": true, "captureMethod": "print" }
+// capture_window（默认 PrintWindow）
+{ "hwnd": "123456", "focus": false, "noActivate": true }
 ```
 
 ## 安装与构建

@@ -78,7 +78,7 @@ export const captureWindowSchema = z.object({
   titleContains: z.string().min(1).optional(),
   region: regionSchema.optional(),
   focus: z.boolean().optional().default(true),
-  captureMethod: z.enum(["screen", "print"]).optional().default("screen"),
+  captureMethod: z.enum(["screen", "print"]).optional().default("print"),
   noActivate: z.boolean().optional().default(false),
   outputPath: z.string().min(1).optional()
 }).strict().refine(
@@ -270,7 +270,7 @@ export const toolInputSchemas = {
         description: "Optional rectangle relative to the target window top-left corner."
       },
       focus: { type: "boolean", default: true, description: "Bring the window to the foreground before capturing. Set false to preserve open menus, popups, or transient UI." },
-      captureMethod: { type: "string", enum: ["screen", "print"], default: "screen", description: "Capture method: 'screen' uses CopyFromScreen (needs visible area), 'print' uses PrintWindow API (captures window content even behind other windows)." },
+      captureMethod: { type: "string", enum: ["screen", "print"], default: "print", description: "Capture method: 'print' uses PrintWindow API (captures window content even behind other windows, default). 'screen' uses CopyFromScreen (needs visible area, only use when print fails or you need to capture separate popup/tooltip windows)." },
       noActivate: { type: "boolean", default: false, description: "When true, prefer non-activating capture. With captureMethod 'screen', the helper falls back to PrintWindow to avoid changing foreground/z-order." },
       outputPath: { type: "string", description: "Optional absolute PNG output path." }
     },

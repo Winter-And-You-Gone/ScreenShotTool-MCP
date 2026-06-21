@@ -846,20 +846,9 @@ function Capture-Window {
     [string]$OutputPath
   )
 
-  $captureMethod = "screen"
+  $captureMethod = "print"
   if ($Target.ContainsKey("captureMethod") -and $null -ne $Target.captureMethod) {
     $captureMethod = ([string]$Target.captureMethod).ToLowerInvariant()
-  }
-
-  $noActivate = $false
-  if ($Target.ContainsKey("noActivate") -and $null -ne $Target.noActivate) {
-    $noActivate = [bool]$Target.noActivate
-  }
-
-  # When noActivate is requested with screen capture, switch to PrintWindow
-  # instead — no z-order juggling, no visual flash.
-  if ($noActivate -and $captureMethod -eq "screen") {
-    $captureMethod = "print"
   }
 
   $includeHidden = ($captureMethod -eq "print")

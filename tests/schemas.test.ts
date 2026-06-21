@@ -241,12 +241,12 @@ test("launch_app accepts startMinimized and defaults to false", () => {
   assert.equal(withFlag.startMinimized, true);
 });
 
-test("capture_window accepts captureMethod and defaults to screen", () => {
+test("capture_window accepts captureMethod and defaults to print", () => {
   const fallback = captureWindowSchema.parse({ hwnd: "1" });
-  assert.equal(fallback.captureMethod, "screen");
+  assert.equal(fallback.captureMethod, "print");
 
-  const print = captureWindowSchema.parse({ hwnd: "1", captureMethod: "print" });
-  assert.equal(print.captureMethod, "print");
+  const screen = captureWindowSchema.parse({ hwnd: "1", captureMethod: "screen" });
+  assert.equal(screen.captureMethod, "screen");
 
   assert.throws(() => captureWindowSchema.parse({ hwnd: "1", captureMethod: "invalid" }));
 });
