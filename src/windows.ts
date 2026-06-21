@@ -299,12 +299,13 @@ export async function launchApp(input: LaunchAppInput): Promise<{ pid: number; w
 
   let window: WindowInfo | null = null;
   let suppressRan = false;
+  const launchStart = Date.now();
 
   if (input.noActivate) {
     // Phase 1: wait-and-suppress via the shared worker (pre-warmed, zero
     // cold-start). Captures previous foreground internally, polls for the
     // first new window, pushes to HWND_BOTTOM, then sustains suppression
-    // for min(8s, timeoutMs) to cover delayed self-activation.
+    // for max(8s, timeoutMs) to cover delayed self-activation.
     try {
       const suppressResult = await runHelper<WaitAndSuppressResult>(
         {
@@ -327,10 +328,13 @@ export async function launchApp(input: LaunchAppInput): Promise<{ pid: number; w
   }
 
   if (!window) {
-    window = await pollForWindow(child.pid, processName, existingHwnds, input.timeoutMs, exitState);
+    // Phase 2: use remaining time so Phase 1 + Phase 2 total ≤ timeoutMs + 2s.
+    const elapsed = Date.now() - launchStart;
+    const remaining = Math.max(2000, input.timeoutMs - elapsed);
+    window = await pollForWindow(child.pid, processName, existingHwnds, remaining, exitState);
   }
 
-  // Phase 2: when Phase 1 timed out (app started slowly) but pollForWindow
+  // Phase 3: when Phase 1 timed out (app started slowly) but pollForWindow
   // found a window, fire a short suppression pass. The window is not in
   // existingHwnds (those were captured pre-spawn), so Wait-And-Suppress
   // will find it as "new", push it to HWND_BOTTOM, and sustain for 8s.
@@ -451,7 +455,7 @@ async function pollForWindow(
       return newNamedWindow;
     }
 
-    await delay(500);
+    await delay(200);
   }
 
   return null;
@@ -521,15 +525,25 @@ async function spawnApp(input: LaunchAppInput, cwd?: string): Promise<ReturnType
   return child;
 }
 
-// Hard timeout for a single request on the shared PowerShell worker.
+// Per-action timeout for the shared PowerShell worker (runHelper).
 //
-// Must exceed the slowest request the schema can produce. The type_text
-// schema (src/schemas.ts) caps estimated work at maxTypeTextEstimatedMs
-// (55s), and PowerShell's Start-Sleep plus per-char overhead drifts a few
-// seconds above the estimate at the limit. 90s gives comfortable headroom
-// so a legitimately large type_text never trips the worker kill switch
-// (which would also nuke any other queued requests on the same worker).
-const HELPER_TIMEOUT_MS = 90000;
+// Quick operations (click, list, clipboard, etc.) normally finish in < 1s
+// and should never take more than 15s.  type-text is the outlier: the schema
+// caps estimated work at maxTypeTextEstimatedMs (55s), and PowerShell's
+// Start-Sleep plus per-char overhead drifts a few seconds above the estimate,
+// so 90s gives comfortable headroom.
+//
+// wait-and-suppress can sustain suppression for max(8s, timeoutMs) after
+// the first window is found; with timeoutMs up to 120s that's 240s, but the
+// caller (launchApp) already limits its own wall-clock timeout. 120,000ms
+// ensures Wait-And-Suppress isn't prematurely killed during legitimately
+// long suppression windows.
+const ACTION_TIMEOUT_MS: Readonly<Record<string, number>> = {
+  "type-text": 90000,
+  "wait-and-suppress": 120000,
+};
+/** Default timeout for quick worker operations (click, list, menu, etc.). */
+const QUICK_OPERATION_TIMEOUT = 15000;
 
 // Timeout for standalone capture requests (capture_window / capture_screen_region).
 //
@@ -721,6 +735,9 @@ function unrefStream(stream: NodeJS.ReadableStream | NodeJS.WritableStream | nul
 
 async function runHelper<T>(request: HelperRequest): Promise<T> {
   const worker = await getWorker();
+  const timeoutMs = request.action in ACTION_TIMEOUT_MS
+    ? ACTION_TIMEOUT_MS[request.action]!
+    : QUICK_OPERATION_TIMEOUT;
 
   if (worker.exited || !worker.child.stdin || worker.child.stdin.destroyed) {
     activeWorker = null;
@@ -735,9 +752,9 @@ async function runHelper<T>(request: HelperRequest): Promise<T> {
       }
       // The request order is broken once a request times out — restart the worker
       // so subsequent requests get correlated with their responses again.
-      killWorker(worker, `action=${request.action} exceeded ${HELPER_TIMEOUT_MS}ms`);
-      reject(new Error(`PowerShell helper timed out after ${HELPER_TIMEOUT_MS}ms (action=${request.action}).`));
-    }, HELPER_TIMEOUT_MS);
+      killWorker(worker, `action=${request.action} exceeded ${timeoutMs}ms`);
+      reject(new Error(`PowerShell helper timed out after ${timeoutMs}ms (action=${request.action}).`));
+    }, timeoutMs);
 
     worker.queue.push({
       resolve: resolve as (value: unknown) => void,
