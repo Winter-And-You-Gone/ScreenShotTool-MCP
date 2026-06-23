@@ -376,9 +376,11 @@ npm run inspect
 
 ## 限制
 
+- ⚠️ **不要尝试用 MCP 实现鼠标拖拽、拖动滑块、缩放、手势操作**——`click_window` 只发送按下+抬起消息，不支持连续移动。如果需要拖拽或任意复杂的鼠标操作，**直接请求人类用户手动完成**，你的描述清晰告诉用户需要做什么就好。
+- ⚠️ **不要依赖 `move_mouse_window` 触发 tooltip、hover 效果、右键菜单等 UI 状态变化**——它只投递一个假的消息，不移动真实光标。Qt/Electron 等现代框架读取系统鼠标位置，不会响应假消息。需要此类交互时，**直接请求人类用户操作**。
+- ⚠️ **截图很慢（1-5s），能不用就不用**——优先用 `list_windows` / `get_window_state` 或读应用日志替代。
 - 只支持 Windows 桌面会话；需要 Node 20+。
 - 不做 OCR、图像比对。
-- 鼠标点击/悬停使用窗口消息模拟，不调用 `SetCursorPos` / `mouse_event`，不会抢主机物理鼠标；少数程序可能忽略窗口消息。
 - `type_text` 的 `noActivate` 模式通过 `PostMessage(WM_CHAR)` 投递，少数自绘编辑控件可能不响应 `WM_CHAR`。
 - `exePath` 要求绝对 `.exe` 路径。
 - `args` 必须是字符串数组，不接受拼接后的命令行。

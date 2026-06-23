@@ -59,6 +59,19 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
 
   return {
     tools: [
+      // ════════════════════════════════════════════════════════════════
+      // MCP 工具使用原则（AI Agent 必读）：
+      //
+      // 1. 截图很慢（1-5s），优先用 list_windows / get_window_state /
+      //    click_window 验证状态，或用目标应用日志代替截图。
+      //
+      // 2. 不支持鼠标拖拽、拖动、手势、连续移动——click_window 只发
+      //    单次按下+抬起。不需要反复尝试拖拽，直接请求人类操作。
+      //
+      // 3. move_mouse_window 只投递假消息，不移动真实光标。Qt/Electron
+      //    等现代框架读取系统鼠标位置，不会响应假消息。不要依赖它触
+      //    发 tooltip/hover/右键菜单，需要就请求人类操作。
+      // ════════════════════════════════════════════════════════════════
       {
         name: "launch_app",
         description: "Launch a Windows .exe and optionally wait for its first visible window. Use noActivate for best-effort background launch.",
@@ -81,7 +94,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       },
       {
         name: "click_window",
-        description: "Post mouse click messages to a window-relative coordinate without moving the physical cursor.",
+        description: "LIMITATION: only sends down/up messages — does NOT support drag-and-drop, pinch-to-zoom, or any gesture/sequence. Does NOT move the physical cursor. If you need drag or real mouse input, ask the human to do it. Posts mouse click messages to a window-relative coordinate.",
         inputSchema: schemas.toolInputSchemas.click_window
       },
       {
@@ -91,7 +104,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       },
       {
         name: "move_mouse_window",
-        description: "Post a WM_MOUSEMOVE message to a window-relative coordinate without moving the physical cursor. NOTE: does not trigger tooltips in Qt/Electron apps — those read the real system cursor position (QCursor::pos()), not window messages. For reliable hover-driven UI in such apps, use a programmatic test hook or real cursor instead.",
+        description: "LIMITATION: posts a fake WM_MOUSEMOVE message — does NOT move the real cursor, does NOT trigger Qt/Electron tooltips (those read QCursor::pos()), does NOT work for hover-dependent UI in modern apps. If you need real hover to trigger UI changes, ask the human to do it. Posts a WM_MOUSEMOVE message to a window-relative coordinate.",
         inputSchema: schemas.toolInputSchemas.move_mouse_window
       },
       {
