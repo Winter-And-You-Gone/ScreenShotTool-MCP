@@ -1,13 +1,16 @@
 # ScreenShotTool MCP
 
+> ⚠️ **截图很慢！每次 capture_window / capture_screen_region 需要 1-5 秒，且可能阻塞目标应用的渲染线程（PrintWindow 发 WM_PRINT 消息，目标必须同步响应）。**
+> **优先用其他工具替代截图：** `list_windows` / `get_window_state` / `click_window` + 再次 `list_windows` 验证状态变化、从目标应用日志/文件读数据。**只在真正需要视觉内容时才截图。**
+
 Windows 本地截图与窗口操控 MCP Server，供 Codex、Claude Code 等 MCP 客户端通过 stdio 调用。支持启动应用、发现窗口、截取窗口或屏幕区域、模拟鼠标/键盘操作、点击原生菜单。多数窗口操作支持 best-effort 后台模式：尽量不抢焦点、不移动鼠标、不改变用户当前前台窗口。
 
 ## 功能
 
 - `launch_app` — 启动指定 `.exe`，可等待第一个可见窗口。`noActivate:true` 会在发现新窗口后恢复原前台窗口，并把目标窗口压到 z-order 底部；`startMinimized:true` 会在发现窗口后请求后台/最小化呈现。少数程序启动时仍可能短暂置顶或自行抢焦点。
 - `list_windows` — 按 `pid`、进程名、标题关键字列出可见窗口。
-- `capture_window` — 截取窗口。**默认使用 `captureMethod:"print"`（PrintWindow API）**，可截取被遮挡或最小化的窗口，推荐优先使用。仅当 `print` 模式抓不到的场景（如需要捕获 Qt ToolTip、Electron 子窗口等独立顶层弹窗）才改为 `captureMethod:"screen"`。`noActivate:true` 自动使用 PrintWindow，不操作 z-order，不闪烁。
-- `capture_screen_region` — 按屏幕绝对坐标截取矩形。
+- `capture_window` — ⚠️ 截图很慢（1-5s），尽量用其他工具替代。截取窗口。**默认使用 `captureMethod:"print"`（PrintWindow API）**，可截取被遮挡或最小化的窗口。仅当 `print` 模式抓不到的场景（如需要捕获 Qt ToolTip、Electron 子窗口等独立顶层弹窗）才改为 `captureMethod:"screen"`。`noActivate:true` 自动使用 PrintWindow，不操作 z-order，不闪烁。
+- `capture_screen_region` — ⚠️ 截图很慢（1-5s），尽量避免使用。按屏幕绝对坐标截取矩形。
 - `click_window` — 按窗口相对坐标投递鼠标点击消息，不移动主机物理鼠标。
 - `move_mouse_window` — 按窗口相对坐标投递鼠标移动消息，不移动主机物理鼠标。
 - `click_menu_item` — 按原生菜单路径触发菜单命令，支持中文菜单名，不移动主机物理鼠标。

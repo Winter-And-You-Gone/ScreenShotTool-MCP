@@ -71,12 +71,12 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       },
       {
         name: "capture_window",
-        description: "Capture a window by hwnd, pid, process name, or title substring. 'print' mode (default) uses PrintWindow API — works on occluded/minimized windows, but cannot capture separate top-level windows like Qt tooltips, popups, or Electron child windows. 'screen' mode uses CopyFromScreen (requires visible area, captures whatever is on top); only use when print fails or you need to capture separate popup/tooltip windows. noActivate avoids stealing focus.",
+        description: "IMPORTANT: screenshots are SLOW (each costs 1-5s and can block the target app). Prefer click_window + state checks (get_window_state, list_windows) or reading app logs/info instead of taking screenshots. Only capture when you actually need visual content. 'print' mode (default) uses PrintWindow API — works on occluded/minimized windows, but cannot capture separate top-level windows like Qt tooltips, popups, or Electron child windows. 'screen' mode uses CopyFromScreen (requires visible area, captures whatever is on top); only use when print fails or you need to capture separate popup/tooltip windows. noActivate avoids stealing focus.",
         inputSchema: schemas.toolInputSchemas.capture_window
       },
       {
         name: "capture_screen_region",
-        description: "Capture a screen-space rectangle in physical pixels. Copies whatever is currently visible at that screen region — if other windows occlude the target, the occluder is captured instead. Subject to multi-monitor coordinate and DPI considerations.",
+        description: "IMPORTANT: screenshots are SLOW (each costs 1-5s). Avoid this when possible — prefer window-relative capture or reading state via list_windows/get_window_state instead. Captures a screen-space rectangle in physical pixels. Copies whatever is currently visible at that screen region — if other windows occlude the target, the occluder is captured instead. Subject to multi-monitor coordinate and DPI considerations.",
         inputSchema: schemas.toolInputSchemas.capture_screen_region
       },
       {
