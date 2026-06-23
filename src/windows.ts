@@ -25,6 +25,7 @@ export type WaitAndSuppressInput = {
   processName?: string;
   existingHwnds?: string[];
   timeoutMs?: number;
+  previousForegroundHwnd?: string;
 };
 
 export type Rect = {
@@ -171,6 +172,10 @@ type WaitAndSuppressResult = {
   window: WindowInfo | null
 }
 
+type ForegroundWindowResult = {
+  hwnd: string;
+}
+
 type NativeMenuResult = {
   index: number;
   text: string;
@@ -196,6 +201,7 @@ type HelperRequest =
   | { action: "minimize-window"; target: { hwnd: string } }
   | { action: "noactivate-minimize"; target: { hwnd: string; previousForegroundHwnd?: string } }
   | { action: "wait-and-suppress"; target: WaitAndSuppressInput }
+  | { action: "get-foreground-window"; target?: Record<string, unknown> }
   | { action: "read-clipboard"; target?: Record<string, unknown> }
   | { action: "write-clipboard"; target: WriteClipboardInput }
   | { action: "get-window-state"; target: GetWindowStateInput }
@@ -275,6 +281,7 @@ export async function launchApp(input: LaunchAppInput): Promise<{ pid: number; w
   const processName = path.basename(input.exePath, path.extname(input.exePath));
   const existingProcessWindows = input.waitForWindow ? await listWindows({ processName }) : [];
   const existingHwnds = new Set(existingProcessWindows.map((window) => window.hwnd));
+  const previousForegroundHwnd = input.noActivate ? await getForegroundWindowHwnd().catch(() => undefined) : undefined;
 
   const child = await spawnApp(input, cwd);
 
@@ -303,8 +310,8 @@ export async function launchApp(input: LaunchAppInput): Promise<{ pid: number; w
 
   if (input.noActivate) {
     // Phase 1: wait-and-suppress via the shared worker (pre-warmed, zero
-    // cold-start). Captures previous foreground internally, polls for the
-    // first new window, pushes to HWND_BOTTOM, then sustains suppression
+    // cold-start). Uses the pre-spawn foreground hwnd when available, polls
+    // for the first new window, pushes to HWND_BOTTOM, then sustains suppression
     // for max(8s, timeoutMs) to cover delayed self-activation.
     try {
       const suppressResult = await runHelper<WaitAndSuppressResult>(
@@ -314,7 +321,8 @@ export async function launchApp(input: LaunchAppInput): Promise<{ pid: number; w
             pid: child.pid,
             processName,
             existingHwnds: [...existingHwnds],
-            timeoutMs: input.timeoutMs
+            timeoutMs: input.timeoutMs,
+            previousForegroundHwnd
           }
         }
       );
@@ -347,7 +355,8 @@ export async function launchApp(input: LaunchAppInput): Promise<{ pid: number; w
             pid: child.pid,
             processName,
             existingHwnds: [...existingHwnds],
-            timeoutMs: 8000
+            timeoutMs: 8000,
+            previousForegroundHwnd
           }
         }
       );
@@ -362,7 +371,7 @@ export async function launchApp(input: LaunchAppInput): Promise<{ pid: number; w
 
   if (input.startMinimized && window) {
     try {
-      await minimizeWindow(window.hwnd, input.noActivate);
+      await minimizeWindow(window.hwnd, input.noActivate, previousForegroundHwnd);
     } catch (error) {
       console.error(`startMinimized failed for hwnd ${window.hwnd}: ${formatSpawnError(error)}`);
     }
@@ -900,7 +909,13 @@ function findPowerShellCommand(): string {
   return pwsh.status === 0 ? "pwsh.exe" : "powershell.exe";
 }
 
-function minimizeWindow(hwnd: string, noActivate = false): Promise<unknown> {
+function minimizeWindow(hwnd: string, noActivate = false, previousForegroundHwnd?: string): Promise<unknown> {
   const action = noActivate ? "noactivate-minimize" : "minimize-window";
-  return runHelper({ action, target: { hwnd } });
+  const target = previousForegroundHwnd ? { hwnd, previousForegroundHwnd } : { hwnd };
+  return runHelper({ action, target });
+}
+
+async function getForegroundWindowHwnd(): Promise<string> {
+  const result = await runHelper<ForegroundWindowResult>({ action: "get-foreground-window", target: {} });
+  return result.hwnd;
 }

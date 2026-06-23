@@ -850,6 +850,9 @@ function Capture-Window {
   if ($Target.ContainsKey("captureMethod") -and $null -ne $Target.captureMethod) {
     $captureMethod = ([string]$Target.captureMethod).ToLowerInvariant()
   }
+  if ($Target.ContainsKey("noActivate") -and [bool]$Target.noActivate) {
+    $captureMethod = "print"
+  }
 
   $includeHidden = ($captureMethod -eq "print")
   $window = Resolve-TargetWindow -Target $Target -IncludeHidden:$includeHidden
@@ -2193,6 +2196,14 @@ function Get-WindowState {
   }
 }
 
+function Get-ForegroundWindow {
+  $hwnd = [ScreenshotTool.Native]::GetForegroundWindow()
+  return [ordered]@{
+    hwnd = $hwnd.ToInt64().ToString()
+    timestamp = (Get-Date).ToUniversalTime().ToString("o")
+  }
+}
+
 function Format-WindowLongHex {
   param([int64]$Value)
 
@@ -2405,9 +2416,13 @@ function Wait-And-Suppress {
   # plugins and may self-activate long after the first window appears.
   $SUSTAIN_MS = [Math]::Max(8000, $timeoutMs)
 
-  # Capture the current foreground window right here — zero cold start because
-  # the shared worker already has all C# types compiled and loaded.
-  $previousForegroundHwnd = [ScreenshotTool.Native]::GetForegroundWindow()
+  # Prefer the foreground window captured before the target process was spawned.
+  # If it is missing, fall back to the current foreground in this helper call.
+  if ($Target.ContainsKey("previousForegroundHwnd") -and $null -ne $Target.previousForegroundHwnd) {
+    $previousForegroundHwnd = [IntPtr]([int64]$Target.previousForegroundHwnd)
+  } else {
+    $previousForegroundHwnd = [ScreenshotTool.Native]::GetForegroundWindow()
+  }
 
   $SWP_NOSIZE = [uint32]0x0001
   $SWP_NOMOVE = [uint32]0x0002
@@ -2548,6 +2563,9 @@ function Invoke-Action {
     }
     "wait-and-suppress" {
       return Wait-And-Suppress -Target $Request.target
+    }
+    "get-foreground-window" {
+      return Get-ForegroundWindow
     }
     "read-clipboard" {
       return Read-Clipboard -Target $Request.target

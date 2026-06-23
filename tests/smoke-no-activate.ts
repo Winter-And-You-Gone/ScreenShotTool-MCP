@@ -64,10 +64,10 @@ console.log("foreground before:", beforeHwnd);
     const shot = await captureWindow({
       hwnd: r.window.hwnd,
       noActivate: true,
-      captureMethod: "print"
+      captureMethod: "screen"
     });
     const stats = await stat(shot.path);
-    assert.ok(stats.size > 4096, "noActivate capture should produce non-trivial output");
+    assert.ok(stats.size > 4096, "noActivate capture should fall back to PrintWindow and produce non-trivial output");
     console.log("  capture OK:", stats.size, "bytes");
 
     // Foreground should not have changed to the captured window
