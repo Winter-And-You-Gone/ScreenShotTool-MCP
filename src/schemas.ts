@@ -5,6 +5,8 @@ const nonNegativeInt = z.number().int().nonnegative();
 const optionalTimeout = z.number().int().min(100).max(120000).optional();
 const maxTypeTextLength = 1000;
 const maxTypeTextEstimatedMs = 55000;
+const maxCaptureRegionDimension = 16_384;
+const maxCaptureRegionArea = 67_108_864;
 // Clipboard writes go through GlobalAlloc + Marshal.Copy with no chunking,
 // so cap the payload to bound memory use. 1M chars (2 MiB UTF-16) is far
 // above any realistic paste target while preventing accidental abuse.
@@ -51,9 +53,12 @@ const sendKeyValue = z.string().min(1).refine(
 export const regionSchema = z.object({
   x: nonNegativeInt,
   y: nonNegativeInt,
-  width: positiveInt,
-  height: positiveInt
-}).strict();
+  width: positiveInt.max(maxCaptureRegionDimension),
+  height: positiveInt.max(maxCaptureRegionDimension)
+}).strict().refine(
+  (value) => value.width * value.height <= maxCaptureRegionArea,
+  `Capture region area must be at most ${maxCaptureRegionArea} pixels.`
+);
 
 export const launchAppSchema = z.object({
   exePath: z.string().min(1),
@@ -262,12 +267,12 @@ export const toolInputSchemas = {
         properties: {
           x: { type: "integer", minimum: 0 },
           y: { type: "integer", minimum: 0 },
-          width: { type: "integer", minimum: 1 },
-          height: { type: "integer", minimum: 1 }
+          width: { type: "integer", minimum: 1, maximum: maxCaptureRegionDimension },
+          height: { type: "integer", minimum: 1, maximum: maxCaptureRegionDimension }
         },
         required: ["x", "y", "width", "height"],
         additionalProperties: false,
-        description: "Optional rectangle relative to the target window top-left corner."
+        description: `Optional rectangle relative to the target window top-left corner. Width and height are capped at ${maxCaptureRegionDimension}px, with total area capped at ${maxCaptureRegionArea} pixels.`
       },
       focus: { type: "boolean", default: true, description: "Bring the window to the foreground before capturing. Set false to preserve open menus, popups, or transient UI." },
       captureMethod: { type: "string", enum: ["screen", "print"], default: "print", description: "Capture method: 'print' uses PrintWindow API (captures window content even behind other windows, default). 'screen' uses CopyFromScreen (needs visible area, only use when print fails or you need to capture separate popup/tooltip windows)." },
@@ -285,12 +290,12 @@ export const toolInputSchemas = {
         properties: {
           x: { type: "integer", minimum: 0 },
           y: { type: "integer", minimum: 0 },
-          width: { type: "integer", minimum: 1 },
-          height: { type: "integer", minimum: 1 }
+          width: { type: "integer", minimum: 1, maximum: maxCaptureRegionDimension },
+          height: { type: "integer", minimum: 1, maximum: maxCaptureRegionDimension }
         },
         required: ["x", "y", "width", "height"],
         additionalProperties: false,
-        description: "Screen-space rectangle in physical pixels."
+        description: `Screen-space rectangle in physical pixels. Width and height are capped at ${maxCaptureRegionDimension}px, with total area capped at ${maxCaptureRegionArea} pixels.`
       },
       outputPath: { type: "string", description: "Optional absolute PNG output path." }
     },

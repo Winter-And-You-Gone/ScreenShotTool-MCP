@@ -724,15 +724,7 @@ function unrefStream(stream: NodeJS.ReadableStream | NodeJS.WritableStream | nul
 
 async function runHelper<T>(request: HelperRequest): Promise<T> {
   const worker = await getWorker();
-  const timeoutMs = request.action === "type-text"
-    ? 90000
-    : request.action === "wait-and-suppress"
-      ? 120000
-      : request.action === "click-window"
-        || request.action === "move-mouse-window"
-        || request.action === "click-menu-item"
-        ? 12000
-        : 5000;
+  const timeoutMs = helperTimeoutMs(request);
 
   if (worker.exited || !worker.child.stdin || worker.child.stdin.destroyed) {
     activeWorker = null;
@@ -765,6 +757,27 @@ async function runHelper<T>(request: HelperRequest): Promise<T> {
       worker.child.stdin!.once("drain", () => undefined);
     }
   });
+}
+
+function helperTimeoutMs(request: HelperRequest): number {
+  if (request.action === "type-text") {
+    return 90000;
+  }
+
+  if (request.action === "wait-and-suppress") {
+    const timeoutMs = request.target.timeoutMs ?? 10000;
+    return timeoutMs + Math.max(8000, timeoutMs) + 5000;
+  }
+
+  if (
+    request.action === "click-window"
+    || request.action === "move-mouse-window"
+    || request.action === "click-menu-item"
+  ) {
+    return 12000;
+  }
+
+  return 5000;
 }
 
 async function runStandaloneHelper<T>(request: HelperRequest, timeoutMs: number, label: string): Promise<T> {

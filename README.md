@@ -47,7 +47,7 @@ X:\MCP\ScreenShotTool\outputs\YYYYMMDD-HHMMSS-xxxxxx.png
 
 | 工具 | noActivate 行为 |
 |------|-----------------|
-| `launch_app` | 新窗口出现后立即推到 `HWND_BOTTOM`，并恢复用户原来的前台窗口。继续持续监控约 3 秒：压制多窗口 app 的后续窗口（Bug 2）、捕获 app 自激活恢复（Bug 3）、以及等待较慢启动的窗口。使用独立 PS 进程 + Alt 键技巧绕过 `SetForegroundWindow` 限制。当 app 启动超慢、`Wait-And-Suppress` 已经开始返回后，还有一个 fallback 阶段会对已找到的窗口补做持续压制。 |
+| `launch_app` | 新窗口出现后立即推到 `HWND_BOTTOM`，并恢复用户原来的前台窗口。发现窗口后会继续持续监控至少 8 秒，且不短于本次 `timeoutMs`：压制多窗口 app 的后续窗口、捕获 app 自激活恢复、以及覆盖较慢启动的窗口。使用 Alt 键技巧绕过 `SetForegroundWindow` 限制。当 app 启动超慢、`Wait-And-Suppress` 没能先发现窗口时，还有一个 fallback 阶段会对已找到的窗口补做持续压制。 |
 | `capture_window` | 自动切换到 `PrintWindow` 模式，从窗口绘制表面直接捕获，无需操作 z-order，不会导致窗口闪现。 |
 | `type_text` | 通过 `GetGUIThreadInfo` 定位焦点子控件（如 Scintilla、Edit），再用 `PostMessage(WM_CHAR)` 投递字符；窗口在后台时用 `EnumChildWindows` 按类名查找编辑控件。 |
 | `send_key` | 用 `PostMessage(WM_KEYDOWN/WM_KEYUP)` 代替 `keybd_event`，无需前台焦点。 |
@@ -386,8 +386,8 @@ npm run inspect
 - `args` 必须是字符串数组，不接受拼接后的命令行。
 - 截图使用物理像素坐标；helper 会尝试启用 DPI aware，减少高 DPI 缩放偏差。
 - 服务器进程持有一个长驻 PowerShell helper 进程，命中第一次启动后，后续每次工具调用约几十毫秒；helper 异常退出时会按需重启。
-- **请求模型**：长驻 worker 是串行的——所有走 `runHelper` 的工具调用（除 `wait_for_window`、`wait-and-suppress` 外）共享一个 stdin，后者处理完前一个请求才会响应下一个。长时间操作（如超长 `type_text`）会阻塞后续调用。`wait_for_window` 走独立 PS 进程，不阻塞其他工具。
-- **后台模式的极限**：`noActivate` 的持续压制最多持续约 3 秒。如果目标应用在启动 3 秒后才主动调用 `SetForegroundWindow`（极少见，多见于延迟加载插件或开机自启注册），窗口仍可能抢到前台。这是应用行为，工具侧已做到了合理覆盖。
+- **请求模型**：长驻 worker 是串行的——`list_windows`、点击、输入、剪贴板、窗口状态查询、`launch_app` 内部的 `wait-and-suppress` 等共享一个 stdin，worker 处理完前一个请求才会响应下一个。`capture_window`、`capture_screen_region`、`wait_for_window` 走独立 PS 进程，不阻塞其他工具。长时间操作（如超长 `type_text`，或 `launch_app noActivate` 的持续压制阶段）仍会占用共享 worker；相关 schema 和超时保护会限制单次请求的边界。
+- **后台模式的极限**：`noActivate` 发现窗口后会持续压制至少 8 秒，且不短于本次 `timeoutMs`（默认约 10 秒）。如果目标应用在这段时间后才主动调用 `SetForegroundWindow`（极少见，多见于延迟加载插件或开机自启注册），窗口仍可能抢到前台。这是应用行为，工具侧已做到了合理覆盖。
 
 ### 截图模式与遮挡 / tooltip 的关键限制（Qt、Electron 类应用特别注意）
 

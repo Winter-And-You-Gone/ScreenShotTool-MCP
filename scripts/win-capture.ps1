@@ -2491,7 +2491,7 @@ function Wait-And-Suppress {
       rect        = Get-RectObject $rect
     }
 
-    # Set sustain deadline 3s from first discovery.
+    # Set sustain deadline from first discovery.
     if ($null -eq $sustainDeadline) {
       $sustainDeadline = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() + $SUSTAIN_MS
     }

@@ -29,6 +29,10 @@ test("launch_app requires a non-empty exePath and accepts defaults", () => {
 });
 
 test("schemas reject invalid capture dimensions", () => {
+  assert.deepEqual(captureScreenRegionSchema.parse({
+    region: { x: 0, y: 0, width: 800, height: 600 }
+  }).region, { x: 0, y: 0, width: 800, height: 600 });
+
   assert.throws(() => captureScreenRegionSchema.parse({
     region: { x: 0, y: 0, width: 0, height: 100 }
   }));
@@ -37,6 +41,15 @@ test("schemas reject invalid capture dimensions", () => {
     pid: 1234,
     region: { x: 0, y: 0, width: 100, height: -1 }
   }));
+
+  assert.throws(() => captureScreenRegionSchema.parse({
+    region: { x: 0, y: 0, width: 16_385, height: 100 }
+  }));
+
+  assert.throws(() => captureWindowSchema.parse({
+    pid: 1234,
+    region: { x: 0, y: 0, width: 16_384, height: 4097 }
+  }), /area/i);
 });
 
 test("capture_window requires at least one target selector", () => {
@@ -362,5 +375,7 @@ test("tool JSON schemas expose runtime selector and enum constraints", () => {
     { type: "string" },
     { type: "integer", minimum: 1 }
   ]);
+  assert.equal(toolInputSchemas.capture_window.properties.region.properties.width.maximum, 16_384);
+  assert.equal(toolInputSchemas.capture_screen_region.properties.region.properties.height.maximum, 16_384);
   assert.deepEqual(toolInputSchemas.click_window.properties.button.enum, ["left", "right", "middle"]);
 });
