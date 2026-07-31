@@ -22,6 +22,8 @@ Windows 本地截图与窗口操控 MCP Server，供 Codex、Claude Code 等 MCP
 - `get_window_state` — 查询单个窗口的详细状态（minimized/maximized/foreground/topmost/layered/cloaked/style 等），比 `list_windows` 信息更全。
 - `wait_for_window` — 阻塞等待匹配窗口出现 (`mode:"appear"`) 或消失 (`mode:"disappear"`)。超时返回 `found:false` 而不是抛错，比客户端轮询高效。
 
+- **UI Automation 工具**（UIA 优先，详见下文 [UI Automation](#ui-automationuia) 章节）：`ui_inspect_tree` 读取控件树、`ui_query`/`ui_get` 查找控件、`ui_action` 通过 UIA Pattern 操作控件、`ui_wait` 等待状态变化、`profile_list`/`profile_resolve`/`profile_action` 操作应用 profile（如 VaporView）。这些工具不依赖截图或固定坐标，不移动真实鼠标。
+
 截图默认保存到：
 
 ```text
@@ -251,6 +253,226 @@ npm run smoke:no-activate
 - ❌ 不要给 `type_text` 传超长字符串（单次最多 1000 字符，且会按 `delayMs + pressMs` 拒绝预计过慢的请求），分段发送更可靠
 - ❌ 不要在 `click_window` 之后立刻 `capture_window`——加 `delayMs: 200` 给 UI 重绘时间
 
+## UI Automation（UIA）
+
+除了基于窗口坐标的操作，本工具还提供 **Microsoft UI Automation** 优先的控件读取与操作能力。UIA 通过控件的 `AutomationId` / `Name` / `ControlType` / `ClassName` / `FrameworkId` 定位，比截图或固定坐标更稳定，不受分辨率、DPI、窗口位置变化影响，也不需要移动物理鼠标。
+
+### 为什么 UIA 优先于截图和固定坐标
+
+- 截图很慢（1-5s）且只能看静态画面；UIA 直接读取控件树和状态，毫秒级返回。
+- 固定坐标在 DPI 缩放、多显示器、窗口移动后会失效；UIA 控件定位与坐标无关。
+- 截图无法读取控件值/状态（如文本框内容、勾选状态、下拉选中项）；UIA 通过 Pattern 直接读取。
+- 截图不能"点击"；UIA 通过 `InvokePattern` / `ValuePattern` 等真正触发控件行为，且不移动真实鼠标。
+
+### UIA 工具列表
+
+| 工具 | 用途 |
+|------|------|
+| `ui_inspect_tree` | 读取目标窗口的 UIA 控件树（扁平 nodeId/parentNodeId 结构，带 patterns/boundingRect）。 |
+| `ui_query` | 按 selector 查找控件，返回匹配元素及值/状态。 |
+| `ui_get` | 读取**唯一**控件的状态（比 ui_query 轻）。0 个=found:false，1 个=状态，多个=ELEMENT_AMBIGUOUS。 |
+| `ui_action` | 对控件执行动作（invoke/toggle/select/expand/setValue 等），优先用 UIA Pattern，坐标降级默认关闭。 |
+| `ui_wait` | 等待 UI 状态变化（exists/enabled/valueEquals 等），不截图轮询。运行在独立 PowerShell 进程，不阻塞共享 worker。 |
+| `profile_list` | 列出可用应用 profile（如 VaporView）。 |
+| `profile_resolve` | 按 profile + 逻辑控件名解析为真实元素。 |
+| `profile_action` | 对 profile 中的逻辑控件执行动作（内部复用 ui_action）。 |
+
+### Selector 说明
+
+`selector` 支持以下字段，至少提供一个定位字段：
+
+| 字段 | 默认匹配 | 说明 |
+|------|----------|------|
+| `automationId` | exact | Qt 的 objectName、WPF 的 AutomationId。最稳定。 |
+| `name` | exact | 控件显示文本（本地化敏感）。 |
+| `controlType` | exact（不区分大小写） | 接受 `Button` / `ControlType.Button` / `button`。 |
+| `className` | exact | Win32 窗口类名（如 `Edit`、`RICHEDIT50W`）。 |
+| `frameworkId` | exact | `Win32` / `Qt` / `WPF` / `WinForm`。 |
+| `match` | - | `exact`（默认）/ `contains` / `regex`。正则限长 256 字符。 |
+| `caseSensitive` | false | 大小写敏感。 |
+| `index` | - | 0-based。多匹配时必须提供，否则返回 ELEMENT_AMBIGUOUS。 |
+| `visibleOnly` / `enabledOnly` | - | 过滤器（非定位字段）。 |
+| `ancestor` | - | 祖先 selector，约束匹配元素的层级。 |
+| `path` | - | 层级路径，从 root 逐级匹配（最多 12 级）。 |
+
+> **不要把 `RuntimeId` 当作长期 selector**——它可能在 UI 重建后变化。`RuntimeId` 仅用于单次结果诊断。
+
+### 各 Pattern 对应操作
+
+| 控件类型 | 动作 | Pattern 优先级 |
+|----------|------|----------------|
+| 按钮 | invoke | InvokePattern → 坐标降级 |
+| 开关/复选框 | toggle | TogglePattern → InvokePattern → 坐标降级 |
+| 列表项/标签页 | select | SelectionItemPattern.Select → InvokePattern → 坐标降级 |
+| 下拉框 | expand/collapse | ExpandCollapsePattern |
+| 文本框 | setValue | ValuePattern（**不**用 WM_CHAR 替代） |
+| 滑块 | setRangeValue | RangeValuePattern（**禁止**拖拽模拟） |
+| 滚动到可见 | scrollIntoView | ScrollItemPattern |
+
+> **LegacyIAccessiblePattern 不可用**：本工具使用的托管 `System.Windows.Automation` API 不暴露 `LegacyIAccessiblePattern`（它仅存在于 COM `IUIAutomation` 接口）。`legacyDefaultAction` 动作会退化为 InvokePattern，失败时按坐标降级（需显式开启）。这是 API 层限制，非缺陷。
+
+### 坐标降级（默认关闭）
+
+坐标降级是**严格受控的最终方案**，仅在以下条件**全部**满足时才使用：
+
+1. 调用方显式传入 `allowCoordinateFallback: true`；
+2. 元素唯一定位成功；
+3. 元素有有效 BoundingRectangle；
+4. 元素非 offscreen、宽高均 > 0；
+5. 中心点位于目标窗口范围内；
+6. UIA Pattern 不可用或调用失败。
+
+降级时基于**当前** BoundingRectangle 动态计算中心点，转换为窗口相对坐标，复用 `click_window` 能力，**不移动真实鼠标**。profile 中**不允许**保存绝对屏幕坐标或固定分辨率坐标。
+
+强制坐标点击需同时设置 `forceCoordinateClick: true` 和 `allowCoordinateFallback: true`。
+
+### ui_inspect_tree 示例
+
+```json
+{
+  "tool": "ui_inspect_tree",
+  "arguments": {
+    "processName": "VaporView",
+    "interactiveOnly": true,
+    "includeProcessPopups": true,
+    "maxDepth": 10,
+    "maxNodes": 1500
+  }
+}
+```
+
+返回扁平节点列表，每个节点含 `nodeId` / `parentNodeId` / `controlType` / `automationId` / `name` / `patterns` / `boundingRect`，以及 `truncated` 标记和 `elapsedMs`。
+
+### ui_query 示例
+
+```json
+{
+  "tool": "ui_query",
+  "arguments": {
+    "processName": "VaporView",
+    "selector": {
+      "controlType": "Button",
+      "name": "设置"
+    }
+  }
+}
+```
+
+### ui_action 示例
+
+```json
+{
+  "tool": "ui_action",
+  "arguments": {
+    "processName": "VaporView",
+    "selector": { "controlType": "Button", "name": "设置" },
+    "action": "invoke",
+    "allowCoordinateFallback": false
+  }
+}
+```
+
+### ui_wait 示例
+
+```json
+{
+  "tool": "ui_wait",
+  "arguments": {
+    "processName": "VaporView",
+    "selector": { "controlType": "Dialog" },
+    "condition": "exists",
+    "timeoutMs": 10000,
+    "pollIntervalMs": 200
+  }
+}
+```
+
+超时返回 `matched:false`（不是错误）。`ui_wait` 运行在独立 PowerShell 进程，不会阻塞共享 worker 的其他工具调用。
+
+### VaporView Profile
+
+VaporView 的 profile（`vaporview`）通过源码中 `setObjectName()` 设置的稳定 AutomationId 映射关键控件，包括：
+
+- `mainWindow`（标题为静态字符串 `"VaporView"`，FrameworkId 为 `Qt`）
+- 窗口控制按钮：`windowMinimizeButton` / `windowMaximizeButton` / `windowCloseButton`
+- 容器：`appCentralWidget` / `mainPageStack` / `appSidebar`
+- 日志：`logTextEdit` / `logSidePanel`
+- 设备配置下拉框：`epsilonPortCombo` / `pressurePortCombo` 等
+- 菜单入口：`titleBarMenuButton` / `titleApplicationPanel`
+
+```json
+{
+  "tool": "profile_action",
+  "arguments": {
+    "profile": "vaporview",
+    "control": "windowCloseButton",
+    "action": "invoke",
+    "pid": 1234
+  }
+}
+```
+
+profile 找不到控件时会按候选 selector 顺序尝试，并返回每个候选的失败摘要。profile 层不直接调用 PowerShell，完全复用通用 UIA 层。
+
+> **VaporView 需要管理员权限**：`VaporView.exe` 的 manifest 要求 `requireAdministrator`。非提权的 MCP server 无法读取其 UIA 树（完整性级别边界）。要让 profile 生效，**MCP server 必须以与 VaporView 相同的提权级别运行**（即以管理员身份启动）。
+
+### VAPORVIEW_EXE 配置
+
+VaporView smoke test 通过环境变量获取路径，不在源码中硬编码：
+
+```powershell
+$env:VAPORVIEW_EXE = "T:\VaporView\VaporView.exe"
+# 可选启动参数
+$env:VAPORVIEW_ARGS = "--no-hardware"
+npm run smoke:uia-vaporview
+```
+
+未设置 `VAPORVIEW_EXE` 时输出 `SKIPPED`（不是失败）。路径不存在时报错退出。
+
+### Qt 自绘控件的 UIA 限制
+
+VaporView 等 Qt 应用的部分控件是自绘的（`QPainter` paintEvent），UIA 无法访问其内部视觉元素：
+
+- `SegmentedSwitchButton`、`SingleLevelPopupMenuRow`、`VisualTextLabel` 等自绘控件只暴露整体对象，内部绘制内容不可访问。
+- Qt 原生 `QMenuBar` 被 VaporView 隐藏（`menuBar()->hide()`），菜单项不作为标准 `MenuBar`/`MenuItem` 层级出现——需通过 `titleApplicationPanel` 或 `titleBarMenuButton` 操作。
+- 标题栏工具栏按钮共享 objectName `titleBarButton`（非唯一），需通过 accessibleName/tooltip 区分，部分按钮未设置 accessibleName。
+
+### 权限级别说明
+
+UIA 跨进程访问受 **UIPI（User Interface Privilege Isolation）** 限制：
+
+- **目标应用与 MCP server 的权限级别应尽量一致**。如果目标应用以管理员身份运行而 MCP server 是普通用户，UIA 读取会失败（返回空树或 `UIA_ROOT_UNAVAILABLE`）。
+- **不要用管理员权限运行 `smoke:no-activate`** 等 `keybd_event` 测试（UAC 会阻止）。
+- 如果 VaporView 必须以管理员运行，MCP server 也应以管理员启动。
+
+### popup / tooltip 独立 HWND 说明
+
+Qt 的下拉菜单、tooltip、弹出对话框通常是**独立顶层 HWND**（`Qt::Popup` / `Qt::Tool`），不在主窗口的子窗口树里：
+
+- `includeProcessPopups: true`（默认）会枚举同 PID 的所有顶层窗口，每个作为独立 UIA Root 搜索。
+- VaporView 的 `RtkConfigDialog`、`TrajectoryViewerDialog`、`Map3DWindow`、`SessionViewerWindow` 等都是同 PID 下的独立顶层窗口。
+- QComboBox 弹出层（`SingleLevelPopupMenu` / `vaporViewComboPopupView`）是临时 `Qt::Popup` 顶层窗口，生命周期短。
+
+### 调试控件树的方法
+
+1. 先用 `ui_inspect_tree`（`automationIdOnly: true` 可只看有 AutomationId 的控件）了解结构。
+2. 用 Windows 自带的 **Accessibility Insights for Windows** 或 **Inspect.exe** 交叉验证。
+3. **不要高频调用 `ui_inspect_tree`**——每次都会遍历控件树，对大型 Qt 应用可能耗时几百毫秒到几秒。先 inspect 一次，记录稳定的 AutomationId，后续用 `ui_get` / `ui_query` 精确查询。
+4. 不要把 `RuntimeId` 当作稳定 selector——它可能随 UI 重建变化。
+
+### UIA smoke test 命令
+
+```powershell
+# 通用 UIA smoke test（用系统自带 WordPad/记事本，验证 inspect/query/setValue/invoke/wait 全流程）
+npm run smoke:uia-notepad
+
+# VaporView UIA smoke test（需设置 VAPORVIEW_EXE）
+$env:VAPORVIEW_EXE = "T:\VaporView\VaporView.exe"
+npm run smoke:uia-vaporview
+```
+
+`smoke:uia-notepad` 验证：启动 → inspect_tree → 找到 Document 控件 → ValuePattern 写入文字 → 读回值 → InvokePattern 点击 Close → ui_wait notExists → 物理鼠标未移动 → 前台窗口未被永久改变。
+
 ## 示例调用
 
 启动 Notepad：
@@ -365,6 +587,19 @@ npm run smoke:no-activate
 
 ```powershell
 npm run smoke:no-cursor-click
+```
+
+UI Automation smoke test（用系统自带 WordPad/记事本验证 UIA 全流程）：
+
+```powershell
+npm run smoke:uia-notepad
+```
+
+VaporView UIA smoke test（需设置 `VAPORVIEW_EXE`，未设置则输出 SKIPPED）：
+
+```powershell
+$env:VAPORVIEW_EXE = "T:\VaporView\VaporView.exe"
+npm run smoke:uia-vaporview
 ```
 
 用 MCP Inspector 手动验收：

@@ -17,8 +17,21 @@ import type {
   ReadClipboardInput,
   WriteClipboardInput,
   GetWindowStateInput,
-  WaitForWindowInput
+  WaitForWindowInput,
+  UiInspectTreeInput,
+  UiQueryInput,
+  UiGetInput,
+  UiActionInput,
+  UiWaitInput
 } from "./schemas.js";
+import type {
+  InspectTreeResult,
+  QueryResult,
+  GetResult,
+  ActionResult,
+  WaitResult,
+  UiError
+} from "./uia/types.js";
 
 export type WaitAndSuppressInput = {
   pid: number;
@@ -27,6 +40,21 @@ export type WaitAndSuppressInput = {
   timeoutMs?: number;
   previousForegroundHwnd?: string;
 };
+
+// Error carrying a structured UIA error code (e.g. ELEMENT_AMBIGUOUS,
+// PATTERN_NOT_SUPPORTED). Thrown by runHelper/runStandaloneHelper when the
+// PowerShell helper emits { ok:false, code, message, details }. Callers can
+// read .code to branch without parsing English text.
+export class HelperError extends Error {
+  readonly code: string;
+  readonly details: unknown;
+  constructor(message: string, code: string, details?: unknown) {
+    super(message);
+    this.name = "HelperError";
+    this.code = code;
+    this.details = details;
+  }
+}
 
 export type Rect = {
   x: number;
@@ -206,6 +234,11 @@ type HelperRequest =
   | { action: "write-clipboard"; target: WriteClipboardInput }
   | { action: "get-window-state"; target: GetWindowStateInput }
   | { action: "wait-for-window"; target: Omit<WaitForWindowInput, "timeoutMs" | "pollIntervalMs"> & { timeoutMs?: number; pollIntervalMs?: number } }
+  | { action: "ui-inspect-tree"; target: UiInspectTreeInput }
+  | { action: "ui-query"; target: UiQueryInput }
+  | { action: "ui-get"; target: UiGetInput }
+  | { action: "ui-action"; target: UiActionInput }
+  | { action: "ui-wait"; target: Omit<UiWaitInput, "timeoutMs" | "pollIntervalMs"> & { timeoutMs?: number; pollIntervalMs?: number } }
 
 export function getDefaultOutputDir(): string {
   return defaultOutputDir
@@ -241,6 +274,37 @@ export async function waitForWindow(input: WaitForWindowInput): Promise<WaitForW
     { action: "wait-for-window", target: input },
     timeoutMs,
     "wait_for_window"
+  );
+}
+
+// ── UI Automation wrappers ──
+//
+// Query/get/inspect/action run on the shared worker (fast, bounded by their
+// own timeoutMs). ui_wait runs standalone so a long poll can't stall the
+// shared worker's serial queue - mirroring the wait_for_window design.
+
+export async function inspectUiTree(input: UiInspectTreeInput): Promise<InspectTreeResult> {
+  return runHelper<InspectTreeResult>({ action: "ui-inspect-tree", target: input });
+}
+
+export async function queryUi(input: UiQueryInput): Promise<QueryResult> {
+  return runHelper<QueryResult>({ action: "ui-query", target: input });
+}
+
+export async function getUiElement(input: UiGetInput): Promise<GetResult> {
+  return runHelper<GetResult>({ action: "ui-get", target: input });
+}
+
+export async function performUiAction(input: UiActionInput): Promise<ActionResult> {
+  return runHelper<ActionResult>({ action: "ui-action", target: input });
+}
+
+export async function waitForUi(input: UiWaitInput): Promise<WaitResult> {
+  const timeoutMs = (input.timeoutMs ?? 10_000) + 5000;
+  return runStandaloneHelper<WaitResult>(
+    { action: "ui-wait", target: input },
+    timeoutMs,
+    "ui_wait"
   );
 }
 
@@ -549,7 +613,7 @@ async function spawnApp(input: LaunchAppInput, cwd?: string): Promise<ReturnType
 const CAPTURE_TIMEOUT_MS = 20000;
 
 type WorkerResponseOk = { ok: true; result: unknown };
-type WorkerResponseErr = { ok: false; error: string };
+type WorkerResponseErr = { ok: false; error: string; code?: string; message?: string; details?: unknown };
 type WorkerResponse = WorkerResponseOk | WorkerResponseErr;
 
 type PendingRequest = {
@@ -635,6 +699,9 @@ async function getWorker(): Promise<Worker> {
           const response = JSON.parse(line) as WorkerResponse;
           if (response.ok) {
             pending.resolve(response.result);
+          } else if (response.code) {
+            // Structured UIA error: { ok:false, code, message, details }.
+            pending.reject(new HelperError(response.message ?? response.error ?? `UIA error (code=${response.code}).`, response.code, response.details));
           } else {
             pending.reject(new Error(response.error || `PowerShell helper failed (action=${pending.action}).`));
           }
@@ -777,6 +844,19 @@ function helperTimeoutMs(request: HelperRequest): number {
     return 12000;
   }
 
+  // UIA query/inspect/get/action carry their own timeoutMs; give the worker a
+  // generous ceiling above that so a bounded walk completes but a genuine
+  // hang is still killed. Qt UIA providers can block briefly while pumping.
+  if (
+    request.action === "ui-inspect-tree"
+    || request.action === "ui-query"
+    || request.action === "ui-get"
+    || request.action === "ui-action"
+  ) {
+    const t = request.target.timeoutMs ?? 20000;
+    return t + 10000;
+  }
+
   return 5000;
 }
 
@@ -834,7 +914,16 @@ async function runStandaloneHelper<T>(request: HelperRequest, timeoutMs: number,
           return;
         }
         try {
-          resolve(JSON.parse(out) as T);
+          const parsed = JSON.parse(out) as unknown;
+          // Standalone UIA errors emit { ok:false, code, message, details }
+          // as the top-level JSON. Surface them as HelperError so callers can
+          // branch on the structured code.
+          if (parsed && typeof parsed === "object" && (parsed as { ok?: unknown }).ok === false && typeof (parsed as { code?: unknown }).code === "string") {
+            const err = parsed as { code: string; message?: string; details?: unknown };
+            reject(new HelperError(err.message ?? `${label} UIA error (code=${err.code}).`, err.code, err.details));
+            return;
+          }
+          resolve(parsed as T);
         } catch (err) {
           reject(new Error(`${label} returned invalid JSON: ${(err as Error).message}`));
         }

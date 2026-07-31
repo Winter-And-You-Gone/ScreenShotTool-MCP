@@ -19,6 +19,24 @@ try {
 } catch {
 }
 
+# Whether the managed UIA API is available. Callers that need UIA must check
+# this and return UIA_ASSEMBLY_UNAVAILABLE rather than silently falling back
+# to coordinate clicks.
+function Test-UiaAvailable {
+  return ($null -ne ("System.Windows.Automation.AutomationElement" -as [type]))
+}
+
+function Assert-UiaAvailable {
+  if (-not (Test-UiaAvailable)) {
+    throw [ordered]@{
+      ok = $false
+      code = "UIA_ASSEMBLY_UNAVAILABLE"
+      message = "UIAutomationClient/Types assemblies could not be loaded in this PowerShell environment."
+      details = [ordered]@{ stage = "assembly-load" }
+    }
+  }
+}
+
 if (-not ("ScreenshotTool.Native" -as [type])) {
   Add-Type -TypeDefinition @"
 using System;
@@ -2522,6 +2540,1093 @@ function Wait-And-Suppress {
   return [ordered]@{ found = $true; window = $result }
 }
 
+# ════════════════════════════════════════════════════════════════════════════
+# UI Automation (UIA) backend.
+#
+# Uses the managed System.Windows.Automation API (UIAutomationClient/Types).
+# LegacyIAccessiblePattern is NOT exposed by this managed API, so the action
+# layer falls back from InvokePattern directly to coordinate click when no
+# pattern is available.
+#
+# Design rules enforced here:
+#  - Never cache AutomationElement across requests; resolve fresh each call.
+#  - Every property read is individually try/caught so one bad getter cannot
+#    fail a whole tree walk.
+#  - Tree walks are bounded by maxDepth, maxNodes, and a per-call deadline.
+#  - Structured errors are thrown as hashtables via Throw-UiaError; the
+#    worker loop (Invoke-Action catch) re-emits them verbatim.
+# ════════════════════════════════════════════════════════════════════════════
+
+# Pattern identifiers used throughout. Cached once per process.
+function Get-UiaPatternIds {
+  return @{
+    Invoke         = [System.Windows.Automation.InvokePattern]::Pattern
+    Value          = [System.Windows.Automation.ValuePattern]::Pattern
+    Toggle         = [System.Windows.Automation.TogglePattern]::Pattern
+    SelectionItem  = [System.Windows.Automation.SelectionItemPattern]::Pattern
+    Selection      = [System.Windows.Automation.SelectionPattern]::Pattern
+    ExpandCollapse = [System.Windows.Automation.ExpandCollapsePattern]::Pattern
+    RangeValue     = [System.Windows.Automation.RangeValuePattern]::Pattern
+    ScrollItem     = [System.Windows.Automation.ScrollItemPattern]::Pattern
+    Scroll         = [System.Windows.Automation.ScrollPattern]::Pattern
+    Window         = [System.Windows.Automation.WindowPattern]::Pattern
+    Text           = [System.Windows.Automation.TextPattern]::Pattern
+    Transform      = [System.Windows.Automation.TransformPattern]::Pattern
+    Grid           = [System.Windows.Automation.GridPattern]::Pattern
+    Table          = [System.Windows.Automation.TablePattern]::Pattern
+  }
+}
+
+function Throw-UiaError {
+  param([string]$Code, [string]$Message, [hashtable]$Details = @{})
+  $err = [ordered]@{ ok = $false; code = $Code; message = $Message }
+  if ($Details.Count -gt 0) { $err.details = $Details }
+  # Throw as a RuntimeException wrapping the hashtable so the worker catch
+  # can detect and re-emit it verbatim (see Invoke-Action).
+  $ex = New-Object System.Management.Automation.RuntimeException($Message)
+  $ex.Data.Add("UiaError", $err)
+  throw $ex
+}
+
+# Extract a structured UIA error from an error record/exception, if present.
+function Get-UiaErrorFromRecord {
+  param($ErrorRecord)
+  try {
+    if ($null -ne $ErrorRecord -and $null -ne $ErrorRecord.Exception -and $ErrorRecord.Exception.Data.Contains("UiaError")) {
+      return $ErrorRecord.Exception.Data["UiaError"]
+    }
+  } catch {}
+  return $null
+}
+
+# Resolve the target window using the SAME logic as the rest of the helper
+# (Resolve-TargetWindow), then return its hwnd + pid. Raises WINDOW_NOT_FOUND
+# when nothing matches and WINDOW_AMBIGUOUS when multiple match and no hwnd
+# was given (we pick the first but warn).
+function Resolve-UiaTargetWindow {
+  param([hashtable]$Target)
+
+  if ($Target.ContainsKey("hwnd") -and $null -ne $Target.hwnd) {
+    $win = Resolve-TargetWindow -Target $Target -IncludeHidden
+    return $win
+  }
+
+  $windows = Get-AllWindows
+  $filtered = @(Filter-Windows $windows $Target)
+  if ($filtered.Count -lt 1) {
+    Throw-UiaError "WINDOW_NOT_FOUND" "No window matched the provided target." ([ordered]@{ window = $Target; stage = "resolve-window" })
+  }
+  return $filtered[0]
+}
+
+# Enumerate all top-level HWNDs belonging to the same PID as the resolved
+# window. Used to find Qt popups, dialogs, and combo-box menus that live as
+# separate top-level windows. Returns an array of hwnd-int64 values.
+function Get-ProcessTopLevelHwnds {
+  param([int]$ProcessId)
+
+  $hwnds = [System.Collections.ArrayList]::new()
+  $enumProc = [ScreenshotTool.Native+EnumWindowsProc]{
+    param([IntPtr]$Hwnd, [IntPtr]$LParam)
+    $pidValue = [uint32]0
+    [ScreenshotTool.Native]::GetWindowThreadProcessId($Hwnd, [ref]$pidValue) | Out-Null
+    if ([int]$pidValue -eq $ProcessId) {
+      $hwnds.Add($Hwnd.ToInt64()) | Out-Null
+    }
+    return $true
+  }
+  [ScreenshotTool.Native]::EnumWindows($enumProc, [IntPtr]::Zero) | Out-Null
+  return @($hwnds.ToArray())
+}
+
+# Build the list of UIA root elements to search. The main resolved window is
+# always first; when includeProcessPopups is true, other same-PID top-level
+# windows are appended. Each root carries metadata for the result.
+function Get-UiaRoots {
+  param([hashtable]$Target, [bool]$IncludeProcessPopups)
+
+  $mainWin = Resolve-UiaTargetWindow -Target $Target
+  $mainHwnd = [int64]$mainWin.hwnd
+  $mainPid = [int]$mainWin.pid
+
+  $roots = [System.Collections.ArrayList]::new()
+  $mainEl = $null
+  try { $mainEl = [System.Windows.Automation.AutomationElement]::FromHandle([IntPtr]$mainHwnd) } catch {}
+  if ($null -eq $mainEl) {
+    Throw-UiaError "UIA_ROOT_UNAVAILABLE" "AutomationElement.FromHandle returned null for the main window." ([ordered]@{ hwnd = $mainWin.hwnd; stage = "from-handle" })
+  }
+  $roots.Add([ordered]@{
+    element = $mainEl
+    hwnd = $mainWin.hwnd
+    title = $mainWin.title
+    className = $mainWin.className
+    processId = $mainPid
+    isMain = $true
+    isPopup = $false
+    rootIndex = 1
+  }) | Out-Null
+
+  if (-not $IncludeProcessPopups) { return @($roots.ToArray()) }
+
+  $allHwnds = Get-ProcessTopLevelHwnds -ProcessId $mainPid
+  $idx = 1
+  foreach ($h in $allHwnds) {
+    if ($h -eq $mainHwnd) { continue }
+    $el = $null
+    try { $el = [System.Windows.Automation.AutomationElement]::FromHandle([IntPtr]$h) } catch {}
+    if ($null -eq $el) { continue }
+    $idx++
+    $sb = New-Object System.Text.StringBuilder 256
+    [ScreenshotTool.Native]::GetWindowText([IntPtr]$h, $sb, $sb.Capacity) | Out-Null
+    $cb = New-Object System.Text.StringBuilder 256
+    [ScreenshotTool.Native]::GetClassName([IntPtr]$h, $cb, $cb.Capacity) | Out-Null
+    # Heuristic: a tool/popup/dialog window is non-main. Qt::Popup and
+    # WS_EX_TOOLWINDOW tend to have empty or transient titles.
+    $isPopup = [string]::IsNullOrWhiteSpace($sb.ToString())
+    $roots.Add([ordered]@{
+      element = $el
+      hwnd = $h.ToString()
+      title = $sb.ToString()
+      className = $cb.ToString()
+      processId = $mainPid
+      isMain = $false
+      isPopup = $isPopup
+      rootIndex = $idx
+    }) | Out-Null
+  }
+  return @($roots.ToArray())
+}
+
+function Get-UiaCurrent {
+  param($Element, [string]$PropertyName)
+  try { return $Element.Current.$PropertyName } catch { return $null }
+}
+
+# Read the full state of an element for ui_get / ui_query results. Each field
+# is independently guarded; an unsupported pattern yields null (not an error).
+function Get-UiaElementState {
+  param($Element, [bool]$IncludePatterns = $true, [bool]$IncludeValues = $true)
+
+  $pids = Get-UiaPatternIds
+  $ct = Get-UiaCurrent $Element "ControlType"
+  $ctName = if ($ct) { $ct.ProgrammaticName } else { "" }
+  $rect = $null
+  try {
+    $r = $Element.Current.BoundingRectangle
+    if ($r.Width -gt 0 -and $r.Height -gt 0) {
+      $rect = [ordered]@{ x = [int]$r.X; y = [int]$r.Y; width = [int]$r.Width; height = [int]$r.Height }
+    }
+  } catch {}
+
+  $runtimeId = @()
+  try { $runtimeId = @($Element.GetRuntimeId()) } catch {}
+
+  $patterns = @()
+  if ($IncludePatterns) {
+    foreach ($key in @('Invoke','Value','Toggle','SelectionItem','Selection','ExpandCollapse','RangeValue','ScrollItem','Scroll','Window','Text','Transform','Grid','Table')) {
+      try {
+        $dummy = $null
+        if ($Element.TryGetCurrentPattern($pids[$key], [ref]$dummy)) { $patterns += $pids[$key].ProgrammaticName }
+      } catch {}
+    }
+  }
+
+  $value = $null; $isReadOnly = $null
+  $rangeValue = $null; $minimum = $null; $maximum = $null; $smallChange = $null; $largeChange = $null
+  $toggleState = $null; $selected = $null; $expandState = $null
+
+  if ($IncludeValues) {
+    # ValuePattern
+    try {
+      $vp = $null
+      if ($Element.TryGetCurrentPattern($pids.Value, [ref]$vp)) {
+        $value = [string]$vp.Current.Value
+        $isReadOnly = [bool]$vp.Current.IsReadOnly
+      }
+    } catch {}
+    # RangeValuePattern
+    try {
+      $rvp = $null
+      if ($Element.TryGetCurrentPattern($pids.RangeValue, [ref]$rvp)) {
+        $rangeValue = $rvp.Current.Value
+        $minimum = $rvp.Current.Minimum
+        $maximum = $rvp.Current.Maximum
+        $smallChange = $rvp.Current.SmallChange
+        $largeChange = $rvp.Current.LargeChange
+      }
+    } catch {}
+    # TogglePattern
+    try {
+      $tp = $null
+      if ($Element.TryGetCurrentPattern($pids.Toggle, [ref]$tp)) {
+        $toggleState = [string]$tp.Current.ToggleState
+      }
+    } catch {}
+    # SelectionItemPattern
+    try {
+      $sip = $null
+      if ($Element.TryGetCurrentPattern($pids.SelectionItem, [ref]$sip)) {
+        $selected = [bool]$sip.Current.IsSelected
+      }
+    } catch {}
+    # ExpandCollapsePattern
+    try {
+      $ecp = $null
+      if ($Element.TryGetCurrentPattern($pids.ExpandCollapse, [ref]$ecp)) {
+        $expandState = [string]$ecp.Current.ExpandCollapseState
+      }
+    } catch {}
+  }
+
+  $isPassword = $false
+  try { $isPassword = [bool]$Element.Current.IsPassword } catch {}
+
+  $nativeHandle = ""
+  try { $nativeHandle = [string]$Element.Current.NativeWindowHandle } catch {}
+  if ([string]::IsNullOrEmpty($nativeHandle) -or $nativeHandle -eq "0") { $nativeHandle = "" }
+
+  return [ordered]@{
+    automationId = (Get-UiaCurrent $Element "AutomationId")
+    name = (Get-UiaCurrent $Element "Name")
+    controlType = $ctName
+    className = (Get-UiaCurrent $Element "ClassName")
+    frameworkId = (Get-UiaCurrent $Element "FrameworkId")
+    processId = (Get-UiaCurrent $Element "ProcessId")
+    nativeWindowHandle = $nativeHandle
+    enabled = (Get-UiaCurrent $Element "IsEnabled")
+    offscreen = (Get-UiaCurrent $Element "IsOffscreen")
+    focusable = (Get-UiaCurrent $Element "IsKeyboardFocusable")
+    hasKeyboardFocus = (Get-UiaCurrent $Element "HasKeyboardFocus")
+    isPassword = $isPassword
+    isReadOnly = $isReadOnly
+    boundingRect = $rect
+    runtimeId = $runtimeId
+    patterns = $patterns
+    value = $value
+    rangeValue = $rangeValue
+    minimum = $minimum
+    maximum = $maximum
+    smallChange = $smallChange
+    largeChange = $largeChange
+    toggleState = $toggleState
+    selected = $selected
+    expandCollapseState = $expandState
+  }
+}
+
+# Normalize a control-type string from the selector (already cleaned by TS) to
+# the UIA ControlType programmatic name for comparison.
+function ConvertTo-UiaControlTypeName {
+  param([string]$Value)
+  if ([string]::IsNullOrWhiteSpace($Value)) { return "" }
+  $v = $Value -replace "^ControlType\.", ""
+  # Try to find a matching ControlType by short name (case-insensitive).
+  foreach ($ct in [System.Windows.Automation.ControlType].GetFields([System.Reflection.BindingFlags]::Public -bor [System.Reflection.BindingFlags]::Static)) {
+    if ($ct.Name -ieq $v) { return $ct.GetValue($null).ProgrammaticName }
+  }
+  return $v
+}
+
+# Test whether an element matches a single selector (no ancestor/path).
+function Test-UiaElementMatches {
+  param($Element, [hashtable]$Selector)
+
+  $match = "exact"
+  if ($Selector.ContainsKey("match") -and $Selector.match) { $match = [string]$Selector.match }
+  $caseSensitive = $false
+  if ($Selector.ContainsKey("caseSensitive") -and $Selector.caseSensitive) { $caseSensitive = [bool]$Selector.caseSensitive }
+
+  $cmp = if ($caseSensitive) {
+    [System.StringComparison]::Ordinal
+  } else {
+    [System.StringComparison]::OrdinalIgnoreCase
+  }
+
+  if ($Selector.ContainsKey("automationId") -and $Selector.automationId) {
+    $actual = ""
+    try { $actual = [string]$Element.Current.AutomationId } catch {}
+    if (-not (Test-StringMatch $actual $Selector.automationId $match $cmp)) { return $false }
+  }
+  if ($Selector.ContainsKey("name") -and $Selector.name) {
+    $actual = ""
+    try { $actual = [string]$Element.Current.Name } catch {}
+    if (-not (Test-StringMatch $actual $Selector.name $match $cmp)) { return $false }
+  }
+  if ($Selector.ContainsKey("className") -and $Selector.className) {
+    $actual = ""
+    try { $actual = [string]$Element.Current.ClassName } catch {}
+    if (-not (Test-StringMatch $actual $Selector.className $match $cmp)) { return $false }
+  }
+  if ($Selector.ContainsKey("frameworkId") -and $Selector.frameworkId) {
+    $actual = ""
+    try { $actual = [string]$Element.Current.FrameworkId } catch {}
+    if (-not (Test-StringMatch $actual $Selector.frameworkId $match $cmp)) { return $false }
+  }
+  if ($Selector.ContainsKey("controlType") -and $Selector.controlType) {
+    $actual = ""
+    try { $actual = [string]$Element.Current.ControlType.ProgrammaticName } catch {}
+    $expected = ConvertTo-UiaControlTypeName $Selector.controlType
+    # ControlType is always exact-matched (no contains/regex).
+    if (-not [string]::Equals($actual, $expected, [System.StringComparison]::OrdinalIgnoreCase)) { return $false }
+  }
+  if ($Selector.ContainsKey("visibleOnly") -and $Selector.visibleOnly) {
+    try { if ($Element.Current.IsOffscreen) { return $false } } catch {}
+  }
+  if ($Selector.ContainsKey("enabledOnly") -and $Selector.enabledOnly) {
+    try { if (-not $Element.Current.IsEnabled) { return $false } } catch {}
+  }
+  return $true
+}
+
+function Test-StringMatch {
+  param([string]$Actual, [string]$Expected, [string]$Match, [System.StringComparison]$Cmp)
+  switch ($Match) {
+    "exact" { return [string]::Equals($Actual, $Expected, $Cmp) }
+    "contains" { return ($Actual.IndexOf($Expected, $Cmp) -ge 0) }
+    "regex" {
+      try {
+        $opts = if ($Cmp -eq [System.StringComparison]::Ordinal) { [System.Text.RegularExpressions.RegexOptions]::None } else { [System.Text.RegularExpressions.RegexOptions]::IgnoreCase }
+        return [System.Text.RegularExpressions.Regex]::IsMatch($Actual, $Expected, $opts)
+      } catch { return $false }
+    }
+    default { return [string]::Equals($Actual, $Expected, $Cmp) }
+  }
+}
+
+# Find all elements matching a selector across the given roots, with bounded
+# traversal. Returns @{ matches=@(...); visited=N; truncated=bool }.
+# When a path[] is present, matches are resolved hierarchically from each root.
+function Find-UiaElements {
+  param(
+    $Roots,
+    [hashtable]$Selector,
+    [int]$MaxDepth,
+    [int]$MaxNodes,
+    [int]$PerRootMs,
+    [int]$MaxResults = 100,
+    [bool]$IncludePatterns = $true,
+    [bool]$IncludeValues = $true,
+    [string[]]$ControlTypeFilter = $null
+  )
+
+  $walker = [System.Windows.Automation.TreeWalker]::RawViewWalker
+  $matches = [System.Collections.ArrayList]::new()
+  $visited = 0
+  $truncated = $false
+  $hasPath = $Selector.ContainsKey("path") -and $Selector.path -and @($Selector.path).Count -gt 0
+  $hasAncestor = $Selector.ContainsKey("ancestor") -and $Selector.ancestor -and (Test-SelectorHasLocator $Selector.ancestor)
+
+  foreach ($root in $Roots) {
+    if ($matches.Count -ge $MaxResults) { $truncated = $true; break }
+    $deadline = [DateTimeOffset]::UtcNow.AddMilliseconds($PerRootMs)
+    $script:walkStop = $false
+
+    if ($hasPath) {
+      # Hierarchical path resolution: find path[0] matches, then for each,
+      # search descendants for path[1], etc. The final level's matches are
+      # the result (plus ancestor/path filters from the top-level selector).
+      $pathMatches = Find-UiaByPath -Root $root.element -Path @($Selector.path) -Walker $walker -MaxDepth $MaxDepth -MaxNodes $MaxNodes -Deadline $deadline -Visited ([ref]$visited)
+      foreach ($m in $pathMatches) {
+        if ($matches.Count -ge $MaxResults) { $truncated = $true; break }
+        $state = Get-UiaElementState -Element $m -IncludePatterns $IncludePatterns -IncludeValues $IncludeValues
+        $matches.Add($state) | Out-Null
+      }
+      continue
+    }
+
+    # Standard walk. The ancestor filter is applied by tracking depth + parent.
+    & {
+      param($RootEl, $RootInfo)
+      # Use an explicit stack to avoid recursion limits and to allow per-node
+      # deadline checks.
+      $stack = [System.Collections.Stack]::new()
+      $stack.Push([pscustomobject]@{ Element = $RootEl; Depth = 0; Parent = $null })
+      while ($stack.Count -gt 0) {
+        if ($script:walkStop) { break }
+        if ($visited -ge $MaxNodes) { $truncated = $true; break }
+        if ([DateTimeOffset]::UtcNow -gt $deadline) { $script:walkStop = $true; $truncated = $true; break }
+        if ($matches.Count -ge $MaxResults) { $truncated = $true; break }
+
+        $node = $stack.Pop()
+        $visited++
+        $el = $node.Element
+
+        $isMatch = $false
+        try { $isMatch = Test-UiaElementMatches -Element $el -Selector $Selector } catch { $isMatch = $false }
+
+        if ($isMatch) {
+          # Ancestor check: if ancestor selector present, verify some ancestor
+          # in the chain matches it.
+          $ancestorOk = $true
+          if ($hasAncestor) {
+            $ancestorOk = $false
+            $p = $node.Parent
+            while ($null -ne $p) {
+              try { if (Test-UiaElementMatches -Element $p.Element -Selector $Selector.ancestor) { $ancestorOk = $true; break } } catch {}
+              $p = $p.Parent
+            }
+          }
+          if ($ancestorOk) {
+            $state = Get-UiaElementState -Element $el -IncludePatterns $IncludePatterns -IncludeValues $IncludeValues
+            $matches.Add($state) | Out-Null
+          }
+        }
+
+        if ($node.Depth -ge $MaxDepth) { continue }
+
+        # Push children in reverse so they pop in order. Cap children per node
+        # to avoid pathological sibling counts.
+        $child = $null
+        try { $child = $walker.GetFirstChild($el) } catch { $child = $null }
+        $childCount = 0
+        $childBuffer = [System.Collections.ArrayList]::new()
+        while ($null -ne $child) {
+          if ($childCount -ge 500) { break }
+          $childBuffer.Insert(0, $child) | Out-Null
+          $childCount++
+          try { $child = $walker.GetNextSibling($child) } catch { $child = $null }
+        }
+        foreach ($c in $childBuffer) {
+          $stack.Push([pscustomobject]@{ Element = $c; Depth = ($node.Depth + 1); Parent = $node })
+        }
+      }
+    } $root.element $root
+  }
+
+  return [ordered]@{ matches = @($matches.ToArray()); visited = $visited; truncated = $truncated }
+}
+
+function Test-SelectorHasLocator {
+  param([hashtable]$Selector)
+  if ($null -eq $Selector) { return $false }
+  foreach ($k in @('automationId','name','controlType','className','frameworkId')) {
+    if ($Selector.ContainsKey($k) -and $Selector.$k) { return $true }
+  }
+  if ($Selector.ContainsKey("path") -and $Selector.path -and @($Selector.path).Count -gt 0) { return $true }
+  if ($Selector.ContainsKey("ancestor") -and $Selector.ancestor -and (Test-SelectorHasLocator $Selector.ancestor)) { return $true }
+  return $false
+}
+
+# Hierarchical path resolution. Returns the final-level matches.
+function Find-UiaByPath {
+  param($Root, $Path, $Walker, [int]$MaxDepth, [int]$MaxNodes, $Deadline, $Visited)
+  $current = @($Root)
+  for ($i = 0; $i -lt $Path.Count; $i++) {
+    $seg = [hashtable]$Path[$i]
+    $next = [System.Collections.ArrayList]::new()
+    foreach ($parent in $current) {
+      if ($script:walkStop) { break }
+      # Search descendants of $parent up to MaxDepth for $seg matches.
+      $stack = [System.Collections.Stack]::new()
+      $stack.Push([pscustomobject]@{ Element = $parent; Depth = 0 })
+      while ($stack.Count -gt 0) {
+        if ($script:walkStop) { break }
+        if ($Visited.Value -ge $MaxNodes) { $script:walkStop = $true; break }
+        if ([DateTimeOffset]::UtcNow -gt $Deadline) { $script:walkStop = $true; break }
+        $node = $stack.Pop()
+        $Visited.Value++
+        $isMatch = $false
+        try { $isMatch = Test-UiaElementMatches -Element $node.Element -Selector $seg } catch {}
+        if ($isMatch) { $next.Add($node.Element) | Out-Null }
+        if ($node.Depth -ge $MaxDepth) { continue }
+        $child = $null
+        try { $child = $Walker.GetFirstChild($node.Element) } catch {}
+        $buf = [System.Collections.ArrayList]::new()
+        $cc = 0
+        while ($null -ne $child -and $cc -lt 500) {
+          $buf.Insert(0, $child) | Out-Null
+          $cc++
+          try { $child = $Walker.GetNextSibling($child) } catch { $child = $null }
+        }
+        foreach ($c in $buf) { $stack.Push([pscustomobject]@{ Element = $c; Depth = ($node.Depth + 1) }) }
+      }
+    }
+    $current = @($next.ToArray())
+    if ($current.Count -eq 0) { break }
+  }
+  return $current
+}
+
+# ── ui_inspect_tree ──
+function Invoke-UiInspectTree {
+  param([hashtable]$Target)
+
+  Assert-UiaAvailable
+  $includePopups = $true
+  if ($Target.ContainsKey("includeProcessPopups") -and $null -ne $Target.includeProcessPopups) { $includePopups = [bool]$Target.includeProcessPopups }
+  $maxDepth = 10
+  if ($Target.ContainsKey("maxDepth")) { $maxDepth = [int]$Target.maxDepth }
+  $maxNodes = 1500
+  if ($Target.ContainsKey("maxNodes")) { $maxNodes = [int]$Target.maxNodes }
+  $timeoutMs = 20000
+  if ($Target.ContainsKey("timeoutMs")) { $timeoutMs = [int]$Target.timeoutMs }
+  $interactiveOnly = $false
+  if ($Target.ContainsKey("interactiveOnly")) { $interactiveOnly = [bool]$Target.interactiveOnly }
+  $automationIdOnly = $false
+  if ($Target.ContainsKey("automationIdOnly")) { $automationIdOnly = [bool]$Target.automationIdOnly }
+  $includePatterns = $true
+  if ($Target.ContainsKey("includePatterns")) { $includePatterns = [bool]$Target.includePatterns }
+  $includeOffscreen = $true
+  if ($Target.ContainsKey("includeOffscreen")) { $includeOffscreen = [bool]$Target.includeOffscreen }
+  $controlTypes = $null
+  if ($Target.ContainsKey("controlTypes") -and $Target.controlTypes) { $controlTypes = @($Target.controlTypes) }
+
+  $windowSel = @{}
+  foreach ($k in @('hwnd','pid','processName','titleContains')) { if ($Target.ContainsKey($k) -and $null -ne $Target.$k) { $windowSel[$k] = $Target.$k } }
+  $roots = Get-UiaRoots -Target $windowSel -IncludeProcessPopups:$includePopups
+
+  $walker = [System.Windows.Automation.TreeWalker]::RawViewWalker
+  $nodes = [System.Collections.ArrayList]::new()
+  $visited = 0
+  $truncated = $false
+  $overallDeadline = [DateTimeOffset]::UtcNow.AddMilliseconds($timeoutMs)
+  $perRootMs = [Math]::Max(500, [int]($timeoutMs / ([Math]::Max(1, $roots.Count))))
+  $script:walkStop = $false
+
+  $ctrlTypeFilterSet = $null
+  if ($controlTypes) {
+    $ctrlTypeFilterSet = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    foreach ($ct in $controlTypes) { $ctrlTypeFilterSet.Add((ConvertTo-UiaControlTypeName $ct)) | Out-Null }
+  }
+
+  foreach ($root in $roots) {
+    if ($script:walkStop) { break }
+    $rootDeadline = [DateTimeOffset]::UtcNow.AddMilliseconds($perRootMs)
+    $stack = [System.Collections.Stack]::new()
+    $stack.Push([pscustomobject]@{ Element = $root.element; Depth = 0; ParentId = $null })
+    while ($stack.Count -gt 0) {
+      if ($script:walkStop) { break }
+      if ($nodes.Count -ge $maxNodes) { $truncated = $true; break }
+      if ($visited -ge ($maxNodes * 3)) { $truncated = $true; $script:walkStop = $true; break }
+      if ([DateTimeOffset]::UtcNow -gt $rootDeadline -or [DateTimeOffset]::UtcNow -gt $overallDeadline) { $truncated = $true; $script:walkStop = $true; break }
+
+      $node = $stack.Pop()
+      $visited++
+      $el = $node.Element
+      $nodeId = $nodes.Count + 1
+
+      $ct = $null; try { $ct = $el.Current.ControlType } catch {}
+      $ctName = if ($ct) { $ct.ProgrammaticName } else { "" }
+      $autoId = ""; $name = ""; $cls = ""; $fw = ""; $pidv = 0; $en = $true; $off = $true
+      $focusable = $false; $hasFocus = $false
+      try { $autoId = [string]$el.Current.AutomationId } catch {}
+      try { $name = [string]$el.Current.Name } catch {}
+      try { $cls = [string]$el.Current.ClassName } catch {}
+      try { $fw = [string]$el.Current.FrameworkId } catch {}
+      try { $pidv = [int]$el.Current.ProcessId } catch {}
+      try { $en = [bool]$el.Current.IsEnabled } catch {}
+      try { $off = [bool]$el.Current.IsOffscreen } catch {}
+      try { $focusable = [bool]$el.Current.IsKeyboardFocusable } catch {}
+      try { $hasFocus = [bool]$el.Current.HasKeyboardFocus } catch {}
+
+      # Filtering: filters only affect whether the node is RETURNED, not
+      # whether traversal continues past it.
+      $include = $true
+      if (-not $includeOffscreen -and $off) { $include = $false }
+      if ($automationIdOnly -and [string]::IsNullOrEmpty($autoId)) { $include = $false }
+      if ($interactiveOnly) {
+        if ($off -or -not $en -or -not $focusable) { $include = $false }
+      }
+      if ($ctrlTypeFilterSet -and -not $ctrlTypeFilterSet.Contains($ctName)) { $include = $false }
+
+      if ($include) {
+        $rect = $null
+        try { $r = $el.Current.BoundingRectangle; if ($r.Width -gt 0 -and $r.Height -gt 0) { $rect = [ordered]@{ x=[int]$r.X; y=[int]$r.Y; width=[int]$r.Width; height=[int]$r.Height } } } catch {}
+        $pats = @()
+        if ($includePatterns) { $pats = (Get-UiaElementState -Element $el -IncludePatterns $true -IncludeValues $false).patterns }
+        $nativeHandle = ""
+        try { $nh = $el.Current.NativeWindowHandle; if ($nh -ne 0) { $nativeHandle = [string]$nh } } catch {}
+        $nodes.Add([ordered]@{
+          nodeId = $nodeId
+          parentNodeId = $node.ParentId
+          depth = $node.Depth
+          rootHwnd = [string]$root.hwnd
+          rootIndex = [int]$root.rootIndex
+          automationId = $autoId
+          name = $name
+          controlType = $ctName
+          className = $cls
+          frameworkId = $fw
+          processId = $pidv
+          nativeWindowHandle = $nativeHandle
+          enabled = $en
+          offscreen = $off
+          focusable = $focusable
+          hasKeyboardFocus = $hasFocus
+          boundingRect = $rect
+          patterns = $pats
+        }) | Out-Null
+      }
+
+      if ($node.Depth -ge $maxDepth) { continue }
+      $child = $null
+      try { $child = $walker.GetFirstChild($el) } catch { $child = $null }
+      $buf = [System.Collections.ArrayList]::new()
+      $cc = 0
+      while ($null -ne $child -and $cc -lt 500) {
+        $buf.Insert(0, $child) | Out-Null
+        $cc++
+        try { $child = $walker.GetNextSibling($child) } catch { $child = $null }
+      }
+      $parentId = if ($include) { $nodeId } else { $node.ParentId }
+      foreach ($c in $buf) { $stack.Push([pscustomobject]@{ Element = $c; Depth = ($node.Depth + 1); ParentId = $parentId }) }
+    }
+  }
+
+  $elapsed = [int]([DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() - ($overallDeadline.ToUnixTimeMilliseconds() - $timeoutMs))
+  return [ordered]@{
+    roots = @($roots | ForEach-Object {
+      [ordered]@{
+        hwnd = [string]$_.hwnd
+        title = [string]$_.title
+        className = [string]$_.className
+        processId = [int]$_.processId
+        isMain = [bool]$_.isMain
+        isPopup = [bool]$_.isPopup
+        rootIndex = [int]$_.rootIndex
+      }
+    })
+    nodes = @($nodes.ToArray())
+    visitedNodes = $visited
+    returnedNodes = $nodes.Count
+    truncated = [bool]$truncated
+    maxDepth = $maxDepth
+    maxNodes = $maxNodes
+    elapsedMs = $elapsed
+  }
+}
+
+# ── ui_query / ui_get shared resolver ──
+function Resolve-UiaSelector {
+  param([hashtable]$Target, [bool]$Single, [bool]$IncludeValues)
+
+  Assert-UiaAvailable
+  $includePopups = $true
+  if ($Target.ContainsKey("includeProcessPopups") -and $null -ne $Target.includeProcessPopups) { $includePopups = [bool]$Target.includeProcessPopups }
+  $maxDepth = 15
+  if ($Target.ContainsKey("maxDepth")) { $maxDepth = [int]$Target.maxDepth }
+  $maxNodes = 2000
+  if ($Target.ContainsKey("maxNodes")) { $maxNodes = [int]$maxNodes }
+  $timeoutMs = 15000
+  if ($Target.ContainsKey("timeoutMs")) { $timeoutMs = [int]$Target.timeoutMs }
+  $includePatterns = $true
+  if ($Target.ContainsKey("includePatterns")) { $includePatterns = [bool]$Target.includePatterns }
+  $maxResults = 100
+  if ($Target.ContainsKey("maxResults")) { $maxResults = [int]$Target.maxResults }
+  if ($Single) { $maxResults = 2 } # fetch up to 2 to detect ambiguity
+
+  $windowSel = @{}
+  foreach ($k in @('hwnd','pid','processName','titleContains')) { if ($Target.ContainsKey($k) -and $null -ne $Target.$k) { $windowSel[$k] = $Target.$k } }
+  $roots = Get-UiaRoots -Target $windowSel -IncludeProcessPopups:$includePopups
+
+  $perRootMs = [Math]::Max(500, [int]($timeoutMs / ([Math]::Max(1, $roots.Count))))
+  $result = Find-UiaElements -Roots $roots -Selector $Target.selector -MaxDepth $maxDepth -MaxNodes $maxNodes -PerRootMs $perRootMs -MaxResults $maxResults -IncludePatterns $includePatterns -IncludeValues $IncludeValues
+
+  $matches = @($result.matches)
+  if ($matches.Count -eq 0) {
+    Throw-UiaError "ELEMENT_NOT_FOUND" "No element matched the selector." ([ordered]@{ selector = $Target.selector; stage = "query"; visitedNodes = $result.visited })
+  }
+  if ($Single -and $matches.Count -gt 1) {
+    Throw-UiaError "ELEMENT_AMBIGUOUS" "Selector matched $($matches.Count) elements; provide an index or a more specific selector." ([ordered]@{ selector = $Target.selector; candidateCount = $matches.Count; candidates = @($matches | Select-Object -First 10 | ForEach-Object { [ordered]@{ automationId=$_.automationId; name=$_.name; controlType=$_.controlType; className=$_.className; frameworkId=$_.frameworkId; boundingRect=$_.boundingRect; runtimeId=$_.runtimeId } }) })
+  }
+
+  # Apply index selector if present (0-based).
+  $index = $null
+  if ($Target.selector.ContainsKey("index") -and $null -ne $Target.selector.index) { $index = [int]$Target.selector.index }
+  if ($null -ne $index) {
+    if ($index -ge $matches.Count) {
+      Throw-UiaError "ELEMENT_NOT_FOUND" "Selector index $index is out of range (matched $($matches.Count) elements)." ([ordered]@{ selector = $Target.selector; stage = "index" })
+    }
+    $matches = @($matches[$index])
+  }
+  return [ordered]@{ matches = $matches; visited = $result.visited; truncated = $result.truncated }
+}
+
+function Invoke-UiQuery {
+  param([hashtable]$Target)
+  $start = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
+  $res = Resolve-UiaSelector -Target $Target -Single $false -IncludeValues $true
+  $elapsed = [int]([DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() - $start)
+  return [ordered]@{
+    found = $true
+    count = $res.matches.Count
+    elements = @($res.matches)
+    truncated = [bool]$res.truncated
+    visitedNodes = [int]$res.visited
+    elapsedMs = $elapsed
+  }
+}
+
+function Invoke-UiGet {
+  param([hashtable]$Target)
+  $start = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
+  $res = Resolve-UiaSelector -Target $Target -Single $true -IncludeValues $true
+  $elapsed = [int]([DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() - $start)
+  if ($res.matches.Count -eq 0) {
+    return [ordered]@{ found = $false; element = $null; elapsedMs = $elapsed }
+  }
+  return [ordered]@{ found = $true; element = $res.matches[0]; elapsedMs = $elapsed }
+}
+
+# ── ui_action ──
+function Invoke-UiAction {
+  param([hashtable]$Target)
+
+  Assert-UiaAvailable
+  $action = [string]$Target.action
+  $allowFallback = $false
+  if ($Target.ContainsKey("allowCoordinateFallback")) { $allowFallback = [bool]$Target.allowCoordinateFallback }
+  $forceClick = $false
+  if ($Target.ContainsKey("forceCoordinateClick")) { $forceClick = [bool]$Target.forceCoordinateClick }
+
+  $start = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
+
+  # Re-resolve the element fresh (never reuse a cached AutomationElement).
+  $res = Resolve-UiaSelector -Target $Target -Single $true -IncludeValues $true
+  if ($res.matches.Count -eq 0) {
+    Throw-UiaError "ELEMENT_NOT_FOUND" "No element matched the selector for action '$action'." ([ordered]@{ selector = $Target.selector; stage = "action-resolve" })
+  }
+  $stateBefore = $res.matches[0]
+  $windowSel = @{}
+  foreach ($k in @('hwnd','pid','processName','titleContains')) { if ($Target.ContainsKey($k) -and $null -ne $Target.$k) { $windowSel[$k] = $Target.$k } }
+  $mainWin = Resolve-UiaTargetWindow -Target $windowSel
+  $targetHwnd = [IntPtr]([int64]$mainWin.hwnd)
+
+  # Re-fetch the live AutomationElement by re-running the selector query but
+  # returning the element rather than its serialized state.
+  $live = Resolve-UiaLiveElement -Target $Target
+  if ($null -eq $live) {
+    Throw-UiaError "ELEMENT_NOT_AVAILABLE" "Element was no longer available when the action ran." ([ordered]@{ selector = $Target.selector; stage = "action-live" })
+  }
+
+  $method = ""
+  $fallbackUsed = $false
+
+  if ($forceClick) {
+    $method = "coordinate_click_forced"
+    $fallbackUsed = $true
+    Invoke-CoordinateClick -Element $live -TargetHwnd $targetHwnd -AllowFallback $true
+  } else {
+    switch ($action) {
+      "invoke" {
+        if (Try-UiaPattern $live "Invoke" { param($p) $p.Invoke() }) { $method = "InvokePattern" }
+        elseif ($allowFallback -and (Invoke-CoordinateClick -Element $live -TargetHwnd $targetHwnd -AllowFallback $true)) { $method = "coordinate_click_fallback"; $fallbackUsed = $true }
+        else { Throw-UiaError "PATTERN_NOT_SUPPORTED" "Element does not support InvokePattern and coordinate fallback is disabled." ([ordered]@{ selector = $Target.selector; patterns = $stateBefore.patterns; stage = "invoke" }) }
+      }
+      "toggle" {
+        if (Try-UiaPattern $live "Toggle" { param($p) $p.Toggle() }) { $method = "TogglePattern" }
+        elseif (Try-UiaPattern $live "Invoke" { param($p) $p.Invoke() }) { $method = "InvokePattern" }
+        elseif ($allowFallback -and (Invoke-CoordinateClick -Element $live -TargetHwnd $targetHwnd -AllowFallback $true)) { $method = "coordinate_click_fallback"; $fallbackUsed = $true }
+        else { Throw-UiaError "PATTERN_NOT_SUPPORTED" "Element does not support Toggle/Invoke patterns and coordinate fallback is disabled." ([ordered]@{ selector = $Target.selector; patterns = $stateBefore.patterns; stage = "toggle" }) }
+      }
+      "select" { $method = Invoke-SelectionAction -Element $live -Action "Select" -AllowFallback $allowFallback -TargetHwnd $targetHwnd -Selector $Target.selector -StateBefore $stateBefore }
+      "addToSelection" { $method = Invoke-SelectionAction -Element $live -Action "AddToSelection" -AllowFallback $allowFallback -TargetHwnd $targetHwnd -Selector $Target.selector -StateBefore $stateBefore }
+      "removeFromSelection" { $method = Invoke-SelectionAction -Element $live -Action "RemoveFromSelection" -AllowFallback $allowFallback -TargetHwnd $targetHwnd -Selector $Target.selector -StateBefore $stateBefore }
+      "expand" { $method = Invoke-ExpandCollapse -Element $live -Action "Expand" -Selector $Target.selector -StateBefore $stateBefore }
+      "collapse" { $method = Invoke-ExpandCollapse -Element $live -Action "Collapse" -Selector $Target.selector -StateBefore $stateBefore }
+      "setValue" {
+        if (Try-UiaPattern $live "Value" { param($p) $p.SetValue([string]$Target.value) }) { $method = "ValuePattern" }
+        else { Throw-UiaError "PATTERN_NOT_SUPPORTED" "Element does not support ValuePattern; cannot setValue." ([ordered]@{ selector = $Target.selector; patterns = $stateBefore.patterns; stage = "setValue" }) }
+      }
+      "setRangeValue" {
+        if (Try-UiaPattern $live "RangeValue" { param($p) $p.SetValue([double]$Target.rangeValue) }) { $method = "RangeValuePattern" }
+        else { Throw-UiaError "PATTERN_NOT_SUPPORTED" "Element does not support RangeValuePattern; cannot setRangeValue." ([ordered]@{ selector = $Target.selector; patterns = $stateBefore.patterns; stage = "setRangeValue" }) }
+      }
+      "scrollIntoView" {
+        if (Try-UiaPattern $live "ScrollItem" { param($p) $p.ScrollIntoView() }) { $method = "ScrollItemPattern" }
+        else { Throw-UiaError "PATTERN_NOT_SUPPORTED" "Element does not support ScrollItemPattern." ([ordered]@{ selector = $Target.selector; patterns = $stateBefore.patterns; stage = "scrollIntoView" }) }
+      }
+      "focus" {
+        try { $live.SetFocus(); $method = "SetFocus" } catch { Throw-UiaError "ACTION_FAILED" "SetFocus failed: $($_.Exception.Message)" ([ordered]@{ selector = $Target.selector; stage = "focus" }) }
+      }
+      "legacyDefaultAction" {
+        # LegacyIAccessiblePattern is not exposed by this managed API. Fall
+        # back to InvokePattern; if unavailable, coordinate click (when
+        # allowed). This is documented as an API limitation.
+        if (Try-UiaPattern $live "Invoke" { param($p) $p.Invoke() }) { $method = "InvokePattern(legacy)" }
+        elseif ($allowFallback -and (Invoke-CoordinateClick -Element $live -TargetHwnd $targetHwnd -AllowFallback $true)) { $method = "coordinate_click_fallback"; $fallbackUsed = $true }
+        else { Throw-UiaError "PATTERN_NOT_SUPPORTED" "LegacyIAccessiblePattern is not available in this managed API and InvokePattern is unsupported; enable allowCoordinateFallback to use a coordinate click." ([ordered]@{ selector = $Target.selector; patterns = $stateBefore.patterns; stage = "legacyDefaultAction" }) }
+      }
+      "click" {
+        # Caller-requested click, but still prefer patterns per spec.
+        if (Try-UiaPattern $live "Invoke" { param($p) $p.Invoke() }) { $method = "InvokePattern" }
+        elseif ($allowFallback -and (Invoke-CoordinateClick -Element $live -TargetHwnd $targetHwnd -AllowFallback $true)) { $method = "coordinate_click_fallback"; $fallbackUsed = $true }
+        else { Throw-UiaError "COORDINATE_FALLBACK_DISABLED" "Element has no invokable pattern and allowCoordinateFallback is false." ([ordered]@{ selector = $Target.selector; patterns = $stateBefore.patterns; stage = "click" }) }
+      }
+      default { Throw-UiaError "ACTION_FAILED" "Unknown action: $action" ([ordered]@{ stage = "dispatch" }) }
+    }
+  }
+
+  # Read post-state for diff (best-effort).
+  $stateAfter = $null
+  try {
+    $liveAfter = Resolve-UiaLiveElement -Target $Target
+    if ($liveAfter) { $stateAfter = Get-UiaElementState -Element $liveAfter -IncludePatterns $false -IncludeValues $true }
+  } catch {}
+
+  $elapsed = [int]([DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() - $start)
+  return [ordered]@{
+    success = $true
+    method = $method
+    coordinateFallbackUsed = [bool]$fallbackUsed
+    before = $stateBefore
+    after = $stateAfter
+    elapsedMs = $elapsed
+  }
+}
+
+function Try-UiaPattern {
+  param($Element, [string]$PatternName, [scriptblock]$Action)
+  try {
+    $pids = Get-UiaPatternIds
+    $pat = $pids[$PatternName]
+    if ($null -eq $pat) { return $false }
+    $instance = $null
+    if (-not $Element.TryGetCurrentPattern($pat, [ref]$instance)) { return $false }
+    if ($null -eq $instance) { return $false }
+    & $Action $instance
+    return $true
+  } catch {
+    return $false
+  }
+}
+
+function Invoke-SelectionAction {
+  param($Element, [string]$Action, [bool]$AllowFallback, [IntPtr]$TargetHwnd, [hashtable]$Selector, $StateBefore)
+  $pids = Get-UiaPatternIds
+  try {
+    $sip = $null
+    if ($Element.TryGetCurrentPattern($pids.SelectionItem, [ref]$sip) -and $null -ne $sip) {
+      switch ($Action) {
+        "Select" { $sip.Select(); return "SelectionItemPattern.Select" }
+        "AddToSelection" { $sip.AddToSelection(); return "SelectionItemPattern.AddToSelection" }
+        "RemoveFromSelection" { $sip.RemoveFromSelection(); return "SelectionItemPattern.RemoveFromSelection" }
+      }
+    }
+  } catch {}
+  if (Try-UiaPattern $Element "Invoke" { param($p) $p.Invoke() }) { return "InvokePattern" }
+  if ($AllowFallback -and (Invoke-CoordinateClick -Element $Element -TargetHwnd $TargetHwnd -AllowFallback $true)) { return "coordinate_click_fallback" }
+  Throw-UiaError "PATTERN_NOT_SUPPORTED" "Element does not support SelectionItem/Invoke patterns and coordinate fallback is disabled." ([ordered]@{ selector = $Selector; patterns = $StateBefore.patterns; stage = "selection" })
+}
+
+function Invoke-ExpandCollapse {
+  param($Element, [string]$Action, [hashtable]$Selector, $StateBefore)
+  $pids = Get-UiaPatternIds
+  try {
+    $ecp = $null
+    if ($Element.TryGetCurrentPattern($pids.ExpandCollapse, [ref]$ecp) -and $null -ne $ecp) {
+      if ($Action -eq "Expand") { $ecp.Expand(); return "ExpandCollapsePattern.Expand" }
+      else { $ecp.Collapse(); return "ExpandCollapsePattern.Collapse" }
+    }
+  } catch {}
+  Throw-UiaError "PATTERN_NOT_SUPPORTED" "Element does not support ExpandCollapsePattern." ([ordered]@{ selector = $Selector; patterns = $StateBefore.patterns; stage = "expandCollapse" })
+}
+
+# Strictly-controlled coordinate fallback. Validates every safety condition
+# before clicking. Returns $true if a click was performed, $false otherwise.
+function Invoke-CoordinateClick {
+  param($Element, [IntPtr]$TargetHwnd, [bool]$AllowFallback)
+
+  if (-not $AllowFallback) { return $false }
+
+  # Re-validate all safety conditions dynamically.
+  try {
+    $off = [bool]$Element.Current.IsOffscreen
+    if ($off) { Throw-UiaError "INVALID_BOUNDING_RECT" "Element is offscreen; cannot use coordinate fallback." ([ordered]@{ stage = "coordinate-fallback" }) }
+    $r = $Element.Current.BoundingRectangle
+    if ($r.Width -le 0 -or $r.Height -le 0) { Throw-UiaError "INVALID_BOUNDING_RECT" "Element has zero-size bounding rectangle." ([ordered]@{ stage = "coordinate-fallback" }) }
+  } catch {
+    if ($null -ne (Get-UiaErrorFromRecord $_)) { throw }
+    Throw-UiaError "INVALID_BOUNDING_RECT" "Could not read element bounding rectangle." ([ordered]@{ stage = "coordinate-fallback" })
+  }
+
+  $rect = $Element.Current.BoundingRectangle
+  $centerX = [int]([double]$rect.X + [double]$rect.Width / 2)
+  $centerY = [int]([double]$rect.Y + [double]$rect.Height / 2)
+
+  # Verify the center is within the target window's bounds.
+  $winRect = New-Object ScreenshotTool.Native+RECT
+  if (-not [ScreenshotTool.Native]::GetWindowRect($TargetHwnd, [ref]$winRect)) {
+    Throw-UiaError "INVALID_BOUNDING_RECT" "Failed to read target window rect for coordinate fallback." ([ordered]@{ stage = "coordinate-fallback" })
+  }
+  if ($centerX -lt $winRect.Left -or $centerX -ge $winRect.Right -or $centerY -lt $winRect.Top -or $centerY -ge $winRect.Bottom) {
+    Throw-UiaError "INVALID_BOUNDING_RECT" "Element center ($centerX,$centerY) is outside the target window bounds." ([ordered]@{ stage = "coordinate-fallback"; screenPoint = [ordered]@{ x = $centerX; y = $centerY }; windowRect = (Get-RectObject $winRect) })
+  }
+
+  # Convert screen -> window-relative and reuse the existing click_window path.
+  $clientPoint = New-Object ScreenshotTool.Native+POINT
+  $clientPoint.X = $centerX
+  $clientPoint.Y = $centerY
+  if (-not [ScreenshotTool.Native]::ScreenToClient($TargetHwnd, [ref]$clientPoint)) {
+    Throw-UiaError "ACTION_FAILED" "ScreenToClient failed during coordinate fallback." ([ordered]@{ stage = "coordinate-fallback" })
+  }
+
+  $clickTarget = [ordered]@{
+    hwnd = $TargetHwnd.ToInt64().ToString()
+    x = [int]$clientPoint.X
+    y = [int]$clientPoint.Y
+    button = "left"
+    delayMs = 0
+  }
+  Click-Window -Target $clickTarget | Out-Null
+  return $true
+}
+
+# Re-resolve a live AutomationElement for action execution. Same selector,
+# fresh traversal. Returns the element (not its serialized state).
+function Resolve-UiaLiveElement {
+  param([hashtable]$Target)
+
+  $windowSel = @{}
+  foreach ($k in @('hwnd','pid','processName','titleContains')) { if ($Target.ContainsKey($k) -and $null -ne $Target.$k) { $windowSel[$k] = $Target.$k } }
+  $includePopups = $true
+  if ($Target.ContainsKey("includeProcessPopups") -and $null -ne $Target.includeProcessPopups) { $includePopups = [bool]$Target.includeProcessPopups }
+  $maxDepth = 15
+  if ($Target.ContainsKey("maxDepth")) { $maxDepth = [int]$Target.maxDepth }
+  $maxNodes = 2000
+  if ($Target.ContainsKey("maxNodes")) { $maxNodes = [int]$Target.maxNodes }
+  $timeoutMs = 15000
+  if ($Target.ContainsKey("timeoutMs")) { $timeoutMs = [int]$Target.timeoutMs }
+  $roots = Get-UiaRoots -Target $windowSel -IncludeProcessPopups:$includePopups
+  $perRootMs = [Math]::Max(500, [int]($timeoutMs / ([Math]::Max(1, $roots.Count))))
+
+  $walker = [System.Windows.Automation.TreeWalker]::RawViewWalker
+  $selector = $Target.selector
+  $hasPath = $selector.ContainsKey("path") -and $selector.path -and @($selector.path).Count -gt 0
+  $hasAncestor = $selector.ContainsKey("ancestor") -and $selector.ancestor -and (Test-SelectorHasLocator $selector.ancestor)
+
+  foreach ($root in $roots) {
+    $deadline = [DateTimeOffset]::UtcNow.AddMilliseconds($perRootMs)
+    $script:walkStop = $false
+    $stack = [System.Collections.Stack]::new()
+    $stack.Push([pscustomobject]@{ Element = $root.element; Depth = 0; Parent = $null; Matched = $false })
+    $found = $null
+    $matchCount = 0
+    $index = $null
+    if ($selector.ContainsKey("index") -and $null -ne $selector.index) { $index = [int]$selector.index }
+    $visited = 0
+
+    while ($stack.Count -gt 0) {
+      if ($script:walkStop) { break }
+      if ($visited -ge $maxNodes) { break }
+      if ([DateTimeOffset]::UtcNow -gt $deadline) { $script:walkStop = $true; break }
+      $node = $stack.Pop()
+      $visited++
+      $isMatch = $false
+      try { $isMatch = Test-UiaElementMatches -Element $node.Element -Selector $selector } catch {}
+      if ($isMatch) {
+        $ancOk = $true
+        if ($hasAncestor) {
+          $ancOk = $false
+          $p = $node.Parent
+          while ($null -ne $p) {
+            try { if (Test-UiaElementMatches -Element $p.Element -Selector $selector.ancestor) { $ancOk = $true; break } } catch {}
+            $p = $p.Parent
+          }
+        }
+        if ($ancOk) {
+          if ($null -eq $index -and $matchCount -eq 0) { $found = $node.Element; break }
+          if ($null -ne $index -and $matchCount -eq $index) { $found = $node.Element; break }
+          $matchCount++
+        }
+      }
+      if ($node.Depth -ge $maxDepth) { continue }
+      $child = $null
+      try { $child = $walker.GetFirstChild($node.Element) } catch {}
+      $buf = [System.Collections.ArrayList]::new()
+      $cc = 0
+      while ($null -ne $child -and $cc -lt 500) { $buf.Insert(0, $child) | Out-Null; $cc++; try { $child = $walker.GetNextSibling($child) } catch { $child = $null } }
+      foreach ($c in $buf) { $stack.Push([pscustomobject]@{ Element = $c; Depth = ($node.Depth + 1); Parent = $node }) }
+    }
+    if ($null -ne $found) { return $found }
+  }
+  return $null
+}
+
+# ── ui_wait ──
+function Invoke-UiWait {
+  param([hashtable]$Target)
+
+  Assert-UiaAvailable
+  $condition = [string]$Target.condition
+  $timeoutMs = 10000
+  if ($Target.ContainsKey("timeoutMs")) { $timeoutMs = [int]$Target.timeoutMs }
+  $pollMs = 200
+  if ($Target.ContainsKey("pollIntervalMs")) { $pollMs = [int]$Target.pollIntervalMs }
+  if ($pollMs -lt 50) { $pollMs = 50 }
+  $expectedValue = $null
+  if ($Target.ContainsKey("expectedValue") -and $null -ne $Target.expectedValue) { $expectedValue = [string]$Target.expectedValue }
+  $expectedCount = $null
+  if ($Target.ContainsKey("expectedCount") -and $null -ne $Target.expectedCount) { $expectedCount = [int]$Target.expectedCount }
+  $toggleExpected = $null
+  if ($Target.ContainsKey("toggleState") -and $null -ne $Target.toggleState) { $toggleExpected = [string]$Target.toggleState }
+
+  $start = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
+  $deadline = $start + $timeoutMs
+  $lastObs = $null
+
+  while ($true) {
+    $now = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
+    $elapsed = [int]($now - $start)
+
+    # notExists / countEquals query the count without requiring a single match.
+    if ($condition -eq "notExists" -or $condition -eq "countEquals") {
+      try {
+        $res = Resolve-UiaSelector -Target $Target -Single $false -IncludeValues $true
+        $count = $res.matches.Count
+      } catch {
+        $count = 0
+      }
+      $lastObs = [ordered]@{ count = $count }
+      $matched = $false
+      if ($condition -eq "notExists" -and $count -eq 0) { $matched = $true }
+      if ($condition -eq "countEquals" -and $null -ne $expectedCount -and $count -eq $expectedCount) { $matched = $true }
+      if ($matched) {
+        return [ordered]@{ matched = $true; condition = $condition; lastObservation = $lastObs; elapsedMs = $elapsed; timeoutMs = $timeoutMs; pollIntervalMs = $pollMs }
+      }
+    } else {
+      # exists/visible/hidden/enabled/disabled/value*/toggle*/selected*/expand* need a single element.
+      $state = $null
+      try {
+        $res = Resolve-UiaSelector -Target $Target -Single $true -IncludeValues $true
+        if ($res.matches.Count -gt 0) { $state = $res.matches[0] }
+      } catch {
+        $state = $null
+      }
+      $lastObs = $state
+      $matched = $false
+      if ($null -ne $state) {
+        switch ($condition) {
+          "exists" { $matched = $true }
+          "visible" { $matched = -not [bool]$state.offscreen }
+          "hidden" { $matched = [bool]$state.offscreen }
+          "enabled" { $matched = [bool]$state.enabled }
+          "disabled" { $matched = -not [bool]$state.enabled }
+          "valueEquals" { $matched = ($null -ne $state.value -and [string]$state.value -eq [string]$expectedValue) }
+          "valueContains" { $matched = ($null -ne $state.value -and ([string]$state.value).IndexOf([string]$expectedValue, [System.StringComparison]::Ordinal) -ge 0) }
+          "toggleStateEquals" { $matched = ($null -ne $state.toggleState -and [string]$state.toggleState -eq [string]$toggleExpected) }
+          "selected" { $matched = ($null -ne $state.selected -and [bool]$state.selected) }
+          "notSelected" { $matched = ($null -ne $state.selected -and -not [bool]$state.selected) }
+          "expanded" { $matched = ($null -ne $state.expandCollapseState -and [string]$state.expandCollapseState -eq "Expanded") }
+          "collapsed" { $matched = ($null -ne $state.expandCollapseState -and [string]$state.expandCollapseState -eq "Collapsed") }
+        }
+      } else {
+        # Element absent: only "exists" is definitively false here; other
+        # conditions remain unmatched.
+        if ($condition -eq "exists") { $matched = $false }
+      }
+      if ($matched) {
+        return [ordered]@{ matched = $true; condition = $condition; lastObservation = $state; elapsedMs = $elapsed; timeoutMs = $timeoutMs; pollIntervalMs = $pollMs }
+      }
+    }
+
+    if ($now -ge $deadline) {
+      return [ordered]@{ matched = $false; condition = $condition; lastObservation = $lastObs; elapsedMs = $elapsed; timeoutMs = $timeoutMs; pollIntervalMs = $pollMs }
+    }
+    Start-Sleep -Milliseconds $pollMs
+  }
+}
+
 function Invoke-Action {
   param([hashtable]$Request)
 
@@ -2579,6 +3684,21 @@ function Invoke-Action {
     "wait-for-window" {
       return Wait-ForWindow -Target $Request.target
     }
+    "ui-inspect-tree" {
+      return Invoke-UiInspectTree -Target $Request.target
+    }
+    "ui-query" {
+      return Invoke-UiQuery -Target $Request.target
+    }
+    "ui-get" {
+      return Invoke-UiGet -Target $Request.target
+    }
+    "ui-action" {
+      return Invoke-UiAction -Target $Request.target
+    }
+    "ui-wait" {
+      return Invoke-UiWait -Target $Request.target
+    }
     default {
       throw "Unknown action: $($Request.action)"
     }
@@ -2608,7 +3728,15 @@ if ($Worker) {
         $response = [ordered]@{ ok = $true; result = $result }
       } catch {
         $isArrayResult = $false
-        $response = [ordered]@{ ok = $false; error = $_.Exception.ToString() }
+        # Structured UIA errors are carried in Exception.Data["UiaError"];
+        # emit that object verbatim so callers get {ok,code,message,details}
+        # instead of an English stack trace.
+        $uiaErr = Get-UiaErrorFromRecord $_
+        if ($null -ne $uiaErr) {
+          $response = $uiaErr
+        } else {
+          $response = [ordered]@{ ok = $false; error = $_.Exception.ToString() }
+        }
       }
 
       $json = if ($response.ok -and $isArrayResult) {
@@ -2645,6 +3773,11 @@ try {
   $result = Invoke-Action -Request $request
   ConvertTo-Json -InputObject $result -Depth 8 -Compress
 } catch {
-  Write-Error $_.Exception.ToString()
-  exit 1
+  $uiaErr = Get-UiaErrorFromRecord $_
+  if ($null -ne $uiaErr) {
+    ConvertTo-Json -InputObject $uiaErr -Depth 8 -Compress
+  } else {
+    Write-Error $_.Exception.ToString()
+    exit 1
+  }
 }

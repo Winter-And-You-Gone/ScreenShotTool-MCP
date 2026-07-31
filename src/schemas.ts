@@ -1,4 +1,11 @@
 import { z } from "zod";
+import {
+  MAX_REGEX_LEN,
+  MAX_SELECTOR_STR_LEN,
+  hasLocator,
+  normalizeControlType,
+  validateRegex
+} from "./uia/selectors.js";
 
 const positiveInt = z.number().int().positive();
 const nonNegativeInt = z.number().int().nonnegative();
@@ -216,6 +223,206 @@ export type WriteClipboardInput = z.infer<typeof writeClipboardSchema>;
 export type GetWindowStateInput = z.infer<typeof getWindowStateSchema>;
 export type WaitForWindowInput = z.infer<typeof waitForWindowSchema>;
 
+// ═══════════════════════════════════════════════════════════════════════
+// UI Automation schemas
+// ═══════════════════════════════════════════════════════════════════════
+const uiaMaxDepth = z.number().int().min(1).max(30);
+const uiaMaxNodes = z.number().int().min(1).max(5000);
+const uiaQueryTimeout = z.number().int().min(500).max(120_000);
+const uiaActionTimeout = z.number().int().min(500).max(120_000);
+const uiaWaitTimeout = z.number().int().min(500).max(120_000);
+const uiaPollInterval = z.number().int().min(50).max(10_000);
+const uiaValueMaxLen = 4000;
+const uiaMaxReturnElements = 100;
+
+const uiElementSelectorSchema: z.ZodType<import("./uia/types.js").UiElementSelector> = z.object({
+  automationId: z.string().min(1).max(MAX_SELECTOR_STR_LEN).optional(),
+  name: z.string().min(1).max(MAX_SELECTOR_STR_LEN).optional(),
+  controlType: z.string().min(1).max(MAX_SELECTOR_STR_LEN).optional(),
+  className: z.string().min(1).max(MAX_SELECTOR_STR_LEN).optional(),
+  frameworkId: z.string().min(1).max(MAX_SELECTOR_STR_LEN).optional(),
+  match: z.enum(["exact", "contains", "regex"]).optional(),
+  caseSensitive: z.boolean().optional(),
+  index: z.number().int().min(0).optional(),
+  visibleOnly: z.boolean().optional(),
+  enabledOnly: z.boolean().optional(),
+  ancestor: z.lazy(() => uiElementSelectorSchema).optional(),
+  path: z.array(z.lazy(() => uiElementSelectorSchema)).max(12).optional()
+}).strict().refine(
+  (value) => hasLocator(value),
+  "Selector must provide at least one locator field (automationId, name, controlType, className, frameworkId, ancestor, or path)."
+).refine(
+  (value) => {
+    if (value.match === "regex") {
+      const candidate = value.automationId ?? value.name ?? value.className ?? "";
+      if (candidate.length === 0) return true;
+      return validateRegex(candidate) === null;
+    }
+    return true;
+  },
+  "Invalid regex in selector."
+).refine(
+  // Normalize controlType so the PowerShell helper always receives a clean
+  // short name (e.g. "Button" rather than "ControlType.Button").
+  (value) => {
+    if (value.controlType !== undefined) {
+      const normalized = normalizeControlType(value.controlType);
+      if (!normalized) return false;
+      (value as { controlType?: string }).controlType = normalized;
+    }
+    return true;
+  },
+  "Invalid controlType."
+);
+
+const windowSelectorFields = {
+  hwnd: z.union([z.string().min(1), z.number().int().positive()]).optional(),
+  pid: z.number().int().positive().optional(),
+  processName: z.string().min(1).max(MAX_SELECTOR_STR_LEN).optional(),
+  titleContains: z.string().min(1).max(MAX_SELECTOR_STR_LEN).optional()
+} as const;
+
+const windowSelectorRefine = (value: Record<string, unknown>) =>
+  value.hwnd !== undefined || value.pid !== undefined || value.processName !== undefined || value.titleContains !== undefined;
+
+export const uiInspectTreeSchema = z.object({
+  ...windowSelectorFields,
+  includeProcessPopups: z.boolean().optional().default(true),
+  maxDepth: uiaMaxDepth.optional().default(10),
+  maxNodes: uiaMaxNodes.optional().default(1500),
+  interactiveOnly: z.boolean().optional().default(false),
+  automationIdOnly: z.boolean().optional().default(false),
+  includePatterns: z.boolean().optional().default(true),
+  includeOffscreen: z.boolean().optional().default(true),
+  controlTypes: z.array(z.string().min(1).max(MAX_SELECTOR_STR_LEN)).max(50).optional(),
+  timeoutMs: uiaQueryTimeout.optional().default(20000)
+}).strict().refine(windowSelectorRefine, "Provide at least one of hwnd, pid, processName, or titleContains.");
+
+export const uiQuerySchema = z.object({
+  ...windowSelectorFields,
+  selector: uiElementSelectorSchema,
+  includeProcessPopups: z.boolean().optional().default(true),
+  maxDepth: uiaMaxDepth.optional().default(15),
+  maxNodes: uiaMaxNodes.optional().default(2000),
+  includePatterns: z.boolean().optional().default(true),
+  maxResults: z.number().int().min(1).max(uiaMaxReturnElements).optional().default(uiaMaxReturnElements),
+  timeoutMs: uiaQueryTimeout.optional().default(20000)
+}).strict().refine(windowSelectorRefine, "Provide at least one of hwnd, pid, processName, or titleContains.");
+
+export const uiGetSchema = z.object({
+  ...windowSelectorFields,
+  selector: uiElementSelectorSchema,
+  includeProcessPopups: z.boolean().optional().default(true),
+  maxDepth: uiaMaxDepth.optional().default(15),
+  maxNodes: uiaMaxNodes.optional().default(2000),
+  timeoutMs: uiaQueryTimeout.optional().default(10000)
+}).strict().refine(windowSelectorRefine, "Provide at least one of hwnd, pid, processName, or titleContains.");
+
+export const uiActionSchema = z.object({
+  ...windowSelectorFields,
+  selector: uiElementSelectorSchema,
+  action: z.enum([
+    "invoke", "toggle", "select", "addToSelection", "removeFromSelection",
+    "expand", "collapse", "setValue", "setRangeValue", "scrollIntoView",
+    "focus", "legacyDefaultAction", "click"
+  ]),
+  value: z.string().max(uiaValueMaxLen).optional(),
+  rangeValue: z.number().optional(),
+  allowCoordinateFallback: z.boolean().optional().default(false),
+  forceCoordinateClick: z.boolean().optional().default(false),
+  includeProcessPopups: z.boolean().optional().default(true),
+  maxDepth: uiaMaxDepth.optional().default(15),
+  maxNodes: uiaMaxNodes.optional().default(2000),
+  timeoutMs: uiaActionTimeout.optional().default(10000)
+}).strict().refine(
+  (value) => value.action === "setValue" ? value.value !== undefined : true,
+  "setValue requires a 'value' string."
+).refine(
+  (value) => value.action === "setRangeValue" ? value.rangeValue !== undefined : true,
+  "setRangeValue requires a 'rangeValue' number."
+).refine(
+  (value) => value.forceCoordinateClick ? value.allowCoordinateFallback === true : true,
+  "forceCoordinateClick requires allowCoordinateFallback=true."
+).refine(windowSelectorRefine, "Provide at least one of hwnd, pid, processName, or titleContains.");
+
+export const uiWaitSchema = z.object({
+  ...windowSelectorFields,
+  selector: uiElementSelectorSchema,
+  condition: z.enum([
+    "exists", "notExists", "visible", "hidden", "enabled", "disabled",
+    "valueEquals", "valueContains", "toggleStateEquals", "selected",
+    "notSelected", "expanded", "collapsed", "countEquals"
+  ]),
+  expectedValue: z.string().max(uiaValueMaxLen).optional(),
+  expectedBoolean: z.boolean().optional(),
+  expectedCount: z.number().int().min(0).max(uiaMaxReturnElements).optional(),
+  toggleState: z.enum(["On", "Off", "Indeterminate"]).optional(),
+  includeProcessPopups: z.boolean().optional().default(true),
+  maxDepth: uiaMaxDepth.optional().default(15),
+  maxNodes: uiaMaxNodes.optional().default(2000),
+  timeoutMs: uiaWaitTimeout.optional().default(10_000),
+  pollIntervalMs: uiaPollInterval.optional().default(200)
+}).strict().refine(
+  (value) => ["valueEquals", "valueContains"].includes(value.condition) ? value.expectedValue !== undefined : true,
+  "valueEquals/valueContains require 'expectedValue'."
+).refine(
+  (value) => value.condition === "toggleStateEquals" ? value.toggleState !== undefined : true,
+  "toggleStateEquals requires 'toggleState'."
+).refine(
+  (value) => value.condition === "countEquals" ? value.expectedCount !== undefined : true,
+  "countEquals requires 'expectedCount'."
+).refine(windowSelectorRefine, "Provide at least one of hwnd, pid, processName, or titleContains.");
+
+export const profileListSchema = z.object({}).strict();
+
+export const profileResolveSchema = z.object({
+  profile: z.string().min(1).max(MAX_SELECTOR_STR_LEN),
+  control: z.string().min(1).max(MAX_SELECTOR_STR_LEN),
+  ...windowSelectorFields,
+  includeProcessPopups: z.boolean().optional().default(true),
+  maxDepth: uiaMaxDepth.optional().default(15),
+  maxNodes: uiaMaxNodes.optional().default(2000),
+  timeoutMs: uiaQueryTimeout.optional().default(10000)
+}).strict().refine(windowSelectorRefine, "Provide at least one of hwnd, pid, processName, or titleContains.");
+
+export const profileActionSchema = z.object({
+  profile: z.string().min(1).max(MAX_SELECTOR_STR_LEN),
+  control: z.string().min(1).max(MAX_SELECTOR_STR_LEN),
+  action: z.enum([
+    "invoke", "toggle", "select", "addToSelection", "removeFromSelection",
+    "expand", "collapse", "setValue", "setRangeValue", "scrollIntoView",
+    "focus", "legacyDefaultAction", "click"
+  ]),
+  ...windowSelectorFields,
+  value: z.string().max(uiaValueMaxLen).optional(),
+  rangeValue: z.number().optional(),
+  allowCoordinateFallback: z.boolean().optional().default(false),
+  forceCoordinateClick: z.boolean().optional().default(false),
+  includeProcessPopups: z.boolean().optional().default(true),
+  maxDepth: uiaMaxDepth.optional().default(15),
+  maxNodes: uiaMaxNodes.optional().default(2000),
+  timeoutMs: uiaActionTimeout.optional().default(10000)
+}).strict().refine(
+  (value) => value.action === "setValue" ? value.value !== undefined : true,
+  "setValue requires a 'value' string."
+).refine(
+  (value) => value.action === "setRangeValue" ? value.rangeValue !== undefined : true,
+  "setRangeValue requires a 'rangeValue' number."
+).refine(
+  (value) => value.forceCoordinateClick ? value.allowCoordinateFallback === true : true,
+  "forceCoordinateClick requires allowCoordinateFallback=true."
+).refine(windowSelectorRefine, "Provide at least one of hwnd, pid, processName, or titleContains.");
+
+export type UiInspectTreeInput = z.infer<typeof uiInspectTreeSchema>;
+export type UiQueryInput = z.infer<typeof uiQuerySchema>;
+export type UiGetInput = z.infer<typeof uiGetSchema>;
+export type UiActionInput = z.infer<typeof uiActionSchema>;
+export type UiWaitInput = z.infer<typeof uiWaitSchema>;
+export type ProfileListInput = z.infer<typeof profileListSchema>;
+export type ProfileResolveInput = z.infer<typeof profileResolveSchema>;
+export type ProfileActionInput = z.infer<typeof profileActionSchema>;
+export type UiElementSelectorInput = import("./uia/types.js").UiElementSelector;
+
 const hwndSchemaProperty = {
   anyOf: [
     { type: "string" },
@@ -230,6 +437,28 @@ const atLeastOneSelectorAnyOf = [
   { required: ["processName"] },
   { required: ["titleContains"] }
 ] as const;
+
+// JSON Schema for a UI element selector. Mirrors uiElementSelectorSchema in
+// Zod. Recursive (ancestor / path) via a $defs reference.
+const uiElementSelectorJsonSchema = {
+  type: "object",
+  properties: {
+    automationId: { type: "string" },
+    name: { type: "string" },
+    controlType: { type: "string", description: "Short name (Button), full name (ControlType.Button), or lowercase (button) - all accepted." },
+    className: { type: "string" },
+    frameworkId: { type: "string", description: "e.g. Win32, Qt, WPF, WinForm." },
+    match: { type: "string", enum: ["exact", "contains", "regex"], default: "exact" },
+    caseSensitive: { type: "boolean", default: false },
+    index: { type: "integer", minimum: 0, description: "0-based index into the match list. Required when a selector matches multiple elements." },
+    visibleOnly: { type: "boolean" },
+    enabledOnly: { type: "boolean" },
+    ancestor: { $ref: "#/$defs/uiElementSelector" },
+    path: { type: "array", items: { $ref: "#/$defs/uiElementSelector" }, description: "Hierarchical path of selectors matched from root downward." }
+  },
+  additionalProperties: false,
+  description: "At least one locator field (automationId/name/controlType/className/frameworkId/ancestor/path) is required."
+} as const;
 
 export const toolInputSchemas = {
   launch_app: {
@@ -435,6 +664,154 @@ export const toolInputSchemas = {
       timeoutMs: { type: "integer", minimum: 100, maximum: 300000, default: 30000, description: "Maximum time to wait. On timeout, the call returns found=false instead of throwing." },
       pollIntervalMs: { type: "integer", minimum: 50, maximum: 10000, default: 100, description: "Polling interval. Lower = faster response, higher CPU." }
     },
+    additionalProperties: false,
+    anyOf: atLeastOneSelectorAnyOf
+  },
+  // ── UI Automation tools ──
+  ui_inspect_tree: {
+    type: "object",
+    properties: {
+      hwnd: { ...hwndSchemaProperty },
+      pid: { type: "integer", minimum: 1 },
+      processName: { type: "string" },
+      titleContains: { type: "string" },
+      includeProcessPopups: { type: "boolean", default: true, description: "Also search top-level windows of the same PID (popups, dialogs, tool windows, Qt menus)." },
+      maxDepth: { type: "integer", minimum: 1, maximum: 30, default: 10 },
+      maxNodes: { type: "integer", minimum: 1, maximum: 5000, default: 1500 },
+      interactiveOnly: { type: "boolean", default: false, description: "Only return elements that can receive input (enabled, onscreen, non-Pane)." },
+      automationIdOnly: { type: "boolean", default: false, description: "Only return elements with a non-empty AutomationId." },
+      includePatterns: { type: "boolean", default: true },
+      includeOffscreen: { type: "boolean", default: true },
+      controlTypes: { type: "array", items: { type: "string" }, description: "Optional allow-list of control types (e.g. [\"Button\",\"Edit\"])." },
+      timeoutMs: { type: "integer", minimum: 500, maximum: 120000, default: 20000 }
+    },
+    additionalProperties: false,
+    anyOf: atLeastOneSelectorAnyOf
+  },
+  ui_query: {
+    type: "object",
+    properties: {
+      hwnd: { ...hwndSchemaProperty },
+      pid: { type: "integer", minimum: 1 },
+      processName: { type: "string" },
+      titleContains: { type: "string" },
+      selector: uiElementSelectorJsonSchema,
+      includeProcessPopups: { type: "boolean", default: true },
+      maxDepth: { type: "integer", minimum: 1, maximum: 30, default: 15 },
+      maxNodes: { type: "integer", minimum: 1, maximum: 5000, default: 2000 },
+      includePatterns: { type: "boolean", default: true },
+      maxResults: { type: "integer", minimum: 1, maximum: 100, default: 100 },
+      timeoutMs: { type: "integer", minimum: 500, maximum: 120000, default: 20000 }
+    },
+    required: ["selector"],
+    additionalProperties: false,
+    anyOf: atLeastOneSelectorAnyOf
+  },
+  ui_get: {
+    type: "object",
+    properties: {
+      hwnd: { ...hwndSchemaProperty },
+      pid: { type: "integer", minimum: 1 },
+      processName: { type: "string" },
+      titleContains: { type: "string" },
+      selector: uiElementSelectorJsonSchema,
+      includeProcessPopups: { type: "boolean", default: true },
+      maxDepth: { type: "integer", minimum: 1, maximum: 30, default: 15 },
+      maxNodes: { type: "integer", minimum: 1, maximum: 5000, default: 2000 },
+      timeoutMs: { type: "integer", minimum: 500, maximum: 120000, default: 10000 }
+    },
+    required: ["selector"],
+    additionalProperties: false,
+    anyOf: atLeastOneSelectorAnyOf
+  },
+  ui_action: {
+    type: "object",
+    properties: {
+      hwnd: { ...hwndSchemaProperty },
+      pid: { type: "integer", minimum: 1 },
+      processName: { type: "string" },
+      titleContains: { type: "string" },
+      selector: uiElementSelectorJsonSchema,
+      action: { type: "string", enum: ["invoke", "toggle", "select", "addToSelection", "removeFromSelection", "expand", "collapse", "setValue", "setRangeValue", "scrollIntoView", "focus", "legacyDefaultAction", "click"] },
+      value: { type: "string", maxLength: 4000, description: "Text for setValue." },
+      rangeValue: { type: "number", description: "Target value for setRangeValue." },
+      allowCoordinateFallback: { type: "boolean", default: false, description: "Allow coordinate-based click fallback ONLY when all UIA patterns are unavailable. Off by default." },
+      forceCoordinateClick: { type: "boolean", default: false, description: "Force a coordinate click (requires allowCoordinateFallback=true). Bypasses patterns." },
+      includeProcessPopups: { type: "boolean", default: true },
+      maxDepth: { type: "integer", minimum: 1, maximum: 30, default: 15 },
+      maxNodes: { type: "integer", minimum: 1, maximum: 5000, default: 2000 },
+      timeoutMs: { type: "integer", minimum: 500, maximum: 120000, default: 10000 }
+    },
+    required: ["selector", "action"],
+    additionalProperties: false,
+    anyOf: atLeastOneSelectorAnyOf
+  },
+  ui_wait: {
+    type: "object",
+    properties: {
+      hwnd: { ...hwndSchemaProperty },
+      pid: { type: "integer", minimum: 1 },
+      processName: { type: "string" },
+      titleContains: { type: "string" },
+      selector: uiElementSelectorJsonSchema,
+      condition: { type: "string", enum: ["exists", "notExists", "visible", "hidden", "enabled", "disabled", "valueEquals", "valueContains", "toggleStateEquals", "selected", "notSelected", "expanded", "collapsed", "countEquals"] },
+      expectedValue: { type: "string", maxLength: 4000 },
+      expectedBoolean: { type: "boolean" },
+      expectedCount: { type: "integer", minimum: 0, maximum: 100 },
+      toggleState: { type: "string", enum: ["On", "Off", "Indeterminate"] },
+      includeProcessPopups: { type: "boolean", default: true },
+      maxDepth: { type: "integer", minimum: 1, maximum: 30, default: 15 },
+      maxNodes: { type: "integer", minimum: 1, maximum: 5000, default: 2000 },
+      timeoutMs: { type: "integer", minimum: 500, maximum: 120000, default: 10000, description: "Returns matched=false on timeout (not an error)." },
+      pollIntervalMs: { type: "integer", minimum: 50, maximum: 10000, default: 200 }
+    },
+    required: ["selector", "condition"],
+    additionalProperties: false,
+    anyOf: atLeastOneSelectorAnyOf
+  },
+  profile_list: {
+    type: "object",
+    properties: {},
+    additionalProperties: false
+  },
+  profile_resolve: {
+    type: "object",
+    properties: {
+      profile: { type: "string", minLength: 1 },
+      control: { type: "string", minLength: 1 },
+      hwnd: { ...hwndSchemaProperty },
+      pid: { type: "integer", minimum: 1 },
+      processName: { type: "string" },
+      titleContains: { type: "string" },
+      includeProcessPopups: { type: "boolean", default: true },
+      maxDepth: { type: "integer", minimum: 1, maximum: 30, default: 15 },
+      maxNodes: { type: "integer", minimum: 1, maximum: 5000, default: 2000 },
+      timeoutMs: { type: "integer", minimum: 500, maximum: 120000, default: 10000 }
+    },
+    required: ["profile", "control"],
+    additionalProperties: false,
+    anyOf: atLeastOneSelectorAnyOf
+  },
+  profile_action: {
+    type: "object",
+    properties: {
+      profile: { type: "string", minLength: 1 },
+      control: { type: "string", minLength: 1 },
+      action: { type: "string", enum: ["invoke", "toggle", "select", "addToSelection", "removeFromSelection", "expand", "collapse", "setValue", "setRangeValue", "scrollIntoView", "focus", "legacyDefaultAction", "click"] },
+      value: { type: "string", maxLength: 4000 },
+      rangeValue: { type: "number" },
+      allowCoordinateFallback: { type: "boolean", default: false },
+      forceCoordinateClick: { type: "boolean", default: false },
+      hwnd: { ...hwndSchemaProperty },
+      pid: { type: "integer", minimum: 1 },
+      processName: { type: "string" },
+      titleContains: { type: "string" },
+      includeProcessPopups: { type: "boolean", default: true },
+      maxDepth: { type: "integer", minimum: 1, maximum: 30, default: 15 },
+      maxNodes: { type: "integer", minimum: 1, maximum: 5000, default: 2000 },
+      timeoutMs: { type: "integer", minimum: 500, maximum: 120000, default: 10000 }
+    },
+    required: ["profile", "control", "action"],
     additionalProperties: false,
     anyOf: atLeastOneSelectorAnyOf
   }

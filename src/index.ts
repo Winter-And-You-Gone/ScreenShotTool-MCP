@@ -15,11 +15,13 @@ import { z } from "zod";
 
 import type * as SchemasModule from "./schemas.js";
 import type * as WindowsModule from "./windows.js";
+import type * as ProfilesModule from "./profiles/registry.js";
 
 type RuntimeModules = {
   version: string;
   schemas: typeof SchemasModule;
   windows: typeof WindowsModule;
+  profiles: typeof ProfilesModule;
 };
 
 const moduleRoot = path.dirname(fileURLToPath(import.meta.url));
@@ -141,6 +143,46 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
         name: "wait_for_window",
         description: "Block until a matching window appears (mode=appear) or disappears (mode=disappear). Returns found=false on timeout instead of throwing. More efficient than client-side polling.",
         inputSchema: schemas.toolInputSchemas.wait_for_window
+      },
+      {
+        name: "ui_inspect_tree",
+        description: "Read the UI Automation (UIA) control tree of a target window. Prefer this over screenshots for understanding UI structure. Returns a flat list of nodes (nodeId/parentNodeId) with controlType, automationId, name, className, frameworkId, patterns, and boundingRect. Bounded by maxDepth (default 10), maxNodes (default 1500), and timeoutMs. includeProcessPopups (default true) also searches same-PID top-level windows (Qt popups, dialogs, menus).",
+        inputSchema: schemas.toolInputSchemas.ui_inspect_tree
+      },
+      {
+        name: "ui_query",
+        description: "Find UI elements matching a selector (automationId/name/controlType/className/frameworkId + match mode + ancestor/path). Returns up to maxResults (default 100) elements with value/toggleState/selected/expandCollapseState/rangeValue state. UIA-first: prefer this over coordinate-based click_window when a stable selector exists.",
+        inputSchema: schemas.toolInputSchemas.ui_query
+      },
+      {
+        name: "ui_get",
+        description: "Read the current state of a single uniquely-identified control (lighter than ui_query). 0 matches -> found:false; 1 match -> full state; >1 matches -> ELEMENT_AMBIGUOUS error. Does not take screenshots.",
+        inputSchema: schemas.toolInputSchemas.ui_get
+      },
+      {
+        name: "ui_action",
+        description: "Perform an action on a UI control via UIA patterns (invoke/toggle/select/expand/collapse/setValue/setRangeValue/scrollIntoView/focus/click). Pattern priority: e.g. Button -> InvokePattern; CheckBox -> TogglePattern->InvokePattern; ListItem -> SelectionItemPattern->InvokePattern; Edit -> ValuePattern. Coordinate fallback is OFF by default (allowCoordinateFallback=false) and only used as a last resort when all patterns fail - it never moves the physical mouse. forceCoordinateClick requires allowCoordinateFallback=true.",
+        inputSchema: schemas.toolInputSchemas.ui_action
+      },
+      {
+        name: "ui_wait",
+        description: "Wait for a UI state change without polling screenshots. Conditions: exists/notExists/visible/hidden/enabled/disabled/valueEquals/valueContains/toggleStateEquals/selected/notSelected/expanded/collapsed/countEquals. Returns matched=false on timeout (not an error). Runs in a separate PowerShell process so it does not block the shared worker. Default poll 200ms, default timeout 10s.",
+        inputSchema: schemas.toolInputSchemas.ui_wait
+      },
+      {
+        name: "profile_list",
+        description: "List available application profiles (logical-control mappings for known apps like VaporView).",
+        inputSchema: schemas.toolInputSchemas.profile_list
+      },
+      {
+        name: "profile_resolve",
+        description: "Resolve a logical control name (e.g. 'mainWindow') from an app profile to a concrete UI element, trying candidate selectors in order. Returns the matched element and which selector succeeded.",
+        inputSchema: schemas.toolInputSchemas.profile_resolve
+      },
+      {
+        name: "profile_action",
+        description: "Perform an action on a logical control from an app profile. Reuses ui_action internally (no pattern logic duplicated). Tries candidate selectors in order until one resolves a unique element.",
+        inputSchema: schemas.toolInputSchemas.profile_action
       }
     ]
   };
@@ -150,7 +192,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
   const { name, arguments: args } = request.params;
 
   try {
-    const { schemas, windows } = await loadRuntime();
+    const { schemas, windows, profiles } = await loadRuntime();
 
     switch (name) {
       case "launch_app":
@@ -181,12 +223,42 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         return jsonResult(await windows.getWindowState(parseArgs(schemas.getWindowStateSchema, args)));
       case "wait_for_window":
         return jsonResult(await windows.waitForWindow(parseArgs(schemas.waitForWindowSchema, args)));
+      case "ui_inspect_tree":
+        return jsonResult(await windows.inspectUiTree(parseArgs(schemas.uiInspectTreeSchema, args)));
+      case "ui_query":
+        return jsonResult(await windows.queryUi(parseArgs(schemas.uiQuerySchema, args)));
+      case "ui_get":
+        return jsonResult(await windows.getUiElement(parseArgs(schemas.uiGetSchema, args)));
+      case "ui_action":
+        return jsonResult(await windows.performUiAction(parseArgs(schemas.uiActionSchema, args)));
+      case "ui_wait":
+        return jsonResult(await windows.waitForUi(parseArgs(schemas.uiWaitSchema, args)));
+      case "profile_list":
+        return jsonResult(profiles.profileList());
+      case "profile_resolve":
+        return jsonResult(await profiles.resolveProfileControl(parseArgs(schemas.profileResolveSchema, args)));
+      case "profile_action":
+        return jsonResult(await profiles.performProfileAction(parseArgs(schemas.profileActionSchema, args)));
       default:
         throw new McpError(ErrorCode.MethodNotFound, `Unknown tool: ${name}`);
     }
   } catch (error) {
     if (error instanceof McpError) {
       throw error;
+    }
+
+    // Structured UIA / helper errors carry a machine-readable code. Surface
+    // the code + message (not the full stack trace) so MCP clients can branch.
+    if (error instanceof windows.HelperError) {
+      return {
+        isError: true,
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify({ success: false, code: error.code, message: error.message, details: error.details ?? {} }, null, 2)
+          }
+        ]
+      };
     }
 
     return {
@@ -211,8 +283,9 @@ async function loadRuntime(): Promise<RuntimeModules> {
   const suffix = hotReloadEnabled ? `?v=${encodeURIComponent(version)}` : "";
   const schemas = await import(`./schemas.js${suffix}`) as typeof SchemasModule;
   const windows = await import(`./windows.js${suffix}`) as typeof WindowsModule;
+  const profiles = await import(`./profiles/registry.js${suffix}`) as typeof ProfilesModule;
 
-  runtimeCache = { version, schemas, windows };
+  runtimeCache = { version, schemas, windows, profiles };
   if (version !== "static") {
     console.error(`screenshottool-mcp hot reload loaded runtime ${version}.`);
   }
@@ -234,6 +307,8 @@ async function runtimeVersion(): Promise<string> {
   const files = [
     path.join(moduleRoot, `schemas${sourceExt}`),
     path.join(moduleRoot, `windows${sourceExt}`),
+    path.join(moduleRoot, "profiles", `registry${sourceExt}`),
+    path.join(moduleRoot, "profiles", `vaporview${sourceExt}`),
     path.join(runtimeRoot, "scripts", "win-capture.ps1")
   ];
   const versions = await Promise.all(files.map(async (file) => `${path.basename(file)}:${await fileMtimeMs(file)}`));

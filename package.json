@@ -23,6 +23,8 @@
     "smoke:clipboard": "tsx tests/smoke-clipboard.ts",
     "smoke:window-state": "tsx tests/smoke-window-state.ts",
     "smoke:wait-for-window": "tsx tests/smoke-wait-for-window.ts",
+    "smoke:uia-notepad": "tsx tests/smoke-uia-notepad.ts",
+    "smoke:uia-vaporview": "tsx tests/smoke-uia-vaporview.ts",
     "inspect": "npx @modelcontextprotocol/inspector node dist/index.js"
   },
   "engines": {
