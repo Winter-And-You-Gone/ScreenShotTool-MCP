@@ -272,7 +272,7 @@ npm run smoke:no-activate
 | `ui_query` | 按 selector 查找控件，返回匹配元素及值/状态。 |
 | `ui_get` | 读取**唯一**控件的状态（比 ui_query 轻）。0 个=found:false，1 个=状态，多个=ELEMENT_AMBIGUOUS。 |
 | `ui_action` | 对控件执行动作（invoke/toggle/select/expand/setValue 等），优先用 UIA Pattern，坐标降级默认关闭。 |
-| `ui_wait` | 等待 UI 状态变化（exists/enabled/valueEquals 等），不截图轮询。运行在独立 PowerShell 进程，不阻塞共享 worker。 |
+| `ui_wait` | 等待 UI 状态变化（exists/enabled/valueEquals 等），不截图轮询。运行在独立 PowerShell 进程，不阻塞共享 worker。`exists` 只要有一个匹配即可；状态条件要求唯一元素（可用 `index` 消除歧义）。超时返回 `matched:false,timedOut:true`；窗口/UIA/权限错误不会被吞掉。 |
 | `profile_list` | 列出可用应用 profile（如 VaporView）。 |
 | `profile_resolve` | 按 profile + 逻辑控件名解析为真实元素。 |
 | `profile_action` | 对 profile 中的逻辑控件执行动作（内部复用 ui_action）。 |
@@ -290,10 +290,10 @@ npm run smoke:no-activate
 | `frameworkId` | exact | `Win32` / `Qt` / `WPF` / `WinForm`。 |
 | `match` | - | `exact`（默认）/ `contains` / `regex`。正则限长 256 字符。 |
 | `caseSensitive` | false | 大小写敏感。 |
-| `index` | - | 0-based。多匹配时必须提供，否则返回 ELEMENT_AMBIGUOUS。 |
+| `index` | - | 0-based。多匹配时必须提供，否则返回 ELEMENT_AMBIGUOUS；支持 `index >= 2`。 |
 | `visibleOnly` / `enabledOnly` | - | 过滤器（非定位字段）。 |
-| `ancestor` | - | 祖先 selector，约束匹配元素的层级。 |
-| `path` | - | 层级路径，从 root 逐级匹配（最多 12 级）。 |
+| `ancestor` | - | 从候选元素向父链进行有界匹配（受 `maxDepth` 限制）。 |
+| `path` | - | direct-child 层级路径，从 root 逐级匹配（最多 12 级）；不会把任意 descendant 当作下一段。 |
 
 > **不要把 `RuntimeId` 当作长期 selector**——它可能在 UI 重建后变化。`RuntimeId` 仅用于单次结果诊断。
 
@@ -387,7 +387,7 @@ npm run smoke:no-activate
 }
 ```
 
-超时返回 `matched:false`（不是错误）。`ui_wait` 运行在独立 PowerShell 进程，不会阻塞共享 worker 的其他工具调用。
+超时返回 `matched:false,timedOut:true`（不是错误）。`ui_wait` 运行在独立 PowerShell 进程，不会阻塞共享 worker 的其他工具调用。`ui_query`/`ui_get` 的零结果返回 `found:false`；`ui_action` 的零结果返回 `ELEMENT_NOT_FOUND`，多结果返回 `ELEMENT_AMBIGUOUS`。
 
 ### VaporView Profile
 
@@ -412,7 +412,7 @@ VaporView 的 profile（`vaporview`）通过源码中 `setObjectName()` 设置�
 }
 ```
 
-profile 找不到控件时会按候选 selector 顺序尝试，并返回每个候选的失败摘要。profile 层不直接调用 PowerShell，完全复用通用 UIA 层。
+profile 找不到控件时会按候选 selector 顺序尝试，并返回每个候选的失败摘要。每个控件带有 `confidence`：源码确认但尚未现场验证的是 `source-derived`；只有在匹配完整性级别下的 live smoke test 成功后才能标记 `runtime-verified`。profile 层不直接调用 PowerShell，完全复用通用 UIA 层；hot reload 时通过依赖注入复用同一个 shared worker。
 
 > **VaporView 需要管理员权限**：`VaporView.exe` 的 manifest 要求 `requireAdministrator`。非提权的 MCP server 无法读取其 UIA 树（完整性级别边界）。要让 profile 生效，**MCP server 必须以与 VaporView 相同的提权级别运行**（即以管理员身份启动）。
 
@@ -424,6 +424,9 @@ VaporView smoke test 通过环境变量获取路径，不在源码中硬编码�
 $env:VAPORVIEW_EXE = "T:\VaporView\VaporView.exe"
 # 可选启动参数
 $env:VAPORVIEW_ARGS = "--no-hardware"
+npm run smoke:uia-vaporview
+# 严格模式：任何 UIA root/profile/control/action/popup 验证失败都会退出非零
+$env:VAPORVIEW_SMOKE_STRICT = "1"
 npm run smoke:uia-vaporview
 ```
 

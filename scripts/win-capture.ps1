@@ -28,12 +28,7 @@ function Test-UiaAvailable {
 
 function Assert-UiaAvailable {
   if (-not (Test-UiaAvailable)) {
-    throw [ordered]@{
-      ok = $false
-      code = "UIA_ASSEMBLY_UNAVAILABLE"
-      message = "UIAutomationClient/Types assemblies could not be loaded in this PowerShell environment."
-      details = [ordered]@{ stage = "assembly-load" }
-    }
+    Throw-UiaError "UIA_ASSEMBLY_UNAVAILABLE" "UIAutomationClient/Types assemblies could not be loaded in this PowerShell environment." ([ordered]@{ stage = "assembly-load" })
   }
 }
 
@@ -2599,24 +2594,63 @@ function Get-UiaErrorFromRecord {
   return $null
 }
 
-# Resolve the target window using the SAME logic as the rest of the helper
-# (Resolve-TargetWindow), then return its hwnd + pid. Raises WINDOW_NOT_FOUND
-# when nothing matches and WINDOW_AMBIGUOUS when multiple match and no hwnd
-# was given (we pick the first but warn).
+# Resolve the target window for UIA. An explicit hwnd is authoritative. For
+# process/title selectors, a single non-tool window is preferred as the main
+# window; otherwise multiple candidates are an error rather than an arbitrary
+# first-window choice.
 function Resolve-UiaTargetWindow {
   param([hashtable]$Target)
 
   if ($Target.ContainsKey("hwnd") -and $null -ne $Target.hwnd) {
-    $win = Resolve-TargetWindow -Target $Target -IncludeHidden
-    return $win
+    try {
+      return Resolve-TargetWindow -Target $Target -IncludeHidden
+    } catch {
+      Throw-UiaError "WINDOW_NOT_FOUND" "No window matched the provided hwnd." ([ordered]@{ window = $Target; stage = "resolve-window" })
+    }
   }
 
-  $windows = Get-AllWindows
+  $windows = @(Get-AllWindows)
   $filtered = @(Filter-Windows $windows $Target)
   if ($filtered.Count -lt 1) {
     Throw-UiaError "WINDOW_NOT_FOUND" "No window matched the provided target." ([ordered]@{ window = $Target; stage = "resolve-window" })
   }
-  return $filtered[0]
+  if ($filtered.Count -eq 1) {
+    return $filtered[0]
+  }
+
+  $preferred = [System.Collections.ArrayList]::new()
+  foreach ($win in $filtered) {
+    $hwnd = [IntPtr]([int64]$win.hwnd)
+    $exStyle = if ([IntPtr]::Size -eq 8) {
+      [ScreenshotTool.Native]::GetWindowLong64($hwnd, -20).ToInt64()
+    } else {
+      [int64][ScreenshotTool.Native]::GetWindowLong32($hwnd, -20)
+    }
+    $isToolWindow = (($exStyle -band [int64]0x00000080) -ne 0)
+    if (-not $isToolWindow -and -not [string]::IsNullOrWhiteSpace([string]$win.title)) {
+      $preferred.Add($win) | Out-Null
+    }
+  }
+
+  if ($preferred.Count -eq 1) {
+    return $preferred[0]
+  }
+
+  $candidates = @($filtered | Select-Object -First 10 | ForEach-Object {
+    [ordered]@{
+      hwnd = [string]$_.hwnd
+      title = [string]$_.title
+      pid = [int]$_.pid
+      processName = [string]$_.processName
+      className = [string]$_.className
+    }
+  })
+  Throw-UiaError "WINDOW_AMBIGUOUS" "Multiple windows matched the provided target; specify hwnd or a more specific selector." ([ordered]@{
+    window = $Target
+    candidateCount = $filtered.Count
+    candidates = $candidates
+    stage = "resolve-window"
+  })
 }
 
 # Enumerate all top-level HWNDs belonging to the same PID as the resolved
@@ -2704,6 +2738,11 @@ function Get-UiaCurrent {
 
 # Read the full state of an element for ui_get / ui_query results. Each field
 # is independently guarded; an unsupported pattern yields null (not an error).
+#
+# SECURITY: IsPassword is read BEFORE ValuePattern.Current.Value. When the
+# element reports IsPassword=true, the value is NEVER read and is returned as
+# null with valueProtected=true. This is the single chokepoint for password
+# redaction - every state returned to the client goes through here.
 function Get-UiaElementState {
   param($Element, [bool]$IncludePatterns = $true, [bool]$IncludeValues = $true)
 
@@ -2731,20 +2770,33 @@ function Get-UiaElementState {
     }
   }
 
-  $value = $null; $isReadOnly = $null
+  # SECURITY: read IsPassword FIRST, before any value getter. A password
+  # provider may return a Value via ValuePattern, but we must never surface it.
+  $isPassword = $false
+  try { $isPassword = [bool]$Element.Current.IsPassword } catch {}
+
+  $value = $null; $isReadOnly = $null; $valueProtected = $isPassword
   $rangeValue = $null; $minimum = $null; $maximum = $null; $smallChange = $null; $largeChange = $null
   $toggleState = $null; $selected = $null; $expandState = $null
 
   if ($IncludeValues) {
-    # ValuePattern
+    # ValuePattern - ONLY read the value when this is NOT a password field.
     try {
       $vp = $null
       if ($Element.TryGetCurrentPattern($pids.Value, [ref]$vp)) {
-        $value = [string]$vp.Current.Value
+        # IsReadOnly is safe to read even for password fields.
         $isReadOnly = [bool]$vp.Current.IsReadOnly
+        if ($isPassword) {
+          # Deliberately do NOT call $vp.Current.Value. Mark as protected.
+          $value = $null
+          $valueProtected = $true
+        } else {
+          $value = [string]$vp.Current.Value
+          $valueProtected = $false
+        }
       }
     } catch {}
-    # RangeValuePattern
+    # RangeValuePattern - numeric values are not considered secret; read normally.
     try {
       $rvp = $null
       if ($Element.TryGetCurrentPattern($pids.RangeValue, [ref]$rvp)) {
@@ -2776,10 +2828,11 @@ function Get-UiaElementState {
         $expandState = [string]$ecp.Current.ExpandCollapseState
       }
     } catch {}
+  } else {
+    # Even without values, surface valueProtected so callers can tell a
+    # password field is protected without reading the value.
+    if ($isPassword) { $valueProtected = $true }
   }
-
-  $isPassword = $false
-  try { $isPassword = [bool]$Element.Current.IsPassword } catch {}
 
   $nativeHandle = ""
   try { $nativeHandle = [string]$Element.Current.NativeWindowHandle } catch {}
@@ -2798,6 +2851,7 @@ function Get-UiaElementState {
     focusable = (Get-UiaCurrent $Element "IsKeyboardFocusable")
     hasKeyboardFocus = (Get-UiaCurrent $Element "HasKeyboardFocus")
     isPassword = $isPassword
+    valueProtected = $valueProtected
     isReadOnly = $isReadOnly
     boundingRect = $rect
     runtimeId = $runtimeId
@@ -2893,109 +2947,6 @@ function Test-StringMatch {
   }
 }
 
-# Find all elements matching a selector across the given roots, with bounded
-# traversal. Returns @{ matches=@(...); visited=N; truncated=bool }.
-# When a path[] is present, matches are resolved hierarchically from each root.
-function Find-UiaElements {
-  param(
-    $Roots,
-    [hashtable]$Selector,
-    [int]$MaxDepth,
-    [int]$MaxNodes,
-    [int]$PerRootMs,
-    [int]$MaxResults = 100,
-    [bool]$IncludePatterns = $true,
-    [bool]$IncludeValues = $true,
-    [string[]]$ControlTypeFilter = $null
-  )
-
-  $walker = [System.Windows.Automation.TreeWalker]::RawViewWalker
-  $matches = [System.Collections.ArrayList]::new()
-  $visited = 0
-  $truncated = $false
-  $hasPath = $Selector.ContainsKey("path") -and $Selector.path -and @($Selector.path).Count -gt 0
-  $hasAncestor = $Selector.ContainsKey("ancestor") -and $Selector.ancestor -and (Test-SelectorHasLocator $Selector.ancestor)
-
-  foreach ($root in $Roots) {
-    if ($matches.Count -ge $MaxResults) { $truncated = $true; break }
-    $deadline = [DateTimeOffset]::UtcNow.AddMilliseconds($PerRootMs)
-    $script:walkStop = $false
-
-    if ($hasPath) {
-      # Hierarchical path resolution: find path[0] matches, then for each,
-      # search descendants for path[1], etc. The final level's matches are
-      # the result (plus ancestor/path filters from the top-level selector).
-      $pathMatches = Find-UiaByPath -Root $root.element -Path @($Selector.path) -Walker $walker -MaxDepth $MaxDepth -MaxNodes $MaxNodes -Deadline $deadline -Visited ([ref]$visited)
-      foreach ($m in $pathMatches) {
-        if ($matches.Count -ge $MaxResults) { $truncated = $true; break }
-        $state = Get-UiaElementState -Element $m -IncludePatterns $IncludePatterns -IncludeValues $IncludeValues
-        $matches.Add($state) | Out-Null
-      }
-      continue
-    }
-
-    # Standard walk. The ancestor filter is applied by tracking depth + parent.
-    & {
-      param($RootEl, $RootInfo)
-      # Use an explicit stack to avoid recursion limits and to allow per-node
-      # deadline checks.
-      $stack = [System.Collections.Stack]::new()
-      $stack.Push([pscustomobject]@{ Element = $RootEl; Depth = 0; Parent = $null })
-      while ($stack.Count -gt 0) {
-        if ($script:walkStop) { break }
-        if ($visited -ge $MaxNodes) { $truncated = $true; break }
-        if ([DateTimeOffset]::UtcNow -gt $deadline) { $script:walkStop = $true; $truncated = $true; break }
-        if ($matches.Count -ge $MaxResults) { $truncated = $true; break }
-
-        $node = $stack.Pop()
-        $visited++
-        $el = $node.Element
-
-        $isMatch = $false
-        try { $isMatch = Test-UiaElementMatches -Element $el -Selector $Selector } catch { $isMatch = $false }
-
-        if ($isMatch) {
-          # Ancestor check: if ancestor selector present, verify some ancestor
-          # in the chain matches it.
-          $ancestorOk = $true
-          if ($hasAncestor) {
-            $ancestorOk = $false
-            $p = $node.Parent
-            while ($null -ne $p) {
-              try { if (Test-UiaElementMatches -Element $p.Element -Selector $Selector.ancestor) { $ancestorOk = $true; break } } catch {}
-              $p = $p.Parent
-            }
-          }
-          if ($ancestorOk) {
-            $state = Get-UiaElementState -Element $el -IncludePatterns $IncludePatterns -IncludeValues $IncludeValues
-            $matches.Add($state) | Out-Null
-          }
-        }
-
-        if ($node.Depth -ge $MaxDepth) { continue }
-
-        # Push children in reverse so they pop in order. Cap children per node
-        # to avoid pathological sibling counts.
-        $child = $null
-        try { $child = $walker.GetFirstChild($el) } catch { $child = $null }
-        $childCount = 0
-        $childBuffer = [System.Collections.ArrayList]::new()
-        while ($null -ne $child) {
-          if ($childCount -ge 500) { break }
-          $childBuffer.Insert(0, $child) | Out-Null
-          $childCount++
-          try { $child = $walker.GetNextSibling($child) } catch { $child = $null }
-        }
-        foreach ($c in $childBuffer) {
-          $stack.Push([pscustomobject]@{ Element = $c; Depth = ($node.Depth + 1); Parent = $node })
-        }
-      }
-    } $root.element $root
-  }
-
-  return [ordered]@{ matches = @($matches.ToArray()); visited = $visited; truncated = $truncated }
-}
-
 function Test-SelectorHasLocator {
   param([hashtable]$Selector)
   if ($null -eq $Selector) { return $false }
@@ -3007,44 +2958,179 @@ function Test-SelectorHasLocator {
   return $false
 }
 
-# Hierarchical path resolution. Returns the final-level matches.
-function Find-UiaByPath {
-  param($Root, $Path, $Walker, [int]$MaxDepth, [int]$MaxNodes, $Deadline, $Visited)
-  $current = @($Root)
-  for ($i = 0; $i -lt $Path.Count; $i++) {
-    $seg = [hashtable]$Path[$i]
+function Get-UiaChildren {
+  param($Element, $Walker)
+
+  $children = [System.Collections.ArrayList]::new()
+  $child = $null
+  try { $child = $Walker.GetFirstChild($Element) } catch { $child = $null }
+  $count = 0
+  while ($null -ne $child -and $count -lt 500) {
+    $children.Add($child) | Out-Null
+    $count++
+    try { $child = $Walker.GetNextSibling($child) } catch { $child = $null }
+  }
+  return @($children.ToArray())
+}
+
+function Test-UiaAncestorChain {
+  param($Element, [hashtable]$AncestorSelector, $Walker, [int]$MaxDepth)
+
+  if ($null -eq $AncestorSelector) { return $true }
+  $parent = $null
+  try { $parent = $Walker.GetParent($Element) } catch { $parent = $null }
+  $depth = 0
+  while ($null -ne $parent -and $depth -lt $MaxDepth) {
+    try {
+      if (Test-UiaElementMatches -Element $parent -Selector $AncestorSelector) { return $true }
+    } catch {}
+    $depth++
+    try { $parent = $Walker.GetParent($parent) } catch { $parent = $null }
+  }
+  return $false
+}
+
+function Find-UiaPathRecords {
+  param($RootInfo, $Path, $Walker, [int]$MaxDepth, [int]$MaxNodes, $Deadline, $Visited)
+
+  $current = @([pscustomobject]@{
+    Element = $RootInfo.element
+    Root = $RootInfo
+    Parent = $null
+    Depth = 0
+  })
+  $truncated = $false
+
+  foreach ($segmentValue in @($Path)) {
+    if ($current.Count -eq 0) { break }
+    $segment = [hashtable]$segmentValue
     $next = [System.Collections.ArrayList]::new()
-    foreach ($parent in $current) {
-      if ($script:walkStop) { break }
-      # Search descendants of $parent up to MaxDepth for $seg matches.
-      $stack = [System.Collections.Stack]::new()
-      $stack.Push([pscustomobject]@{ Element = $parent; Depth = 0 })
-      while ($stack.Count -gt 0) {
-        if ($script:walkStop) { break }
-        if ($Visited.Value -ge $MaxNodes) { $script:walkStop = $true; break }
-        if ([DateTimeOffset]::UtcNow -gt $Deadline) { $script:walkStop = $true; break }
-        $node = $stack.Pop()
+    foreach ($parentRecord in $current) {
+      if ([DateTimeOffset]::UtcNow -gt $Deadline -or $Visited.Value -ge $MaxNodes) {
+        $truncated = $true
+        break
+      }
+      if ($parentRecord.Depth -ge $MaxDepth) { continue }
+      foreach ($child in Get-UiaChildren -Element $parentRecord.Element -Walker $Walker) {
+        if ([DateTimeOffset]::UtcNow -gt $Deadline -or $Visited.Value -ge $MaxNodes) {
+          $truncated = $true
+          break
+        }
         $Visited.Value++
         $isMatch = $false
-        try { $isMatch = Test-UiaElementMatches -Element $node.Element -Selector $seg } catch {}
-        if ($isMatch) { $next.Add($node.Element) | Out-Null }
-        if ($node.Depth -ge $MaxDepth) { continue }
-        $child = $null
-        try { $child = $Walker.GetFirstChild($node.Element) } catch {}
-        $buf = [System.Collections.ArrayList]::new()
-        $cc = 0
-        while ($null -ne $child -and $cc -lt 500) {
-          $buf.Insert(0, $child) | Out-Null
-          $cc++
-          try { $child = $Walker.GetNextSibling($child) } catch { $child = $null }
+        try { $isMatch = Test-UiaElementMatches -Element $child -Selector $segment } catch { $isMatch = $false }
+        if ($isMatch) {
+          $next.Add([pscustomobject]@{
+            Element = $child
+            Root = $RootInfo
+            Parent = $parentRecord
+            Depth = ($parentRecord.Depth + 1)
+          }) | Out-Null
         }
-        foreach ($c in $buf) { $stack.Push([pscustomobject]@{ Element = $c; Depth = ($node.Depth + 1) }) }
       }
+      if ($truncated) { break }
     }
     $current = @($next.ToArray())
-    if ($current.Count -eq 0) { break }
+    if ($truncated) { break }
   }
-  return $current
+  return [pscustomobject]@{
+    records = @($current)
+    truncated = [bool]$truncated
+  }
+}
+
+function Resolve-UiaRecordsFromRoots {
+  param(
+    $Roots,
+    [hashtable]$Selector,
+    [int]$MaxDepth,
+    [int]$MaxNodes,
+    [int]$PerRootMs,
+    [int]$MaxResults,
+    [bool]$IncludePatterns,
+    [bool]$IncludeValues
+  )
+
+  $walker = [System.Windows.Automation.TreeWalker]::RawViewWalker
+  $records = [System.Collections.ArrayList]::new()
+  $visited = 0
+  $truncated = $false
+  $hasPath = $Selector.ContainsKey("path") -and $Selector.path -and @($Selector.path).Count -gt 0
+  $ancestorSelector = $null
+  if ($Selector.ContainsKey("ancestor") -and $Selector.ancestor -and (Test-SelectorHasLocator $Selector.ancestor)) {
+    $ancestorSelector = [hashtable]$Selector.ancestor
+  }
+
+  foreach ($root in $Roots) {
+    if ($records.Count -ge $MaxResults) { $truncated = $true; break }
+    if ($visited -ge $MaxNodes) { $truncated = $true; break }
+    $deadline = [DateTimeOffset]::UtcNow.AddMilliseconds($PerRootMs)
+
+    if ($hasPath) {
+      $pathResult = Find-UiaPathRecords -RootInfo $root -Path @($Selector.path) -Walker $walker -MaxDepth $MaxDepth -MaxNodes $MaxNodes -Deadline $deadline -Visited ([ref]$visited)
+      if ($pathResult.truncated) { $truncated = $true }
+      foreach ($record in @($pathResult.records)) {
+        if ($records.Count -ge $MaxResults) { $truncated = $true; break }
+        $finalMatch = $false
+        try { $finalMatch = Test-UiaElementMatches -Element $record.Element -Selector $Selector } catch { $finalMatch = $false }
+        if (-not $finalMatch) { continue }
+        if ($null -ne $ancestorSelector -and -not (Test-UiaAncestorChain -Element $record.Element -AncestorSelector $ancestorSelector -Walker $walker -MaxDepth $MaxDepth)) { continue }
+        $records.Add([pscustomobject]@{
+          Element = $record.Element
+          Root = $root
+          State = (Get-UiaElementState -Element $record.Element -IncludePatterns $IncludePatterns -IncludeValues $IncludeValues)
+          Depth = $record.Depth
+          Parent = $record.Parent
+        }) | Out-Null
+      }
+      continue
+    }
+
+    $stack = [System.Collections.Stack]::new()
+    $stack.Push([pscustomobject]@{
+      Element = $root.element
+      Root = $root
+      Parent = $null
+      Depth = 0
+    })
+
+    while ($stack.Count -gt 0) {
+      if ([DateTimeOffset]::UtcNow -gt $deadline) { $truncated = $true; break }
+      if ($visited -ge $MaxNodes) { $truncated = $true; break }
+      if ($records.Count -ge $MaxResults) { $truncated = $true; break }
+
+      $node = $stack.Pop()
+      $visited++
+      $isMatch = $false
+      try { $isMatch = Test-UiaElementMatches -Element $node.Element -Selector $Selector } catch { $isMatch = $false }
+      if ($isMatch -and ($null -eq $ancestorSelector -or (Test-UiaAncestorChain -Element $node.Element -AncestorSelector $ancestorSelector -Walker $walker -MaxDepth $MaxDepth))) {
+        $records.Add([pscustomobject]@{
+          Element = $node.Element
+          Root = $root
+          State = (Get-UiaElementState -Element $node.Element -IncludePatterns $IncludePatterns -IncludeValues $IncludeValues)
+          Depth = $node.Depth
+          Parent = $node.Parent
+        }) | Out-Null
+      }
+
+      if ($node.Depth -ge $MaxDepth) { continue }
+      $children = @(Get-UiaChildren -Element $node.Element -Walker $walker)
+      for ($i = $children.Count - 1; $i -ge 0; $i--) {
+        $stack.Push([pscustomobject]@{
+          Element = $children[$i]
+          Root = $root
+          Parent = $node
+          Depth = ($node.Depth + 1)
+        })
+      }
+    }
+  }
+
+  return [ordered]@{
+    records = @($records.ToArray())
+    visited = $visited
+    truncated = [bool]$truncated
+  }
 }
 
 # ── ui_inspect_tree ──
@@ -3206,40 +3292,58 @@ function Resolve-UiaSelector {
   $maxDepth = 15
   if ($Target.ContainsKey("maxDepth")) { $maxDepth = [int]$Target.maxDepth }
   $maxNodes = 2000
-  if ($Target.ContainsKey("maxNodes")) { $maxNodes = [int]$maxNodes }
+  if ($Target.ContainsKey("maxNodes") -and $null -ne $Target.maxNodes) { $maxNodes = [int]$Target.maxNodes }
   $timeoutMs = 15000
-  if ($Target.ContainsKey("timeoutMs")) { $timeoutMs = [int]$Target.timeoutMs }
+  if ($Target.ContainsKey("timeoutMs") -and $null -ne $Target.timeoutMs) { $timeoutMs = [int]$Target.timeoutMs }
   $includePatterns = $true
-  if ($Target.ContainsKey("includePatterns")) { $includePatterns = [bool]$Target.includePatterns }
+  if ($Target.ContainsKey("includePatterns") -and $null -ne $Target.includePatterns) { $includePatterns = [bool]$Target.includePatterns }
   $maxResults = 100
-  if ($Target.ContainsKey("maxResults")) { $maxResults = [int]$Target.maxResults }
-  if ($Single) { $maxResults = 2 } # fetch up to 2 to detect ambiguity
+  if ($Target.ContainsKey("maxResults") -and $null -ne $Target.maxResults) { $maxResults = [int]$Target.maxResults }
+
+  $selector = [hashtable]$Target.selector
+  $index = $null
+  if ($selector.ContainsKey("index") -and $null -ne $selector.index) { $index = [int]$selector.index }
+  if ($Single -and $null -eq $index) {
+    $maxResults = 2
+  } elseif ($null -ne $index) {
+    $maxResults = [Math]::Max(2, $index + 1)
+  }
+  $maxResults = [Math]::Min([Math]::Max(1, $maxResults), [Math]::Max(1, $maxNodes))
 
   $windowSel = @{}
   foreach ($k in @('hwnd','pid','processName','titleContains')) { if ($Target.ContainsKey($k) -and $null -ne $Target.$k) { $windowSel[$k] = $Target.$k } }
   $roots = Get-UiaRoots -Target $windowSel -IncludeProcessPopups:$includePopups
 
   $perRootMs = [Math]::Max(500, [int]($timeoutMs / ([Math]::Max(1, $roots.Count))))
-  $result = Find-UiaElements -Roots $roots -Selector $Target.selector -MaxDepth $maxDepth -MaxNodes $maxNodes -PerRootMs $perRootMs -MaxResults $maxResults -IncludePatterns $includePatterns -IncludeValues $IncludeValues
+  $result = Resolve-UiaRecordsFromRoots -Roots $roots -Selector $selector -MaxDepth $maxDepth -MaxNodes $maxNodes -PerRootMs $perRootMs -MaxResults $maxResults -IncludePatterns $includePatterns -IncludeValues $IncludeValues
+  $records = @($result.records)
 
-  $matches = @($result.matches)
-  if ($matches.Count -eq 0) {
-    Throw-UiaError "ELEMENT_NOT_FOUND" "No element matched the selector." ([ordered]@{ selector = $Target.selector; stage = "query"; visitedNodes = $result.visited })
-  }
-  if ($Single -and $matches.Count -gt 1) {
-    Throw-UiaError "ELEMENT_AMBIGUOUS" "Selector matched $($matches.Count) elements; provide an index or a more specific selector." ([ordered]@{ selector = $Target.selector; candidateCount = $matches.Count; candidates = @($matches | Select-Object -First 10 | ForEach-Object { [ordered]@{ automationId=$_.automationId; name=$_.name; controlType=$_.controlType; className=$_.className; frameworkId=$_.frameworkId; boundingRect=$_.boundingRect; runtimeId=$_.runtimeId } }) })
-  }
-
-  # Apply index selector if present (0-based).
-  $index = $null
-  if ($Target.selector.ContainsKey("index") -and $null -ne $Target.selector.index) { $index = [int]$Target.selector.index }
   if ($null -ne $index) {
-    if ($index -ge $matches.Count) {
-      Throw-UiaError "ELEMENT_NOT_FOUND" "Selector index $index is out of range (matched $($matches.Count) elements)." ([ordered]@{ selector = $Target.selector; stage = "index" })
+    if ($index -ge $records.Count) {
+      return [ordered]@{ records = @(); visited = $result.visited; truncated = [bool]$result.truncated; indexOutOfRange = $true }
     }
-    $matches = @($matches[$index])
+    $records = @($records[$index])
   }
-  return [ordered]@{ matches = $matches; visited = $result.visited; truncated = $result.truncated }
+
+  if ($Single -and $null -eq $index -and $records.Count -gt 1) {
+    $candidates = @($records | Select-Object -First 10 | ForEach-Object {
+      $candidate = $_.State
+      [ordered]@{
+        automationId = $candidate.automationId
+        name = $candidate.name
+        controlType = $candidate.controlType
+        className = $candidate.className
+        frameworkId = $candidate.frameworkId
+        boundingRect = $candidate.boundingRect
+        runtimeId = $candidate.runtimeId
+        isPassword = $candidate.isPassword
+        valueProtected = $candidate.valueProtected
+      }
+    })
+    Throw-UiaError "ELEMENT_AMBIGUOUS" "Selector matched $($records.Count) elements; provide an index or a more specific selector." ([ordered]@{ selector = $selector; candidateCount = $records.Count; candidates = $candidates; stage = "resolve-element" })
+  }
+
+  return [ordered]@{ records = $records; visited = $result.visited; truncated = [bool]$result.truncated; indexOutOfRange = [bool]$false }
 }
 
 function Invoke-UiQuery {
@@ -3248,9 +3352,9 @@ function Invoke-UiQuery {
   $res = Resolve-UiaSelector -Target $Target -Single $false -IncludeValues $true
   $elapsed = [int]([DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() - $start)
   return [ordered]@{
-    found = $true
-    count = $res.matches.Count
-    elements = @($res.matches)
+    found = ($res.records.Count -gt 0)
+    count = $res.records.Count
+    elements = @($res.records | ForEach-Object { $_.State })
     truncated = [bool]$res.truncated
     visitedNodes = [int]$res.visited
     elapsedMs = $elapsed
@@ -3262,10 +3366,10 @@ function Invoke-UiGet {
   $start = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
   $res = Resolve-UiaSelector -Target $Target -Single $true -IncludeValues $true
   $elapsed = [int]([DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() - $start)
-  if ($res.matches.Count -eq 0) {
+  if ($res.records.Count -eq 0) {
     return [ordered]@{ found = $false; element = $null; elapsedMs = $elapsed }
   }
-  return [ordered]@{ found = $true; element = $res.matches[0]; elapsedMs = $elapsed }
+  return [ordered]@{ found = $true; element = $res.records[0].State; elapsedMs = $elapsed }
 }
 
 # ── ui_action ──
@@ -3281,23 +3385,14 @@ function Invoke-UiAction {
 
   $start = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
 
-  # Re-resolve the element fresh (never reuse a cached AutomationElement).
   $res = Resolve-UiaSelector -Target $Target -Single $true -IncludeValues $true
-  if ($res.matches.Count -eq 0) {
+  if ($res.records.Count -eq 0) {
     Throw-UiaError "ELEMENT_NOT_FOUND" "No element matched the selector for action '$action'." ([ordered]@{ selector = $Target.selector; stage = "action-resolve" })
   }
-  $stateBefore = $res.matches[0]
-  $windowSel = @{}
-  foreach ($k in @('hwnd','pid','processName','titleContains')) { if ($Target.ContainsKey($k) -and $null -ne $Target.$k) { $windowSel[$k] = $Target.$k } }
-  $mainWin = Resolve-UiaTargetWindow -Target $windowSel
-  $targetHwnd = [IntPtr]([int64]$mainWin.hwnd)
-
-  # Re-fetch the live AutomationElement by re-running the selector query but
-  # returning the element rather than its serialized state.
-  $live = Resolve-UiaLiveElement -Target $Target
-  if ($null -eq $live) {
-    Throw-UiaError "ELEMENT_NOT_AVAILABLE" "Element was no longer available when the action ran." ([ordered]@{ selector = $Target.selector; stage = "action-live" })
-  }
+  $record = $res.records[0]
+  $stateBefore = $record.State
+  $live = $record.Element
+  $targetHwnd = [IntPtr]([int64]$record.Root.hwnd)
 
   $method = ""
   $fallbackUsed = $false
@@ -3357,11 +3452,12 @@ function Invoke-UiAction {
     }
   }
 
-  # Read post-state for diff (best-effort).
+  # Read post-state for diff (best-effort). Resolve through the same bounded
+  # selector path; failures do not hide a successful action.
   $stateAfter = $null
   try {
-    $liveAfter = Resolve-UiaLiveElement -Target $Target
-    if ($liveAfter) { $stateAfter = Get-UiaElementState -Element $liveAfter -IncludePatterns $false -IncludeValues $true }
+    $after = Resolve-UiaSelector -Target $Target -Single $true -IncludeValues $true
+    if ($after.records.Count -gt 0) { $stateAfter = $after.records[0].State }
   } catch {}
 
   $elapsed = [int]([DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() - $start)
@@ -3472,77 +3568,6 @@ function Invoke-CoordinateClick {
   return $true
 }
 
-# Re-resolve a live AutomationElement for action execution. Same selector,
-# fresh traversal. Returns the element (not its serialized state).
-function Resolve-UiaLiveElement {
-  param([hashtable]$Target)
-
-  $windowSel = @{}
-  foreach ($k in @('hwnd','pid','processName','titleContains')) { if ($Target.ContainsKey($k) -and $null -ne $Target.$k) { $windowSel[$k] = $Target.$k } }
-  $includePopups = $true
-  if ($Target.ContainsKey("includeProcessPopups") -and $null -ne $Target.includeProcessPopups) { $includePopups = [bool]$Target.includeProcessPopups }
-  $maxDepth = 15
-  if ($Target.ContainsKey("maxDepth")) { $maxDepth = [int]$Target.maxDepth }
-  $maxNodes = 2000
-  if ($Target.ContainsKey("maxNodes")) { $maxNodes = [int]$Target.maxNodes }
-  $timeoutMs = 15000
-  if ($Target.ContainsKey("timeoutMs")) { $timeoutMs = [int]$Target.timeoutMs }
-  $roots = Get-UiaRoots -Target $windowSel -IncludeProcessPopups:$includePopups
-  $perRootMs = [Math]::Max(500, [int]($timeoutMs / ([Math]::Max(1, $roots.Count))))
-
-  $walker = [System.Windows.Automation.TreeWalker]::RawViewWalker
-  $selector = $Target.selector
-  $hasPath = $selector.ContainsKey("path") -and $selector.path -and @($selector.path).Count -gt 0
-  $hasAncestor = $selector.ContainsKey("ancestor") -and $selector.ancestor -and (Test-SelectorHasLocator $selector.ancestor)
-
-  foreach ($root in $roots) {
-    $deadline = [DateTimeOffset]::UtcNow.AddMilliseconds($perRootMs)
-    $script:walkStop = $false
-    $stack = [System.Collections.Stack]::new()
-    $stack.Push([pscustomobject]@{ Element = $root.element; Depth = 0; Parent = $null; Matched = $false })
-    $found = $null
-    $matchCount = 0
-    $index = $null
-    if ($selector.ContainsKey("index") -and $null -ne $selector.index) { $index = [int]$selector.index }
-    $visited = 0
-
-    while ($stack.Count -gt 0) {
-      if ($script:walkStop) { break }
-      if ($visited -ge $maxNodes) { break }
-      if ([DateTimeOffset]::UtcNow -gt $deadline) { $script:walkStop = $true; break }
-      $node = $stack.Pop()
-      $visited++
-      $isMatch = $false
-      try { $isMatch = Test-UiaElementMatches -Element $node.Element -Selector $selector } catch {}
-      if ($isMatch) {
-        $ancOk = $true
-        if ($hasAncestor) {
-          $ancOk = $false
-          $p = $node.Parent
-          while ($null -ne $p) {
-            try { if (Test-UiaElementMatches -Element $p.Element -Selector $selector.ancestor) { $ancOk = $true; break } } catch {}
-            $p = $p.Parent
-          }
-        }
-        if ($ancOk) {
-          if ($null -eq $index -and $matchCount -eq 0) { $found = $node.Element; break }
-          if ($null -ne $index -and $matchCount -eq $index) { $found = $node.Element; break }
-          $matchCount++
-        }
-      }
-      if ($node.Depth -ge $maxDepth) { continue }
-      $child = $null
-      try { $child = $walker.GetFirstChild($node.Element) } catch {}
-      $buf = [System.Collections.ArrayList]::new()
-      $cc = 0
-      while ($null -ne $child -and $cc -lt 500) { $buf.Insert(0, $child) | Out-Null; $cc++; try { $child = $walker.GetNextSibling($child) } catch { $child = $null } }
-      foreach ($c in $buf) { $stack.Push([pscustomobject]@{ Element = $c; Depth = ($node.Depth + 1); Parent = $node }) }
-    }
-    if ($null -ne $found) { return $found }
-  }
-  return $null
-}
-
 # ── ui_wait ──
 function Invoke-UiWait {
   param([hashtable]$Target)
@@ -3550,9 +3575,9 @@ function Invoke-UiWait {
   Assert-UiaAvailable
   $condition = [string]$Target.condition
   $timeoutMs = 10000
-  if ($Target.ContainsKey("timeoutMs")) { $timeoutMs = [int]$Target.timeoutMs }
+  if ($Target.ContainsKey("timeoutMs") -and $null -ne $Target.timeoutMs) { $timeoutMs = [int]$Target.timeoutMs }
   $pollMs = 200
-  if ($Target.ContainsKey("pollIntervalMs")) { $pollMs = [int]$Target.pollIntervalMs }
+  if ($Target.ContainsKey("pollIntervalMs") -and $null -ne $Target.pollIntervalMs) { $pollMs = [int]$Target.pollIntervalMs }
   if ($pollMs -lt 50) { $pollMs = 50 }
   $expectedValue = $null
   if ($Target.ContainsKey("expectedValue") -and $null -ne $Target.expectedValue) { $expectedValue = [string]$Target.expectedValue }
@@ -3569,61 +3594,83 @@ function Invoke-UiWait {
     $now = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
     $elapsed = [int]($now - $start)
 
-    # notExists / countEquals query the count without requiring a single match.
-    if ($condition -eq "notExists" -or $condition -eq "countEquals") {
-      try {
+    try {
+      if ($condition -eq "notExists" -or $condition -eq "exists" -or $condition -eq "countEquals") {
+        # These conditions are defined by the number of matches, so an ambiguous
+        # selector is not an error. Environment/UIA errors still propagate.
         $res = Resolve-UiaSelector -Target $Target -Single $false -IncludeValues $true
-        $count = $res.matches.Count
-      } catch {
-        $count = 0
-      }
-      $lastObs = [ordered]@{ count = $count }
-      $matched = $false
-      if ($condition -eq "notExists" -and $count -eq 0) { $matched = $true }
-      if ($condition -eq "countEquals" -and $null -ne $expectedCount -and $count -eq $expectedCount) { $matched = $true }
-      if ($matched) {
-        return [ordered]@{ matched = $true; condition = $condition; lastObservation = $lastObs; elapsedMs = $elapsed; timeoutMs = $timeoutMs; pollIntervalMs = $pollMs }
-      }
-    } else {
-      # exists/visible/hidden/enabled/disabled/value*/toggle*/selected*/expand* need a single element.
-      $state = $null
-      try {
-        $res = Resolve-UiaSelector -Target $Target -Single $true -IncludeValues $true
-        if ($res.matches.Count -gt 0) { $state = $res.matches[0] }
-      } catch {
-        $state = $null
-      }
-      $lastObs = $state
-      $matched = $false
-      if ($null -ne $state) {
-        switch ($condition) {
-          "exists" { $matched = $true }
-          "visible" { $matched = -not [bool]$state.offscreen }
-          "hidden" { $matched = [bool]$state.offscreen }
-          "enabled" { $matched = [bool]$state.enabled }
-          "disabled" { $matched = -not [bool]$state.enabled }
-          "valueEquals" { $matched = ($null -ne $state.value -and [string]$state.value -eq [string]$expectedValue) }
-          "valueContains" { $matched = ($null -ne $state.value -and ([string]$state.value).IndexOf([string]$expectedValue, [System.StringComparison]::Ordinal) -ge 0) }
-          "toggleStateEquals" { $matched = ($null -ne $state.toggleState -and [string]$state.toggleState -eq [string]$toggleExpected) }
-          "selected" { $matched = ($null -ne $state.selected -and [bool]$state.selected) }
-          "notSelected" { $matched = ($null -ne $state.selected -and -not [bool]$state.selected) }
-          "expanded" { $matched = ($null -ne $state.expandCollapseState -and [string]$state.expandCollapseState -eq "Expanded") }
-          "collapsed" { $matched = ($null -ne $state.expandCollapseState -and [string]$state.expandCollapseState -eq "Collapsed") }
+        $count = @($res.records).Count
+        $lastObs = [ordered]@{ count = $count }
+        $matched = $false
+        if ($condition -eq "exists" -and $count -gt 0) { $matched = $true }
+        if ($condition -eq "notExists" -and $count -eq 0 -and -not [bool]$res.truncated) { $matched = $true }
+        if ($condition -eq "countEquals" -and $null -ne $expectedCount -and $count -eq $expectedCount -and -not [bool]$res.truncated) { $matched = $true }
+        if ($matched) {
+          $completedAt = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
+          return [ordered]@{
+            matched = $true
+            condition = $condition
+            lastObservation = $lastObs
+            elapsedMs = [int]($completedAt - $start)
+            timeoutMs = $timeoutMs
+            pollIntervalMs = $pollMs
+            timedOut = $false
+          }
         }
       } else {
-        # Element absent: only "exists" is definitively false here; other
-        # conditions remain unmatched.
-        if ($condition -eq "exists") { $matched = $false }
+        # State conditions require one element. A missing element is a normal
+        # non-match; ambiguity and environment failures propagate to the caller.
+        $res = Resolve-UiaSelector -Target $Target -Single $true -IncludeValues $true
+        $state = $null
+        if (@($res.records).Count -gt 0) { $state = $res.records[0].State }
+        $lastObs = $state
+        $matched = $false
+        if ($null -ne $state) {
+          switch ($condition) {
+            "visible" { $matched = -not [bool]$state.offscreen }
+            "hidden" { $matched = [bool]$state.offscreen }
+            "enabled" { $matched = [bool]$state.enabled }
+            "disabled" { $matched = -not [bool]$state.enabled }
+            "valueEquals" { $matched = ($null -ne $state.value -and [string]$state.value -eq [string]$expectedValue) }
+            "valueContains" { $matched = ($null -ne $state.value -and ([string]$state.value).IndexOf([string]$expectedValue, [System.StringComparison]::Ordinal) -ge 0) }
+            "toggleStateEquals" { $matched = ($null -ne $state.toggleState -and [string]$state.toggleState -eq [string]$toggleExpected) }
+            "selected" { $matched = ($null -ne $state.selected -and [bool]$state.selected) }
+            "notSelected" { $matched = ($null -ne $state.selected -and -not [bool]$state.selected) }
+            "expanded" { $matched = ($null -ne $state.expandCollapseState -and [string]$state.expandCollapseState -eq "Expanded") }
+            "collapsed" { $matched = ($null -ne $state.expandCollapseState -and [string]$state.expandCollapseState -eq "Collapsed") }
+          }
+        }
+        if ($matched) {
+          $completedAt = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
+          return [ordered]@{
+            matched = $true
+            condition = $condition
+            lastObservation = $state
+            elapsedMs = [int]($completedAt - $start)
+            timeoutMs = $timeoutMs
+            pollIntervalMs = $pollMs
+            timedOut = $false
+          }
+        }
       }
-      if ($matched) {
-        return [ordered]@{ matched = $true; condition = $condition; lastObservation = $state; elapsedMs = $elapsed; timeoutMs = $timeoutMs; pollIntervalMs = $pollMs }
-      }
+    } catch {
+      throw
     }
 
+    $now = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
     if ($now -ge $deadline) {
-      return [ordered]@{ matched = $false; condition = $condition; lastObservation = $lastObs; elapsedMs = $elapsed; timeoutMs = $timeoutMs; pollIntervalMs = $pollMs }
+      return [ordered]@{
+        matched = $false
+        condition = $condition
+        lastObservation = $lastObs
+        elapsedMs = [int]($now - $start)
+        timeoutMs = $timeoutMs
+        pollIntervalMs = $pollMs
+        timedOut = $true
+      }
     }
-    Start-Sleep -Milliseconds $pollMs
+    $remaining = [int]($deadline - $now)
+    Start-Sleep -Milliseconds ([Math]::Min($pollMs, [Math]::Max(1, $remaining)))
   }
 }
 

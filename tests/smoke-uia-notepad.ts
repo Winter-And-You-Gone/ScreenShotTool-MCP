@@ -101,6 +101,99 @@ try {
   assert.equal(typeof tree.elapsedMs, "number");
   console.log(`inspect_tree: ${tree.nodes.length} nodes, ${tree.roots.length} roots, ${tree.elapsedMs}ms`);
 
+  // 1b. Zero-result contracts: query/get return found:false, action throws ELEMENT_NOT_FOUND.
+  const missingQuery = await queryUi({
+    pid,
+    selector: { automationId: `missing-control-${Date.now()}` },
+    timeoutMs: 5000
+  });
+  assert.equal(missingQuery.found, false);
+  assert.equal(missingQuery.count, 0);
+  assert.deepEqual(missingQuery.elements, []);
+  console.log("query zero-result: found=false");
+
+  const missingGet = await getUiElement({
+    pid,
+    selector: { automationId: `missing-control-${Date.now()}` },
+    timeoutMs: 5000
+  });
+  assert.equal(missingGet.found, false);
+  assert.equal(missingGet.element, null);
+  console.log("get zero-result: found=false");
+
+  await assert.rejects(
+    () => performUiAction({
+      pid,
+      selector: { automationId: `missing-control-${Date.now()}` },
+      action: "invoke",
+      allowCoordinateFallback: false,
+      timeoutMs: 5000
+    }),
+    (error: unknown) => {
+      assert.ok(error instanceof HelperError);
+      assert.equal(error.code, "ELEMENT_NOT_FOUND");
+      return true;
+    }
+  );
+  console.log("action zero-result: ELEMENT_NOT_FOUND");
+
+  // 1c. Ambiguity: bare controlType Button usually matches multiple title-bar buttons.
+  // ui_get must refuse multi-match without index; ui_query may return many.
+  const buttons = await queryUi({
+    pid,
+    selector: { controlType: "Button" },
+    maxResults: 20,
+    timeoutMs: 10000
+  });
+  console.log(`button query count=${buttons.count}`);
+  if (buttons.count >= 2) {
+    await assert.rejects(
+      () => getUiElement({
+        pid,
+        selector: { controlType: "Button" },
+        timeoutMs: 10000
+      }),
+      (error: unknown) => {
+        assert.ok(error instanceof HelperError);
+        assert.equal(error.code, "ELEMENT_AMBIGUOUS");
+        return true;
+      }
+    );
+    const indexed = await getUiElement({
+      pid,
+      selector: { controlType: "Button", index: 1 },
+      timeoutMs: 10000
+    });
+    assert.equal(indexed.found, true);
+    console.log("ambiguity + index>=1: ELEMENT_AMBIGUOUS then indexed get succeeds");
+  } else {
+    console.log("DIAGNOSTIC: fewer than 2 Button controls; skipping ambiguity/index live check");
+  }
+
+  // 1d. ui_wait exists should match even when multiple Window roots exist; timedOut false.
+  const existsWait = await waitForUi({
+    pid,
+    selector: { controlType: "Window" },
+    condition: "exists",
+    timeoutMs: 2000,
+    pollIntervalMs: 100
+  });
+  assert.equal(existsWait.matched, true);
+  assert.equal(existsWait.timedOut, false);
+  console.log(`ui_wait exists: matched=${existsWait.matched} timedOut=${existsWait.timedOut}`);
+
+  // 1e. A missing element on a live process is a normal notExists match.
+  const absentWait = await waitForUi({
+    pid,
+    selector: { automationId: `missing-control-${Date.now()}` },
+    condition: "notExists",
+    timeoutMs: 2000,
+    pollIntervalMs: 100
+  });
+  assert.equal(absentWait.matched, true);
+  assert.equal(absentWait.timedOut, false);
+  console.log(`ui_wait element notExists: matched=${absentWait.matched} timedOut=${absentWait.timedOut}`);
+
   // 2. Find an editable control (Document for WordPad; Edit/Document for notepad).
   // Try Document first, then Edit.
   let editSelector = { controlType: "Document" as const };
@@ -163,8 +256,12 @@ try {
     // WordPad not present; that's fine.
   }
 
-  // 6. ui_wait: close the window via Close button, then wait for notExists.
-  let closedViaUia = false;
+  // 6. Invoke the Close button (action test). WordPad may pop a save-changes
+  // dialog since we wrote text; dismiss it best-effort so the process exits.
+  // We do NOT ui_wait notExists on controlType:Window here - once the window
+  // closes the resolver raises WINDOW_NOT_FOUND, which by contract must
+  // propagate (not be swallowed as a match). Element-level notExists on a live
+  // window is already covered by step 1e.
   try {
     const closeAct = await performUiAction({
       pid,
@@ -174,7 +271,6 @@ try {
       timeoutMs: 10000
     });
     if (closeAct.success) {
-      closedViaUia = true;
       console.log(`Invoked Close button via ${closeAct.method}`);
     }
   } catch (e) {
@@ -183,41 +279,26 @@ try {
     }
   }
 
-  if (closedViaUia) {
-    // 7. Wait for the window to disappear. WordPad may pop a save-changes
-    // dialog; if so, the Window still "exists" - countEquals not needed, we
-    // just wait a short time and accept either outcome.
-    const w = await waitForUi({
+  // Dismiss a possible save-changes dialog (best-effort cleanup).
+  try {
+    await performUiAction({
       pid,
-      selector: { controlType: "Window" },
-      condition: "notExists",
-      timeoutMs: 4000,
-      pollIntervalMs: 200
+      selector: { controlType: "Button", name: "不保存" },
+      action: "invoke",
+      allowCoordinateFallback: false,
+      timeoutMs: 5000
     });
-    console.log(`ui_wait notExists: matched=${w.matched} elapsed=${w.elapsedMs}ms`);
-    // If a save dialog appeared, dismiss it by closing that window too.
-    if (!w.matched) {
-      try {
-        await performUiAction({
-          pid,
-          selector: { controlType: "Button", name: "不保存" },
-          action: "invoke",
-          allowCoordinateFallback: false,
-          timeoutMs: 5000
-        });
-      } catch {
-        try {
-          await performUiAction({
-            pid,
-            selector: { controlType: "Button", name: "Don't Save" },
-            action: "invoke",
-            allowCoordinateFallback: false,
-            timeoutMs: 5000
-          });
-        } catch {
-          // best-effort
-        }
-      }
+  } catch {
+    try {
+      await performUiAction({
+        pid,
+        selector: { controlType: "Button", name: "Don't Save" },
+        action: "invoke",
+        allowCoordinateFallback: false,
+        timeoutMs: 5000
+      });
+    } catch {
+      // best-effort; closeApp in finally handles the rest
     }
   }
 } catch (e) {

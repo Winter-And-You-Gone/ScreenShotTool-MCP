@@ -63,10 +63,45 @@ test("ui_selector normalizes controlType (Button / ControlType.Button / button)"
   assert.equal(uiQuerySchema.parse({ pid: 1, selector: { controlType: "ListItem" } }).selector.controlType, "ListItem");
 });
 
-test("ui_selector index is 0-based non-negative", () => {
-  assert.equal(uiQuerySchema.parse({ pid: 1, selector: { name: "x", index: 0 } }).selector.index, 0);
-  assert.throws(() => uiQuerySchema.parse({ pid: 1, selector: { name: "x", index: -1 } }));
+test("ui_selector supports bounded path/ancestor and higher indexes", () => {
+  const selector = uiQuerySchema.parse({
+    pid: 1,
+    selector: {
+      automationId: "leaf",
+      index: 3,
+      ancestor: { automationId: "parent" },
+      path: [
+        { automationId: "container" },
+        { automationId: "leaf" }
+      ]
+    },
+    maxNodes: 5000,
+    maxResults: 100
+  });
+  assert.equal(selector.selector.index, 3);
+  assert.equal(selector.selector.path?.length, 2);
+  assert.equal(selector.selector.ancestor?.automationId, "parent");
+  assert.throws(() => uiQuerySchema.parse({
+    pid: 1,
+    selector: { automationId: "x", path: Array.from({ length: 13 }, () => ({ automationId: "x" })) }
+  }));
 });
+
+test("ui_wait validates expected fields and accepts selector index", () => {
+  const wait = uiWaitSchema.parse({
+    pid: 1,
+    selector: { automationId: "item", index: 2 },
+    condition: "exists"
+  });
+  assert.equal(wait.selector.index, 2);
+  assert.throws(() => uiWaitSchema.parse({
+    pid: 1,
+    selector: { automationId: "item" },
+    condition: "countEquals",
+    expectedCount: -1
+  }));
+});
+
 
 test("ui_inspect_tree applies defaults and bounds", () => {
   const t = uiInspectTreeSchema.parse({ pid: 1 });

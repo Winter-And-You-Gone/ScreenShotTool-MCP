@@ -9,9 +9,10 @@ import {
   launchApp,
   closeApp
 } from "../src/windows.js";
-import { profileList, resolveProfileControl } from "../src/profiles/registry.js";
+import { profileList, resolveProfileControl, buildUiaDeps } from "../src/profiles/registry.js";
 
 const exePath = process.env.VAPORVIEW_EXE;
+const strict = process.env.VAPORVIEW_SMOKE_STRICT === "1";
 const args = process.env.VAPORVIEW_ARGS ? process.env.VAPORVIEW_ARGS.split(" ") : [];
 
 if (!exePath) {
@@ -61,6 +62,7 @@ try {
   const qtNodes = tree.nodes.filter((n) => n.frameworkId === "Qt");
   console.log(`Qt-framework nodes: ${qtNodes.length}`);
   if (qtNodes.length === 0) {
+    if (strict) throw new Error("strict mode: no Qt-framework nodes found");
     console.log("DIAGNOSTIC: no Qt-framework nodes found. VaporView may expose a different FrameworkId, or the UIA bridge is not loaded.");
   }
 
@@ -71,6 +73,7 @@ try {
   });
   console.log(`Interactive controls (with patterns): ${interactive.length}`);
   if (interactive.length === 0) {
+    if (strict) throw new Error("strict mode: no interactive UIA controls found");
     console.log("ADAPTATION LIMIT: VaporView exposes no controls with standard UIA patterns in this tree slice. Custom-painted Qt widgets may be inaccessible.");
   }
 
@@ -78,17 +81,24 @@ try {
   const profiles = profileList();
   assert.ok(profiles.profiles.some((p) => p.id === "vaporview"), "vaporview profile should be registered");
   try {
-    const resolved = await resolveProfileControl({
+    const resolved = await resolveProfileControl(buildUiaDeps({
+      getUiElement,
+      performUiAction: async () => { throw new Error("unused"); },
+      queryUi: async () => { throw new Error("unused"); }
+    }), {
       profile: "vaporview",
       control: "mainWindow",
       pid,
       timeoutMs: 15000
     });
-    console.log(`profile_resolve mainWindow: found=${resolved.found} candidateIndex=${resolved.candidateIndex ?? "n/a"} candidatesTried=${resolved.candidatesTried.length}`);
+    console.log(`profile_resolve mainWindow: found=${resolved.found} candidateIndex=${resolved.candidateIndex ?? "n/a"} confidence=${resolved.confidence ?? "n/a"} candidatesTried=${resolved.candidatesTried.length}`);
     if (!resolved.found) {
+      if (strict) throw new Error("strict mode: mainWindow profile selector did not resolve");
       console.log("ADAPTATION LIMIT: mainWindow profile selector did not resolve against the live tree. Source-derived selectors may need adjustment - run ui_inspect_tree to confirm.");
     }
+    assert.equal(resolved.confidence, "source-derived");
   } catch (e) {
+    if (strict) throw e;
     console.log(`profile_resolve mainWindow error: ${e instanceof Error ? e.message : String(e)}`);
   }
 
@@ -100,11 +110,16 @@ try {
     timeoutMs: 2000,
     pollIntervalMs: 200
   });
-  console.log(`ui_wait exists: matched=${w.matched} elapsed=${w.elapsedMs}ms`);
+  console.log(`ui_wait exists: matched=${w.matched} timedOut=${w.timedOut} elapsed=${w.elapsedMs}ms`);
+  assert.equal(w.matched, true, "VaporView window should remain present");
+  assert.equal(w.timedOut, false, "window-exists wait should not time out");
 
   // 6. Identify same-PID popups (dialogs/menus). We don't trigger any here to
   // avoid side effects; just report how many top-level windows the PID has.
   console.log(`Same-PID top-level windows in tree roots: ${tree.roots.length} (isMain=1, popups=${tree.roots.length - 1})`);
+  if (strict && tree.roots.length < 2) {
+    throw new Error("strict mode: no same-PID popup/dialog root was exposed");
+  }
 
   console.log("\nVaporView UIA smoke test completed. No dangerous actions were performed.");
 } catch (e) {

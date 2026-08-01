@@ -32,6 +32,7 @@ import type {
   WaitResult,
   UiError
 } from "./uia/types.js";
+import { McpUiError } from "./uia/results.js";
 
 export type WaitAndSuppressInput = {
   pid: number;
@@ -43,16 +44,18 @@ export type WaitAndSuppressInput = {
 
 // Error carrying a structured UIA error code (e.g. ELEMENT_AMBIGUOUS,
 // PATTERN_NOT_SUPPORTED). Thrown by runHelper/runStandaloneHelper when the
-// PowerShell helper emits { ok:false, code, message, details }. Callers can
-// read .code to branch without parsing English text.
-export class HelperError extends Error {
-  readonly code: string;
-  readonly details: unknown;
+// PowerShell helper emits { ok:false, code, message, details }, and by the
+// profile layer for PROFILE_NOT_FOUND etc.
+//
+// This extends McpUiError so that a single `instanceof McpUiError` check in
+// index.ts catches every structured UIA/profile error regardless of which
+// layer produced it. `instanceof HelperError` is kept for backwards compat
+// with existing call sites. `String(error)` on a structured error no longer
+// degrades to "[object Object]" because Error provides a useful toString.
+export class HelperError extends McpUiError {
   constructor(message: string, code: string, details?: unknown) {
-    super(message);
+    super(code, message, details);
     this.name = "HelperError";
-    this.code = code;
-    this.details = details;
   }
 }
 
@@ -635,6 +638,16 @@ type Worker = {
 let activeWorker: Worker | null = null;
 let workerStarting: Promise<Worker> | null = null;
 
+// Diagnostic: how many times the shared worker has been (re)started in this
+// process. Tests assert this stays at 1 across mixed UIA + profile calls so
+// the hot-reload / dependency-injection change didn't regress into spawning a
+// second worker.
+export let workerStartCount = 0;
+
+function getWorkerStartCount(): number {
+  return workerStartCount;
+}
+
 async function getWorker(): Promise<Worker> {
   if (activeWorker && !activeWorker.exited) {
     return activeWorker;
@@ -761,6 +774,7 @@ async function getWorker(): Promise<Worker> {
     });
 
     activeWorker = worker;
+    workerStartCount++;
     return worker;
   })();
 
@@ -948,6 +962,12 @@ export function shutdownHelper(): void {
   }
   activeWorker = null;
   helperShutdowns.delete(shutdownHelper);
+}
+
+// Test/diagnostic accessor: how many shared workers have been started in
+// this process lifetime. Health check for the single-worker invariant.
+export function getWorkerStartCountValue(): number {
+  return workerStartCount;
 }
 
 type HelperGlobal = typeof globalThis & {

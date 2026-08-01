@@ -2,20 +2,36 @@
 //
 // A profile maps logical control names (e.g. "mainWindow", "connectButton")
 // to UiElementSelectors, and identifies the target app by process name /
-// title. Profiles live in the TS layer and call the generic UIA wrappers
-// (inspectUiTree/queryUi/getUiElement/performUiAction/waitForUi) - they never
-// touch PowerShell directly.
+// title. Profiles live in the TS layer and are pure data + selector
+// generation; they never touch PowerShell. The UIA functions are injected by
+// the caller (index.ts), so a hot-reload of windows.js does not leave the
+// profile layer holding a stale module instance (and a second worker).
 
 import type { UiElementSelector, WindowSelector } from "../uia/types.js";
+
+// Confidence label for a control's selectors. "source-derived" means the
+// AutomationId was confirmed by reading the app's source (setObjectName) but
+// NOT verified against the live UIA tree; "runtime-verified" means a
+// privileged smoke test actually resolved it. Promoting to runtime-verified
+// requires running the VaporView smoke test under admin elevation.
+export type SelectorConfidence = "source-derived" | "runtime-verified";
+
+export type ControlEntry = {
+  selectors: UiElementSelector[];
+  confidence: SelectorConfidence;
+  notes?: string;
+};
 
 export type AppProfile = {
   id: string;
   displayName: string;
   processNames: string[];
   titleContains?: string[];
-  // Each logical control may have one or more candidate selectors, tried in
-  // order. The first that resolves to a unique element wins.
-  controls: Record<string, UiElementSelector | UiElementSelector[]>;
+  // Each logical control maps to one or more candidate selectors (tried in
+  // order) plus a confidence label. For backwards compatibility a bare
+  // selector / selector[] is also accepted and wrapped with the default
+  // confidence "source-derived".
+  controls: Record<string, ControlEntry | UiElementSelector | UiElementSelector[]>;
 };
 
 export type ProfileRegistry = {
@@ -29,6 +45,7 @@ export type ProfileResolveResult = {
   found: boolean;
   selectorUsed?: UiElementSelector;
   candidateIndex?: number;
+  confidence?: SelectorConfidence;
   candidatesTried: Array<{
     selector: UiElementSelector;
     outcome: "found" | "not-found" | "ambiguous" | "error";
@@ -36,6 +53,24 @@ export type ProfileResolveResult = {
   }>;
   element?: unknown;
 };
+
+// Normalize a control entry to a ControlEntry (wrapping bare selectors).
+export function normalizeControlEntry(
+  entry: ControlEntry | UiElementSelector | UiElementSelector[] | undefined
+): ControlEntry | undefined {
+  if (!entry) {
+    return undefined;
+  }
+  if (Array.isArray(entry)) {
+    return { selectors: entry, confidence: "source-derived" };
+  }
+  // ControlEntry shape (has `selectors`)
+  if ("selectors" in entry && Array.isArray((entry as ControlEntry).selectors)) {
+    return entry as ControlEntry;
+  }
+  // Bare selector object
+  return { selectors: [entry as UiElementSelector], confidence: "source-derived" };
+}
 
 // Build a WindowSelector from a profile + caller overrides. Caller-supplied
 // pid/processName/hwnd/titleContains always win; otherwise the profile's
@@ -65,9 +100,16 @@ export function getCandidateSelectors(
   profile: AppProfile,
   control: string
 ): UiElementSelector[] {
-  const entry = profile.controls[control];
+  const entry = normalizeControlEntry(profile.controls[control]);
   if (!entry) {
     return [];
   }
-  return Array.isArray(entry) ? entry : [entry];
+  return entry.selectors;
+}
+
+export function getControlConfidence(
+  profile: AppProfile,
+  control: string
+): SelectorConfidence | undefined {
+  return normalizeControlEntry(profile.controls[control])?.confidence;
 }

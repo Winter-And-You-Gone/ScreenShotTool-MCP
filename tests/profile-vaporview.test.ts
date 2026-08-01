@@ -2,8 +2,16 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import { vaporViewProfile } from "../src/profiles/vaporview.js";
-import { getCandidateSelectors, profileWindowSelector } from "../src/profiles/types.js";
-import { getProfile, listProfiles, profileList } from "../src/profiles/registry.js";
+import { getCandidateSelectors, normalizeControlEntry, profileWindowSelector } from "../src/profiles/types.js";
+import {
+  getProfile,
+  listProfiles,
+  profileList,
+  resolveProfileControl,
+  performProfileAction
+} from "../src/profiles/registry.js";
+import { McpUiError } from "../src/uia/results.js";
+import type { GetResult, ActionResult } from "../src/uia/types.js";
 
 test("vaporview profile is registered and identifiable", () => {
   assert.equal(vaporViewProfile.id, "vaporview");
@@ -44,11 +52,25 @@ test("profile contains NO RuntimeId, HWND, PID, or absolute coordinates", () => 
 });
 
 test("profile selectors use stable locators (automationId preferred)", () => {
-  // Window-chrome buttons use unique automationIds (objectName).
-  assert.equal(vaporViewProfile.controls.windowMinimizeButton.automationId, "windowMinimizeButton");
-  assert.equal(vaporViewProfile.controls.windowCloseButton.automationId, "windowCloseButton");
-  assert.equal(vaporViewProfile.controls.logTextEdit.automationId, "logTextEdit");
-  assert.equal(vaporViewProfile.controls.titleBarMenuButton.automationId, "titleBarMenuButton");
+  const closeEntry = normalizeControlEntry(vaporViewProfile.controls.windowCloseButton)!;
+  const minimizeEntry = normalizeControlEntry(vaporViewProfile.controls.windowMinimizeButton)!;
+  const logEntry = normalizeControlEntry(vaporViewProfile.controls.logTextEdit)!;
+  const menuEntry = normalizeControlEntry(vaporViewProfile.controls.titleBarMenuButton)!;
+  assert.equal(closeEntry.selectors[0]!.automationId, "windowCloseButton");
+  assert.equal(minimizeEntry.selectors[0]!.automationId, "windowMinimizeButton");
+  assert.equal(logEntry.selectors[0]!.automationId, "logTextEdit");
+  assert.equal(menuEntry.selectors[0]!.automationId, "titleBarMenuButton");
+  assert.equal(closeEntry.confidence, "source-derived");
+});
+
+test("profile entries expose confidence and non-sensitive notes", () => {
+  for (const [control, rawEntry] of Object.entries(vaporViewProfile.controls)) {
+    const entry = normalizeControlEntry(rawEntry)!;
+    assert.ok(entry.confidence === "source-derived" || entry.confidence === "runtime-verified", control);
+    assert.ok(!/runtimeId|hwnd|pid|boundingRect/i.test(entry.notes ?? ""), control);
+  }
+  const sidebar = normalizeControlEntry(vaporViewProfile.controls.sidebarButtons)!;
+  assert.match(sidebar.notes ?? "", /index/i);
 });
 
 test("mainWindow has multiple candidate selectors tried in order", () => {
@@ -93,6 +115,128 @@ test("profile does not depend on Chinese-only text for key controls", () => {
     const hasNonTextLocator = sels.some((s) => s.automationId || s.className || s.frameworkId);
     assert.ok(hasNonTextLocator, `control ${c} relies only on display text - fragile under localization`);
   }
+});
+
+test("profile resolve records not-found and ambiguous candidates", async () => {
+  const calls: string[] = [];
+  await assert.rejects(
+    () => resolveProfileControl({
+      getUiElement: async ({ selector }): Promise<GetResult> => {
+        calls.push(selector.name ?? selector.frameworkId ?? "unknown");
+        if (selector.name === "VaporView") {
+          return { found: false, element: null, elapsedMs: 1 };
+        }
+        throw new McpUiError("ELEMENT_AMBIGUOUS", "ambiguous", { candidateCount: 2 });
+      },
+      performUiAction: async (): Promise<ActionResult> => {
+        throw new Error("unused");
+      },
+      queryUi: async () => {
+        throw new Error("unused");
+      }
+    }, {
+      profile: "vaporview",
+      control: "mainWindow",
+      pid: 123
+    }),
+    (error: unknown) => {
+      assert.ok(error instanceof McpUiError);
+      assert.equal(error.code, "PROFILE_CONTROL_NOT_FOUND");
+      const details = error.details as { attempts?: Array<{ outcome: string }> };
+      assert.deepEqual(details.attempts?.map((attempt) => attempt.outcome), ["not-found", "ambiguous"]);
+      return true;
+    }
+  );
+  assert.deepEqual(calls, ["VaporView", "Qt"]);
+});
+
+test("profile resolve short-circuits severe window errors", async () => {
+  let calls = 0;
+  await assert.rejects(
+    () => resolveProfileControl({
+      getUiElement: async (): Promise<GetResult> => {
+        calls++;
+        throw new McpUiError("WINDOW_AMBIGUOUS", "multiple windows", { candidateCount: 2 });
+      },
+      performUiAction: async (): Promise<ActionResult> => {
+        throw new Error("unused");
+      },
+      queryUi: async () => {
+        throw new Error("unused");
+      }
+    }, {
+      profile: "vaporview",
+      control: "mainWindow",
+      pid: 123
+    }),
+    (error: unknown) => {
+      assert.ok(error instanceof McpUiError);
+      assert.equal(error.code, "WINDOW_AMBIGUOUS");
+      return true;
+    }
+  );
+  assert.equal(calls, 1);
+});
+
+test("profile action retries element-not-found candidates and preserves attempts", async () => {
+  const calls: string[] = [];
+  const actionResult: ActionResult = {
+    success: true,
+    method: "InvokePattern",
+    coordinateFallbackUsed: false,
+    before: null,
+    after: null,
+    elapsedMs: 1
+  };
+  const result = await performProfileAction({
+    getUiElement: async (): Promise<GetResult> => ({ found: false, element: null, elapsedMs: 1 }),
+    performUiAction: async ({ selector }): Promise<ActionResult> => {
+      calls.push(selector.name ?? selector.frameworkId ?? "unknown");
+      if (calls.length === 1) {
+        throw new McpUiError("ELEMENT_NOT_FOUND", "missing");
+      }
+      return actionResult;
+    },
+    queryUi: async () => {
+      throw new Error("unused");
+    }
+  }, {
+    profile: "vaporview",
+    control: "mainWindow",
+    action: "invoke",
+    pid: 123
+  });
+
+  assert.equal(result.selectorUsed?.name, undefined);
+  assert.equal(result.selectorUsed?.frameworkId, "Qt");
+  assert.deepEqual(calls, ["VaporView", "Qt"]);
+});
+
+test("profile action short-circuits severe errors", async () => {
+  let calls = 0;
+  await assert.rejects(
+    () => performProfileAction({
+      getUiElement: async (): Promise<GetResult> => ({ found: false, element: null, elapsedMs: 1 }),
+      performUiAction: async (): Promise<ActionResult> => {
+        calls++;
+        throw new McpUiError("UIA_ROOT_UNAVAILABLE", "root unavailable");
+      },
+      queryUi: async () => {
+        throw new Error("unused");
+      }
+    }, {
+      profile: "vaporview",
+      control: "mainWindow",
+      action: "invoke",
+      pid: 123
+    }),
+    (error: unknown) => {
+      assert.ok(error instanceof McpUiError);
+      assert.equal(error.code, "UIA_ROOT_UNAVAILABLE");
+      return true;
+    }
+  );
+  assert.equal(calls, 1);
 });
 
 test("listProfiles returns the vaporview profile", () => {

@@ -16,6 +16,7 @@ import { z } from "zod";
 import type * as SchemasModule from "./schemas.js";
 import type * as WindowsModule from "./windows.js";
 import type * as ProfilesModule from "./profiles/registry.js";
+import { McpUiError } from "./uia/results.js";
 
 type RuntimeModules = {
   version: string;
@@ -193,6 +194,11 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
   try {
     const { schemas, windows, profiles } = await loadRuntime();
+    // Build the UIA dependency bag from the CURRENT runtime's windows module.
+    // Passing this into the profile layer (rather than letting registry.ts
+    // import windows.js itself) is what keeps a single worker across hot
+    // reloads: the profile layer never holds a second module instance.
+    const uiaDeps = profiles.buildUiaDeps(windows);
 
     switch (name) {
       case "launch_app":
@@ -236,9 +242,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       case "profile_list":
         return jsonResult(profiles.profileList());
       case "profile_resolve":
-        return jsonResult(await profiles.resolveProfileControl(parseArgs(schemas.profileResolveSchema, args)));
+        return jsonResult(await profiles.resolveProfileControl(uiaDeps, parseArgs(schemas.profileResolveSchema, args)));
       case "profile_action":
-        return jsonResult(await profiles.performProfileAction(parseArgs(schemas.profileActionSchema, args)));
+        return jsonResult(await profiles.performProfileAction(uiaDeps, parseArgs(schemas.profileActionSchema, args)));
       default:
         throw new McpError(ErrorCode.MethodNotFound, `Unknown tool: ${name}`);
     }
@@ -247,9 +253,11 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       throw error;
     }
 
-    // Structured UIA / helper errors carry a machine-readable code. Surface
-    // the code + message (not the full stack trace) so MCP clients can branch.
-    if (error instanceof windows.HelperError) {
+    // Single structured-error catch. McpUiError is the common base for
+    // HelperError (PowerShell-side UIA errors) and profile-layer errors, so
+    // code/message/details survive end to end instead of degrading to
+    // "[object Object]" or a bare stack trace.
+    if (error instanceof McpUiError) {
       return {
         isError: true,
         content: [

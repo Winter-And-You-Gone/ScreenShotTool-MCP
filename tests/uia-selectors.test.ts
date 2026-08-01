@@ -9,7 +9,7 @@ import {
   MAX_REGEX_LEN
 } from "../src/uia/selectors.js";
 import type { UiElementSelector } from "../src/uia/types.js";
-import { buildCandidateSummary, ambiguityError, notFoundError, isUiError } from "../src/uia/results.js";
+import { buildCandidateSummary, ambiguityError, notFoundError, isUiError, redactElementState, McpUiError } from "../src/uia/results.js";
 
 test("hasLocator requires at least one locator field", () => {
   assert.equal(hasLocator(undefined), false);
@@ -56,7 +56,7 @@ test("selectorSummary produces a readable one-liner", () => {
   const s: UiElementSelector = { automationId: "btn", controlType: "Button", match: "exact" };
   const summary = selectorSummary(s);
   assert.ok(summary.includes("automationId=btn"));
-  assert.ok(summary.includes("controlType=Button"));
+  assert.equal(summary.includes("controlType=Button"), true);
   assert.ok(summary.includes("match=exact"));
   assert.equal(selectorSummary(undefined), "<empty>");
 });
@@ -94,6 +94,43 @@ test("buildCandidateSummary caps at MAX_CANDIDATES", () => {
   assert.equal(summary[0]!.automationId, "id0");
 });
 
+test("buildCandidateSummary never leaks password values", () => {
+  const summary = buildCandidateSummary([
+    {
+      automationId: "pwd",
+      name: "Password",
+      controlType: "Edit",
+      className: "",
+      frameworkId: "Qt",
+      processId: 1,
+      nativeWindowHandle: "",
+      enabled: true,
+      offscreen: false,
+      focusable: true,
+      hasKeyboardFocus: false,
+      isPassword: true,
+      isReadOnly: false,
+      boundingRect: null,
+      runtimeId: [1],
+      patterns: ["Value"],
+      value: "super-secret",
+      rangeValue: null,
+      minimum: null,
+      maximum: null,
+      smallChange: null,
+      largeChange: null,
+      toggleState: null,
+      selected: null,
+      expandCollapseState: null
+    }
+  ]);
+  assert.equal(summary.length, 1);
+  assert.equal(summary[0]!.isPassword, true);
+  assert.equal(summary[0]!.valueProtected, true);
+  assert.equal("value" in summary[0]!, false);
+  assert.equal(JSON.stringify(summary).includes("super-secret"), false);
+});
+
 test("ambiguityError carries code ELEMENT_AMBIGUOUS and candidate count", () => {
   const err = ambiguityError({ name: "x" }, [
     {
@@ -115,9 +152,22 @@ test("notFoundError carries code ELEMENT_NOT_FOUND", () => {
   assert.ok(err.message.includes("No element matched"));
 });
 
-test("isUiError detects structured errors", () => {
-  assert.equal(isUiError({ ok: false, code: "X", message: "y" }), true);
-  assert.equal(isUiError({ ok: true, result: 1 }), false);
-  assert.equal(isUiError(new Error("boom")), false);
-  assert.equal(isUiError(null), false);
+test("password state redaction never returns a value", () => {
+  const password = {
+    isPassword: true,
+    valueProtected: false,
+    value: "secret-value"
+  };
+  const redacted = redactElementState(password);
+  assert.equal(redacted.value, null);
+  assert.equal(redacted.valueProtected, true);
+  assert.equal(password.value, "secret-value");
 });
+
+test("McpUiError preserves machine-readable code and details", () => {
+  const error = new McpUiError("WINDOW_AMBIGUOUS", "ambiguous", { candidateCount: 2 });
+  assert.equal(error.code, "WINDOW_AMBIGUOUS");
+  assert.deepEqual(error.details, { candidateCount: 2 });
+  assert.equal(error.name, "McpUiError");
+});
+

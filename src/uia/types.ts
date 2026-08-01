@@ -44,6 +44,9 @@ export type UiElementState = {
   focusable: boolean;
   hasKeyboardFocus: boolean;
   isPassword: boolean;
+  // True when the element is a password field and the value was deliberately
+  // withheld. Callers MUST NOT attempt to read the value via any other path.
+  valueProtected: boolean;
   isReadOnly: boolean | null;
   boundingRect: {
     x: number;
@@ -53,7 +56,7 @@ export type UiElementState = {
   } | null;
   runtimeId: number[];
   patterns: string[];
-  // Value-pattern state (null when unsupported)
+  // Value-pattern state (null when unsupported OR when isPassword is true)
   value: string | null;
   // Range-value-pattern state (null when unsupported)
   rangeValue: number | null;
@@ -174,6 +177,9 @@ export type WaitResult = {
   elapsedMs: number;
   timeoutMs: number;
   pollIntervalMs: number;
+  // True when the wait ended by reaching the timeout (normal, not an error).
+  // False when the condition matched, or when an execution error short-circuited.
+  timedOut: boolean;
 };
 
 // Structured error codes returned by the UIA layer. The PowerShell helper
@@ -195,7 +201,8 @@ export type UiErrorCode =
   | "COORDINATE_FALLBACK_DISABLED"
   | "INVALID_BOUNDING_RECT"
   | "TARGET_PROCESS_EXITED"
-  | "UIA_ASSEMBLY_UNAVAILABLE";
+  | "UIA_ASSEMBLY_UNAVAILABLE"
+  | "INVALID_SELECTOR";
 
 export type UiErrorDetails = {
   selector?: unknown;

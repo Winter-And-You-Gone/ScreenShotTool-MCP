@@ -17,7 +17,17 @@
 // (not unique), so they are disambiguated by accessibleName where the source
 // sets one, and otherwise by index within the titleBar container.
 
-import type { AppProfile } from "./types.js";
+import type { AppProfile, ControlEntry } from "./types.js";
+import type { UiElementSelector } from "../uia/types.js";
+
+const sourceDerived = (
+  selectors: UiElementSelector | UiElementSelector[],
+  notes?: string
+): ControlEntry => ({
+  selectors: Array.isArray(selectors) ? selectors : [selectors],
+  confidence: "source-derived",
+  ...(notes ? { notes } : {})
+});
 
 export const vaporViewProfile: AppProfile = {
   id: "vaporview",
@@ -25,56 +35,45 @@ export const vaporViewProfile: AppProfile = {
   processNames: ["VaporView"],
   titleContains: ["VaporView"],
   controls: {
-    // Main window: static title "VaporView", Qt framework.
-    mainWindow: [
+    mainWindow: sourceDerived([
       { controlType: "Window", name: "VaporView", frameworkId: "Qt" },
       { controlType: "Window", frameworkId: "Qt" }
-    ],
+    ], "Source-derived Qt window selectors; live runtime verification requires matching administrator elevation."),
 
-    // Central widget and primary containers (source: GroundMainWindowSetup.cpp).
-    centralWidget: { automationId: "appCentralWidget" },
-    mainPageStack: { automationId: "mainPageStack" },
-    appSidebar: { automationId: "appSidebar" },
-    mainCardsPane: { automationId: "mainCardsPane" },
-    mainCardsScrollArea: { automationId: "mainCardsScrollArea" },
+    centralWidget: sourceDerived({ automationId: "appCentralWidget" }),
+    mainPageStack: sourceDerived({ automationId: "mainPageStack" }),
+    appSidebar: sourceDerived({ automationId: "appSidebar" }),
+    mainCardsPane: sourceDerived({ automationId: "mainCardsPane" }),
+    mainCardsScrollArea: sourceDerived({ automationId: "mainCardsScrollArea" }),
+    sidebarButtons: sourceDerived(
+      { automationId: "appSidebarButton" },
+      "Multiple buttons share this objectName; provide an index after confirming live ordering."
+    ),
 
-    // Sidebar navigation buttons share objectName "appSidebarButton" - use
-    // index to pick a specific page once the live tree confirms ordering.
-    // Exposed as a documented limitation rather than a fragile guess.
-    sidebarButtons: { automationId: "appSidebarButton" },
+    customTitleBar: sourceDerived({ automationId: "customTitleBar" }),
+    titleBarMenuButton: sourceDerived({ automationId: "titleBarMenuButton" }),
+    titleApplicationPanel: sourceDerived({ automationId: "titleApplicationPanel" }),
 
-    // Custom title bar (replaces the native QMenuBar, which is hidden).
-    customTitleBar: { automationId: "customTitleBar" },
-    titleBarMenuButton: { automationId: "titleBarMenuButton" },
-    titleApplicationPanel: { automationId: "titleApplicationPanel" },
+    windowMinimizeButton: sourceDerived({ automationId: "windowMinimizeButton" }),
+    windowMaximizeButton: sourceDerived({ automationId: "windowMaximizeButton" }),
+    windowCloseButton: sourceDerived({ automationId: "windowCloseButton" }),
 
-    // Window chrome buttons - unique objectNames, stable.
-    windowMinimizeButton: { automationId: "windowMinimizeButton" },
-    windowMaximizeButton: { automationId: "windowMaximizeButton" },
-    windowCloseButton: { automationId: "windowCloseButton" },
+    logSidePanel: sourceDerived({ automationId: "logSidePanel" }),
+    logTextEdit: sourceDerived({ automationId: "logTextEdit" }),
+    logSidePanelToggle: sourceDerived({ name: "logSidePanelToggleButton", frameworkId: "Qt" }),
+    recordingStatusCard: sourceDerived({ automationId: "recordingStatusCard" }),
+    recordingStatusLabel: sourceDerived({ automationId: "recordingStatusLabel" }),
 
-    // Log panel and recording status.
-    logSidePanel: { automationId: "logSidePanel" },
-    logTextEdit: { automationId: "logTextEdit" },
-    // setAccessibleName("logSidePanelToggleButton") -> exposed as UIA Name.
-    logSidePanelToggle: { name: "logSidePanelToggleButton", frameworkId: "Qt" },
-    recordingStatusCard: { automationId: "recordingStatusCard" },
-    recordingStatusLabel: { automationId: "recordingStatusLabel" },
+    skyTelemetryPortCombo: sourceDerived({ automationId: "skyTelemetryPortCombo" }),
+    epsilonPortCombo: sourceDerived({ automationId: "epsilonPortCombo" }),
+    pressurePortCombo: sourceDerived({ automationId: "pressurePortCombo" }),
+    humidityPortCombo: sourceDerived({ automationId: "humidityPortCombo" }),
+    lidarPortCombo: sourceDerived({ automationId: "lidarPortCombo" }),
+    temperaturePortCombo: sourceDerived({ automationId: "temperaturePortCombo" }),
 
-    // Device-config combos on the main window (source: GroundMainWindowSetup.cpp).
-    // These are QComboBox with setAccessibleName(toolTip) and stable objectName.
-    skyTelemetryPortCombo: { automationId: "skyTelemetryPortCombo" },
-    epsilonPortCombo: { automationId: "epsilonPortCombo" },
-    pressurePortCombo: { automationId: "pressurePortCombo" },
-    humidityPortCombo: { automationId: "humidityPortCombo" },
-    lidarPortCombo: { automationId: "lidarPortCombo" },
-    temperaturePortCombo: { automationId: "temperaturePortCombo" },
-
-    // Language button (has accessibleName, not objectName).
-    languageButton: [
-      // accessibleName is exposed as UIA Name when set; fall back to objectName.
+    languageButton: sourceDerived([
       { name: "titleLanguageButton", frameworkId: "Qt" },
       { automationId: "titleLanguageButton" }
-    ]
+    ])
   }
 };
