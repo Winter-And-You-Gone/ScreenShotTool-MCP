@@ -9,12 +9,21 @@
 
 import type { UiElementSelector, WindowSelector } from "../uia/types.js";
 
-// Confidence label for a control's selectors. "source-derived" means the
-// AutomationId was confirmed by reading the app's source (setObjectName) but
-// NOT verified against the live UIA tree; "runtime-verified" means a
-// privileged smoke test actually resolved it. Promoting to runtime-verified
-// requires running the VaporView smoke test under admin elevation.
-export type SelectorConfidence = "source-derived" | "runtime-verified";
+// Confidence label for a control's selectors.
+// - "runtime-verified": a live UIA probe resolved this control to a unique
+//   element against the running app (non-elevated, asInvoker build).
+// - "source-derived": the AutomationId was confirmed by reading the app's
+//   source (setObjectName) but NOT yet verified against the live tree.
+// - "action-limited": the control is reachable but lacks standard UIA
+//   patterns (e.g. a custom-painted widget); only fallback actions apply.
+// - "unsupported": the control cannot be operated via UIA/fallback at all.
+// - "ambiguous": multiple elements matched; needs a more specific selector.
+export type SelectorConfidence =
+  | "runtime-verified"
+  | "source-derived"
+  | "action-limited"
+  | "unsupported"
+  | "ambiguous";
 
 export type ControlEntry = {
   selectors: UiElementSelector[];
@@ -27,6 +36,13 @@ export type AppProfile = {
   displayName: string;
   processNames: string[];
   titleContains?: string[];
+  // Executable file name(s) used by profile_launch to resolve the binary.
+  // Never stores an absolute path; resolution uses exePath > env var > config
+  // > common build dirs > PATH at runtime.
+  executableNames?: string[];
+  // Environment variable name (e.g. "VAPORVIEW_EXE") that overrides the
+  // executable path. Machine-specific paths must come through this, not source.
+  executableEnv?: string;
   // Each logical control maps to one or more candidate selectors (tried in
   // order) plus a confidence label. For backwards compatibility a bare
   // selector / selector[] is also accepted and wrapped with the default

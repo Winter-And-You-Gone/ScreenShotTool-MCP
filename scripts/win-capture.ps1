@@ -2594,10 +2594,36 @@ function Get-UiaErrorFromRecord {
   return $null
 }
 
+# Heuristic: identify Qt/IME/observer helper windows that are top-level but
+# NOT the application's real main window. These share the target PID but
+# should never be selected as the UIA root. Examples: Qt custom titlebar
+# windows ("_q_titlebar"), Qt theme/screen observer windows, the IME UI
+# window, and the Default IME window.
+function Test-IsHelperWindowTitle {
+  param([string]$Title)
+  if ([string]::IsNullOrWhiteSpace($Title)) { return $false }
+  if ($Title.StartsWith("_q_", [System.StringComparison]::Ordinal)) { return $true }
+  if ($Title -ieq "MSCTFIME UI") { return $true }
+  if ($Title -ieq "Default IME") { return $true }
+  if ($Title -imatch 'Qt\d+\w*(Observer|ChangeNotification)') { return $true }
+  return $false
+}
+
+function Test-IsHelperWindowClass {
+  param([string]$ClassName)
+  if ([string]::IsNullOrWhiteSpace($ClassName)) { return $false }
+  if ($ClassName.StartsWith("_q_", [System.StringComparison]::Ordinal)) { return $true }
+  if ($ClassName -ieq "MSCTFIME UI") { return $true }
+  if ($ClassName -ieq "IME") { return $true }
+  if ($ClassName -imatch 'Qt\d+\w*(Observer|ChangeNotification)Window') { return $true }
+  return $false
+}
+
 # Resolve the target window for UIA. An explicit hwnd is authoritative. For
-# process/title selectors, a single non-tool window is preferred as the main
-# window; otherwise multiple candidates are an error rather than an arbitrary
-# first-window choice.
+# process/title selectors, score candidates so the real main window wins
+# over Qt/IME helper windows that share the PID (VaporView exposes 2
+# "_q_titlebar" helper windows + the real window). A unique top scorer is
+# returned; a tie remains WINDOW_AMBIGUOUS.
 function Resolve-UiaTargetWindow {
   param([hashtable]$Target)
 
@@ -2618,22 +2644,46 @@ function Resolve-UiaTargetWindow {
     return $filtered[0]
   }
 
-  $preferred = [System.Collections.ArrayList]::new()
-  foreach ($win in $filtered) {
+  # Multiple candidates: score each. The real main window is unowned, not a
+  # toolwindow, not a Qt/IME helper, and has a non-empty title. A caller-
+  # supplied titleContains (e.g. the profile's app title) is a strong bonus.
+  $needle = $null
+  if ($Target.ContainsKey("titleContains") -and -not [string]::IsNullOrWhiteSpace($Target.titleContains)) {
+    $needle = [string]$Target.titleContains
+  }
+
+  $scored = foreach ($win in $filtered) {
     $hwnd = [IntPtr]([int64]$win.hwnd)
     $exStyle = if ([IntPtr]::Size -eq 8) {
       [ScreenshotTool.Native]::GetWindowLong64($hwnd, -20).ToInt64()
     } else {
       [int64][ScreenshotTool.Native]::GetWindowLong32($hwnd, -20)
     }
-    $isToolWindow = (($exStyle -band [int64]0x00000080) -ne 0)
-    if (-not $isToolWindow -and -not [string]::IsNullOrWhiteSpace([string]$win.title)) {
-      $preferred.Add($win) | Out-Null
+    $hwndParent = if ([IntPtr]::Size -eq 8) {
+      [ScreenshotTool.Native]::GetWindowLong64($hwnd, -8).ToInt64()
+    } else {
+      [int64][ScreenshotTool.Native]::GetWindowLong32($hwnd, -8)
     }
-  }
+    $isToolWindow = (($exStyle -band [int64]0x00000080) -ne 0)
+    $hasOwner = ($hwndParent -ne 0)
+    $title = [string]$win.title
+    $isHelper = (Test-IsHelperWindowTitle $title) -or (Test-IsHelperWindowClass ([string]$win.className))
 
-  if ($preferred.Count -eq 1) {
-    return $preferred[0]
+    $score = 0
+    if (-not $hasOwner) { $score += 100 } else { $score -= 50 }
+    if (-not $isToolWindow) { $score += 50 } else { $score -= 50 }
+    if (-not $isHelper) { $score += 40 } else { $score -= 80 }
+    if (-not [string]::IsNullOrWhiteSpace($title)) { $score += 10 } else { $score -= 30 }
+    if ($null -ne $needle -and $title.IndexOf($needle, [System.StringComparison]::OrdinalIgnoreCase) -ge 0) { $score += 60 }
+
+    [pscustomobject]@{ Win = $win; Score = [int]$score }
+  }
+  $scored = @($scored)
+  $maxScore = ($scored | Measure-Object -Property Score -Maximum).Maximum
+  $best = @($scored | Where-Object { $_.Score -eq $maxScore })
+
+  if ($best.Count -eq 1) {
+    return $best[0].Win
   }
 
   $candidates = @($filtered | Select-Object -First 10 | ForEach-Object {
@@ -3380,6 +3430,8 @@ function Invoke-UiAction {
   $action = [string]$Target.action
   $allowFallback = $false
   if ($Target.ContainsKey("allowCoordinateFallback")) { $allowFallback = [bool]$Target.allowCoordinateFallback }
+  # allowMessageClickFallback is the spec-named alias for the same opt-in.
+  if ($Target.ContainsKey("allowMessageClickFallback") -and $Target.allowMessageClickFallback) { $allowFallback = $true }
   $forceClick = $false
   if ($Target.ContainsKey("forceCoordinateClick")) { $forceClick = [bool]$Target.forceCoordinateClick }
 
@@ -3405,14 +3457,16 @@ function Invoke-UiAction {
     switch ($action) {
       "invoke" {
         if (Try-UiaPattern $live "Invoke" { param($p) $p.Invoke() }) { $method = "InvokePattern" }
+        elseif (Invoke-KeyboardFallback $live $targetHwnd "Enter") { $method = "Keyboard.Enter"; $fallbackUsed = $true }
         elseif ($allowFallback -and (Invoke-CoordinateClick -Element $live -TargetHwnd $targetHwnd -AllowFallback $true)) { $method = "coordinate_click_fallback"; $fallbackUsed = $true }
-        else { Throw-UiaError "PATTERN_NOT_SUPPORTED" "Element does not support InvokePattern and coordinate fallback is disabled." ([ordered]@{ selector = $Target.selector; patterns = $stateBefore.patterns; stage = "invoke" }) }
+        else { Throw-UiaError "PATTERN_NOT_SUPPORTED" "Element does not support InvokePattern and no keyboard/click fallback is available." ([ordered]@{ selector = $Target.selector; patterns = $stateBefore.patterns; stage = "invoke" }) }
       }
       "toggle" {
         if (Try-UiaPattern $live "Toggle" { param($p) $p.Toggle() }) { $method = "TogglePattern" }
         elseif (Try-UiaPattern $live "Invoke" { param($p) $p.Invoke() }) { $method = "InvokePattern" }
+        elseif (Invoke-KeyboardFallback $live $targetHwnd "Space") { $method = "Keyboard.Space"; $fallbackUsed = $true }
         elseif ($allowFallback -and (Invoke-CoordinateClick -Element $live -TargetHwnd $targetHwnd -AllowFallback $true)) { $method = "coordinate_click_fallback"; $fallbackUsed = $true }
-        else { Throw-UiaError "PATTERN_NOT_SUPPORTED" "Element does not support Toggle/Invoke patterns and coordinate fallback is disabled." ([ordered]@{ selector = $Target.selector; patterns = $stateBefore.patterns; stage = "toggle" }) }
+        else { Throw-UiaError "PATTERN_NOT_SUPPORTED" "Element does not support Toggle/Invoke patterns and no keyboard/click fallback is available." ([ordered]@{ selector = $Target.selector; patterns = $stateBefore.patterns; stage = "toggle" }) }
       }
       "select" { $method = Invoke-SelectionAction -Element $live -Action "Select" -AllowFallback $allowFallback -TargetHwnd $targetHwnd -Selector $Target.selector -StateBefore $stateBefore }
       "addToSelection" { $method = Invoke-SelectionAction -Element $live -Action "AddToSelection" -AllowFallback $allowFallback -TargetHwnd $targetHwnd -Selector $Target.selector -StateBefore $stateBefore }
@@ -3424,9 +3478,33 @@ function Invoke-UiAction {
         else { Throw-UiaError "PATTERN_NOT_SUPPORTED" "Element does not support ValuePattern; cannot setValue." ([ordered]@{ selector = $Target.selector; patterns = $stateBefore.patterns; stage = "setValue" }) }
       }
       "setRangeValue" {
-        if (Try-UiaPattern $live "RangeValue" { param($p) $p.SetValue([double]$Target.rangeValue) }) { $method = "RangeValuePattern" }
-        else { Throw-UiaError "PATTERN_NOT_SUPPORTED" "Element does not support RangeValuePattern; cannot setRangeValue." ([ordered]@{ selector = $Target.selector; patterns = $stateBefore.patterns; stage = "setRangeValue" }) }
+        # Clamp to [minimum, maximum] and refuse read-only controls.
+        $pids = Get-UiaPatternIds
+        $rvp = $null
+        if (-not $live.TryGetCurrentPattern($pids.RangeValue, [ref]$rvp) -or $null -eq $rvp) {
+          Throw-UiaError "PATTERN_NOT_SUPPORTED" "Element does not support RangeValuePattern; cannot setRangeValue." ([ordered]@{ selector = $Target.selector; patterns = $stateBefore.patterns; stage = "setRangeValue" })
+        }
+        try { if ([bool]$rvp.Current.IsReadOnly) { Throw-UiaError "ACTION_FAILED" "RangeValue control is read-only." ([ordered]@{ selector = $Target.selector; stage = "setRangeValue" }) } } catch { if ($null -ne (Get-UiaErrorFromRecord $_)) { throw } }
+        $desired = [double]$Target.rangeValue
+        $min = [double]$rvp.Current.Minimum
+        $max = [double]$rvp.Current.Maximum
+        $clamped = [Math]::Max($min, [Math]::Min($max, $desired))
+        $rvp.SetValue($clamped)
+        $method = "RangeValuePattern"
       }
+      "appendText" { $method = Invoke-TextAction $live "appendText" ([string]$Target.value) $Target.selector $stateBefore }
+      "clear" { $method = Invoke-TextAction $live "clear" "" $Target.selector $stateBefore }
+      "selectAll" { $method = Invoke-TextAction $live "selectAll" "" $Target.selector $stateBefore }
+      "getValue" { $method = Invoke-TextAction $live "getValue" "" $Target.selector $stateBefore }
+      "setChecked" {
+        $desiredBool = $false
+        $v = [string]$Target.value
+        if ($v -ieq "true" -or $v -eq "1") { $desiredBool = $true }
+        $method = Invoke-SetChecked $live $desiredBool $Target.selector $stateBefore $targetHwnd $allowFallback
+        if ($method -eq "coordinate_click_fallback") { $fallbackUsed = $true }
+      }
+      "increment" { $method = Invoke-RangeStep $live "increment" $Target.selector $stateBefore }
+      "decrement" { $method = Invoke-RangeStep $live "decrement" $Target.selector $stateBefore }
       "scrollIntoView" {
         if (Try-UiaPattern $live "ScrollItem" { param($p) $p.ScrollIntoView() }) { $method = "ScrollItemPattern" }
         else { Throw-UiaError "PATTERN_NOT_SUPPORTED" "Element does not support ScrollItemPattern." ([ordered]@{ selector = $Target.selector; patterns = $stateBefore.patterns; stage = "scrollIntoView" }) }
@@ -3443,10 +3521,11 @@ function Invoke-UiAction {
         else { Throw-UiaError "PATTERN_NOT_SUPPORTED" "LegacyIAccessiblePattern is not available in this managed API and InvokePattern is unsupported; enable allowCoordinateFallback to use a coordinate click." ([ordered]@{ selector = $Target.selector; patterns = $stateBefore.patterns; stage = "legacyDefaultAction" }) }
       }
       "click" {
-        # Caller-requested click, but still prefer patterns per spec.
+        # Caller-requested click, but still prefer patterns then keyboard per spec.
         if (Try-UiaPattern $live "Invoke" { param($p) $p.Invoke() }) { $method = "InvokePattern" }
+        elseif (Invoke-KeyboardFallback $live $targetHwnd "Enter") { $method = "Keyboard.Enter"; $fallbackUsed = $true }
         elseif ($allowFallback -and (Invoke-CoordinateClick -Element $live -TargetHwnd $targetHwnd -AllowFallback $true)) { $method = "coordinate_click_fallback"; $fallbackUsed = $true }
-        else { Throw-UiaError "COORDINATE_FALLBACK_DISABLED" "Element has no invokable pattern and allowCoordinateFallback is false." ([ordered]@{ selector = $Target.selector; patterns = $stateBefore.patterns; stage = "click" }) }
+        else { Throw-UiaError "COORDINATE_FALLBACK_DISABLED" "Element has no invokable pattern and fallback is disabled." ([ordered]@{ selector = $Target.selector; patterns = $stateBefore.patterns; stage = "click" }) }
       }
       default { Throw-UiaError "ACTION_FAILED" "Unknown action: $action" ([ordered]@{ stage = "dispatch" }) }
     }
@@ -3461,14 +3540,23 @@ function Invoke-UiAction {
   } catch {}
 
   $elapsed = [int]([DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() - $start)
-  return [ordered]@{
+  # When a fallback was used, surface the mechanism details per spec. The
+  # physical cursor is NEVER moved (no SetCursorPos / real-mouse SendInput);
+  # the message-click path posts WM_LBUTTONDOWN/UP to the target window.
+  $result = [ordered]@{
     success = $true
     method = $method
     coordinateFallbackUsed = [bool]$fallbackUsed
+    physicalCursorMoved = $false
     before = $stateBefore
     after = $stateAfter
     elapsedMs = $elapsed
   }
+  if ($fallbackUsed) {
+    $result["fallbackReason"] = "No supported UIA pattern; used keyboard or window-message fallback"
+    $result["rootHwnd"] = [string]$targetHwnd.ToInt64()
+  }
+  return $result
 }
 
 function Try-UiaPattern {
@@ -3516,6 +3604,141 @@ function Invoke-ExpandCollapse {
     }
   } catch {}
   Throw-UiaError "PATTERN_NOT_SUPPORTED" "Element does not support ExpandCollapsePattern." ([ordered]@{ selector = $Selector; patterns = $StateBefore.patterns; stage = "expandCollapse" })
+}
+
+# Level-2 no-mouse fallback: focus the element via UIA and post a keyboard
+# activation (Enter or Space) to its window. Never moves the physical cursor
+# and never calls SetCursorPos or real-mouse SendInput. Returns $true if a
+# key was posted. Used when Invoke/Toggle/SelectionItem patterns are all
+# unavailable, before falling back to a coordinate message click.
+function Invoke-KeyboardFallback {
+  param($Element, [IntPtr]$TargetHwnd, [string]$Key)
+  try {
+    $focusable = [bool]$Element.Current.IsKeyboardFocusable
+    if (-not $focusable) { return $false }
+    $Element.SetFocus()
+  } catch { return $false }
+
+  # Post to the element's own HWND when it has one, otherwise the root
+  # window. Qt widgets are usually windowless, so the root window is the
+  # typical destination; after SetFocus the target widget has keyboard focus
+  # inside that window.
+  $postHwnd = $TargetHwnd
+  try {
+    $nh = $Element.Current.NativeWindowHandle
+    if ($nh -ne 0) { $postHwnd = [IntPtr]$nh }
+  } catch {}
+
+  $vk = if ($Key -ieq "Enter") { 0x0D } else { 0x20 }   # default Space
+  $WM_KEYDOWN = 0x100; $WM_KEYUP = 0x101
+  try {
+    [ScreenshotTool.Native]::PostMessage($postHwnd, $WM_KEYDOWN, [IntPtr]$vk, [IntPtr]::Zero) | Out-Null
+    Start-Sleep -Milliseconds 40
+    [ScreenshotTool.Native]::PostMessage($postHwnd, $WM_KEYUP, [IntPtr]$vk, [IntPtr]::Zero) | Out-Null
+    return $true
+  } catch { return $false }
+}
+
+# Post a modified keystroke (e.g. Ctrl+A for selectAll) to the target window
+# without moving the cursor. Returns $true if posted.
+function Invoke-KeyboardModified {
+  param([IntPtr]$TargetHwnd, [int]$Vk, [int[]]$ModifierVks)
+  $WM_KEYDOWN = 0x100; $WM_KEYUP = 0x101
+  try {
+    foreach ($m in $ModifierVks) { [ScreenshotTool.Native]::PostMessage($TargetHwnd, $WM_KEYDOWN, [IntPtr]$m, [IntPtr]::Zero) | Out-Null }
+    [ScreenshotTool.Native]::PostMessage($TargetHwnd, $WM_KEYDOWN, [IntPtr]$Vk, [IntPtr]::Zero) | Out-Null
+    Start-Sleep -Milliseconds 40
+    [ScreenshotTool.Native]::PostMessage($TargetHwnd, $WM_KEYUP, [IntPtr]$Vk, [IntPtr]::Zero) | Out-Null
+    for ($i = $ModifierVks.Count - 1; $i -ge 0; $i--) { [ScreenshotTool.Native]::PostMessage($TargetHwnd, $WM_KEYUP, [IntPtr]$ModifierVks[$i], [IntPtr]::Zero) | Out-Null }
+    return $true
+  } catch { return $false }
+}
+
+# Text-input actions backed by ValuePattern. appendText preserves existing
+# content; clear empties the field. Password fields are never read.
+function Invoke-TextAction {
+  param($Element, [string]$Action, [string]$Value, [hashtable]$Selector, $StateBefore)
+  $pids = Get-UiaPatternIds
+  $vp = $null
+  if (-not $Element.TryGetCurrentPattern($pids.Value, [ref]$vp) -or $null -eq $vp) {
+    Throw-UiaError "PATTERN_NOT_SUPPORTED" "Element does not support ValuePattern; cannot $Action." ([ordered]@{ selector = $Selector; patterns = $StateBefore.patterns; stage = $Action })
+  }
+  switch ($Action) {
+    "appendText" {
+      $isPassword = $false
+      try { $isPassword = [bool]$Element.Current.IsPassword } catch {}
+      $current = ""
+      if (-not $isPassword) { try { $current = [string]$vp.Current.Value } catch {} }
+      $vp.SetValue($current + $Value)
+      return "ValuePattern.Append"
+    }
+    "clear" {
+      $vp.SetValue("")
+      return "ValuePattern.Clear"
+    }
+    "selectAll" {
+      # ValuePattern has no selection API; focus + Ctrl+A via posted messages.
+      try { $Element.SetFocus() } catch {}
+      $nh = 0
+      try { $nh = $Element.Current.NativeWindowHandle } catch {}
+      $hwnd = if ($nh -ne 0) { [IntPtr]$nh } else { [IntPtr]::Zero }
+      if ($hwnd -eq [IntPtr]::Zero) { Throw-UiaError "ACTION_FAILED" "selectAll needs a target HWND; element has none and no root was supplied." ([ordered]@{ selector = $Selector; stage = "selectAll" }) }
+      # Ctrl+A: VK_CONTROL=0x11, VK_A=0x41
+      if (Invoke-KeyboardModified $hwnd 0x41 @(0x11)) { return "Keyboard.CtrlA" }
+      Throw-UiaError "ACTION_FAILED" "selectAll failed to post Ctrl+A." ([ordered]@{ selector = $Selector; stage = "selectAll" })
+    }
+    "getValue" {
+      # Read-only action: no state change. Value is surfaced via before/after
+      # (the caller already has it). Password values are never read.
+      return "ValuePattern.Read"
+    }
+  }
+  Throw-UiaError "ACTION_FAILED" "Unknown text action: $Action" ([ordered]@{ stage = "text-action" })
+}
+
+# Idempotent checkbox/switch toggle: only Toggle when the current state does
+# not match the requested boolean, avoiding double-toggle reversals.
+function Invoke-SetChecked {
+  param($Element, [bool]$Desired, [hashtable]$Selector, $StateBefore, [IntPtr]$TargetHwnd, [bool]$AllowFallback)
+  $pids = Get-UiaPatternIds
+  $tp = $null
+  if ($Element.TryGetCurrentPattern($pids.Toggle, [ref]$tp) -and $null -ne $tp) {
+    $current = $null
+    try { $current = [string]$tp.Current.ToggleState } catch {}
+    $isOn = ($current -eq "On")
+    if ($isOn -ne $Desired) { $tp.Toggle() }
+    return "TogglePattern.SetChecked"
+  }
+  # Fallbacks: keyboard Space, then coordinate click.
+  if (Invoke-KeyboardFallback $Element $TargetHwnd "Space") { return "Keyboard.Space" }
+  if ($AllowFallback -and (Invoke-CoordinateClick -Element $Element -TargetHwnd $TargetHwnd -AllowFallback $true)) { return "coordinate_click_fallback" }
+  Throw-UiaError "PATTERN_NOT_SUPPORTED" "Element does not support TogglePattern and keyboard/click fallback is unavailable." ([ordered]@{ selector = $Selector; patterns = $StateBefore.patterns; stage = "setChecked" })
+}
+
+# RangeValue step with clamping to [minimum, maximum]. Refuses read-only
+# controls. Returns the method label.
+function Invoke-RangeStep {
+  param($Element, [string]$Direction, [hashtable]$Selector, $StateBefore)
+  $pids = Get-UiaPatternIds
+  $rvp = $null
+  if (-not $Element.TryGetCurrentPattern($pids.RangeValue, [ref]$rvp) -or $null -eq $rvp) {
+    Throw-UiaError "PATTERN_NOT_SUPPORTED" "Element does not support RangeValuePattern; cannot $Direction." ([ordered]@{ selector = $Selector; patterns = $StateBefore.patterns; stage = $Direction })
+  }
+  try { if ([bool]$rvp.Current.IsReadOnly) { Throw-UiaError "ACTION_FAILED" "RangeValue control is read-only." ([ordered]@{ selector = $Selector; stage = $Direction }) } } catch {}
+  $current = [double]$rvp.Current.Value
+  $min = [double]$rvp.Current.Minimum
+  $max = [double]$rvp.Current.Maximum
+  $step = [double]$rvp.Current.SmallChange
+  if ($step -eq 0) { $step = 1 }
+  if ($Direction -eq "increment") {
+    $next = [Math]::Min($max, $current + $step)
+    if ($next -eq $current) { Throw-UiaError "ACTION_FAILED" "Already at maximum ($max)." ([ordered]@{ selector = $Selector; stage = "increment"; minimum = $min; maximum = $max; current = $current }) }
+  } else {
+    $next = [Math]::Max($min, $current - $step)
+    if ($next -eq $current) { Throw-UiaError "ACTION_FAILED" "Already at minimum ($min)." ([ordered]@{ selector = $Selector; stage = "decrement"; minimum = $min; maximum = $max; current = $current }) }
+  }
+  $rvp.SetValue($next)
+  return "RangeValuePattern.$Direction"
 }
 
 # Strictly-controlled coordinate fallback. Validates every safety condition

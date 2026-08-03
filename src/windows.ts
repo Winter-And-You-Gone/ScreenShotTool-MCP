@@ -290,6 +290,200 @@ export async function inspectUiTree(input: UiInspectTreeInput): Promise<InspectT
   return runHelper<InspectTreeResult>({ action: "ui-inspect-tree", target: input });
 }
 
+// ── ui_catalog ──
+//
+// Returns a catalog of actionable controls with a recommendedSelector the
+// caller can pass verbatim to ui_action, plus supportedActions and a
+// selector-stability confidence. Implemented in the TS layer on top of
+// inspectUiTree (one tree walk) so it reuses the proven UIA path and needs
+// no new PowerShell action. Selector stability:
+//   stable               - unique AutomationId, or unique Name+ControlType
+//   conditionally-stable - AutomationId/Name present but not unique alone
+//   fragile              - only ControlType+index
+//   unsupported          - no locator fields at all
+const PATTERN_TO_ACTIONS: Array<[string, string[]]> = [
+  ["Invoke", ["invoke"]],
+  ["Toggle", ["toggle", "setChecked"]],
+  ["Value", ["getValue", "setValue", "appendText", "clear", "selectAll"]],
+  ["RangeValue", ["setRangeValue", "increment", "decrement"]],
+  ["SelectionItem", ["select", "addToSelection", "removeFromSelection"]],
+  ["ExpandCollapse", ["expand", "collapse"]],
+  ["ScrollItem", ["scrollIntoView"]]
+];
+
+function patternToActions(patterns: string[]): string[] {
+  const actions = new Set<string>();
+  for (const [needle, acts] of PATTERN_TO_ACTIONS) {
+    if (patterns.some((p) => p.includes(needle))) {
+      for (const a of acts) actions.add(a);
+    }
+  }
+  return [...actions];
+}
+
+export async function catalogUi(input: {
+  hwnd?: string | number;
+  pid?: number;
+  processName?: string;
+  titleContains?: string;
+  includeProcessPopups?: boolean;
+  visibleOnly?: boolean;
+  enabledOnly?: boolean;
+  maxDepth?: number;
+  maxNodes?: number;
+  timeoutMs?: number;
+}): Promise<{
+  totalNodes: number;
+  actionableNodes: number;
+  stableAutomationIdNodes: number;
+  nameOnlyNodes: number;
+  unsupportedNodes: number;
+  controlTypes: Record<string, number>;
+  patterns: Record<string, number>;
+  unmappedActionableControls: Array<{ automationId: string; name: string; controlType: string }>;
+  controls: Array<{
+    controlType: string;
+    automationId: string;
+    name: string;
+    className: string;
+    frameworkId: string;
+    enabled: boolean;
+    visible: boolean;
+    offscreen: boolean;
+    rootHwnd: string;
+    recommendedSelector: Record<string, unknown>;
+    selectorConfidence: "stable" | "conditionally-stable" | "fragile" | "unsupported";
+    supportedActions: string[];
+    patterns: string[];
+    profileControl?: string;
+  }>;
+  truncated: boolean;
+  elapsedMs: number;
+}> {
+  const tree = await inspectUiTree({
+    hwnd: input.hwnd,
+    pid: input.pid,
+    processName: input.processName,
+    titleContains: input.titleContains,
+    includeProcessPopups: input.includeProcessPopups ?? true,
+    maxDepth: input.maxDepth ?? 20,
+    maxNodes: input.maxNodes ?? 5000,
+    includePatterns: true,
+    includeOffscreen: !(input.visibleOnly ?? true),
+    interactiveOnly: false,
+    automationIdOnly: false,
+    timeoutMs: input.timeoutMs ?? 30000
+  });
+
+  const nodes = tree.nodes;
+  // Frequency maps for uniqueness checking.
+  const aidCounts = new Map<string, number>();
+  const nameTypeCounts = new Map<string, number>();
+  for (const n of nodes) {
+    if (n.automationId) aidCounts.set(n.automationId, (aidCounts.get(n.automationId) ?? 0) + 1);
+    const nk = `${n.controlType} ${n.name}`;
+    nameTypeCounts.set(nk, (nameTypeCounts.get(nk) ?? 0) + 1);
+  }
+
+  const controlTypes: Record<string, number> = {};
+  const patternCounts: Record<string, number> = {};
+  for (const n of nodes) {
+    const ct = n.controlType || "(none)";
+    controlTypes[ct] = (controlTypes[ct] ?? 0) + 1;
+    for (const p of n.patterns) {
+      patternCounts[p] = (patternCounts[p] ?? 0) + 1;
+    }
+  }
+
+  const controls: Array<{
+    controlType: string; automationId: string; name: string; className: string; frameworkId: string;
+    enabled: boolean; visible: boolean; offscreen: boolean; rootHwnd: string;
+    recommendedSelector: Record<string, unknown>;
+    selectorConfidence: "stable" | "conditionally-stable" | "fragile" | "unsupported";
+    supportedActions: string[]; patterns: string[];
+  }> = [];
+  let stableAutomationIdNodes = 0;
+  let nameOnlyNodes = 0;
+  let unsupportedNodes = 0;
+  const unmappedActionableControls: Array<{ automationId: string; name: string; controlType: string }> = [];
+
+  for (const n of nodes) {
+    const actionable = n.patterns.length > 0 || (n.enabled && n.focusable);
+    if (!actionable) continue;
+    if ((input.enabledOnly ?? false) && !n.enabled) continue;
+    if ((input.visibleOnly ?? true) && n.offscreen) continue;
+
+    const aid = n.automationId || "";
+    const aidUnique = aid !== "" && (aidCounts.get(aid) ?? 0) === 1;
+    const nameTypeKey = `${n.controlType} ${n.name}`;
+    const nameTypeUnique = n.name !== "" && (nameTypeCounts.get(nameTypeKey) ?? 0) === 1;
+
+    let recommendedSelector: Record<string, unknown>;
+    let selectorConfidence: "stable" | "conditionally-stable" | "fragile" | "unsupported";
+
+    if (aidUnique) {
+      recommendedSelector = { automationId: aid };
+      selectorConfidence = "stable";
+      stableAutomationIdNodes++;
+    } else if (aid !== "") {
+      // AutomationId present but not unique: combine with ControlType (still
+      // not unique, but more stable than Name+index). Caller must add index.
+      recommendedSelector = { automationId: aid, controlType: n.controlType };
+      selectorConfidence = "conditionally-stable";
+    } else if (nameTypeUnique) {
+      recommendedSelector = { name: n.name, controlType: n.controlType };
+      selectorConfidence = "stable";
+      nameOnlyNodes++;
+    } else if (n.name !== "") {
+      recommendedSelector = { name: n.name, controlType: n.controlType };
+      selectorConfidence = "conditionally-stable";
+      nameOnlyNodes++;
+    } else if (n.controlType) {
+      recommendedSelector = { controlType: n.controlType };
+      selectorConfidence = "fragile";
+    } else {
+      recommendedSelector = {};
+      selectorConfidence = "unsupported";
+      unsupportedNodes++;
+    }
+
+    const supportedActions = patternToActions(n.patterns);
+    if (supportedActions.length === 0) {
+      unmappedActionableControls.push({ automationId: aid, name: n.name, controlType: n.controlType });
+    }
+
+    controls.push({
+      controlType: n.controlType,
+      automationId: aid,
+      name: n.name,
+      className: n.className,
+      frameworkId: n.frameworkId,
+      enabled: n.enabled,
+      visible: !n.offscreen,
+      offscreen: n.offscreen,
+      rootHwnd: n.rootHwnd,
+      recommendedSelector,
+      selectorConfidence,
+      supportedActions,
+      patterns: n.patterns
+    });
+  }
+
+  return {
+    totalNodes: nodes.length,
+    actionableNodes: controls.length,
+    stableAutomationIdNodes,
+    nameOnlyNodes,
+    unsupportedNodes,
+    controlTypes,
+    patterns: patternCounts,
+    unmappedActionableControls,
+    controls,
+    truncated: tree.truncated,
+    elapsedMs: tree.elapsedMs
+  };
+}
+
 export async function queryUi(input: UiQueryInput): Promise<QueryResult> {
   return runHelper<QueryResult>({ action: "ui-query", target: input });
 }

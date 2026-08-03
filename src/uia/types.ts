@@ -143,12 +143,24 @@ export type UiAction =
   | "scrollIntoView"
   | "focus"
   | "legacyDefaultAction"
-  | "click";
+  | "click"
+  | "appendText"
+  | "clear"
+  | "selectAll"
+  | "getValue"
+  | "setChecked"
+  | "increment"
+  | "decrement";
 
 export type ActionResult = {
   success: boolean;
   method: string;
   coordinateFallbackUsed: boolean;
+  // Always false: the no-mouse fallback path posts window messages and never
+  // calls SetCursorPos or real-mouse SendInput.
+  physicalCursorMoved: boolean;
+  fallbackReason?: string;
+  rootHwnd?: string;
   before: Partial<UiElementState> | null;
   after: Partial<UiElementState> | null;
   elapsedMs: number;

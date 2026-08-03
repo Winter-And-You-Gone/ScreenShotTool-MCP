@@ -32,7 +32,7 @@ test("vaporview profile maps expected stable controls", () => {
   const expected = [
     "mainWindow", "centralWidget", "mainPageStack", "appSidebar",
     "windowMinimizeButton", "windowMaximizeButton", "windowCloseButton",
-    "titleBarMenuButton", "logTextEdit", "epsilonPortCombo", "pressurePortCombo"
+    "titleBarMenuButton", "logListView", "logSearchEdit", "epsilonPortCombo", "pressurePortCombo"
   ];
   for (const c of expected) {
     assert.ok(vaporViewProfile.controls[c], `missing control: ${c}`);
@@ -54,34 +54,45 @@ test("profile contains NO RuntimeId, HWND, PID, or absolute coordinates", () => 
 test("profile selectors use stable locators (automationId preferred)", () => {
   const closeEntry = normalizeControlEntry(vaporViewProfile.controls.windowCloseButton)!;
   const minimizeEntry = normalizeControlEntry(vaporViewProfile.controls.windowMinimizeButton)!;
-  const logEntry = normalizeControlEntry(vaporViewProfile.controls.logTextEdit)!;
+  const logEntry = normalizeControlEntry(vaporViewProfile.controls.logListView)!;
   const menuEntry = normalizeControlEntry(vaporViewProfile.controls.titleBarMenuButton)!;
-  assert.equal(closeEntry.selectors[0]!.automationId, "windowCloseButton");
-  assert.equal(minimizeEntry.selectors[0]!.automationId, "windowMinimizeButton");
-  assert.equal(logEntry.selectors[0]!.automationId, "logTextEdit");
-  assert.equal(menuEntry.selectors[0]!.automationId, "titleBarMenuButton");
-  assert.equal(closeEntry.confidence, "source-derived");
+  // Runtime AutomationIds are full Qt paths (verified against the live tree).
+  assert.equal(closeEntry.selectors[0]!.automationId, "QApplication.MainWindow.customTitleBar.windowCloseButton");
+  assert.equal(minimizeEntry.selectors[0]!.automationId, "QApplication.MainWindow.customTitleBar.windowMinimizeButton");
+  // Source-derived controls use a regex suffix on the confirmed short objectName.
+  assert.equal(logEntry.selectors[0]!.automationId, "logListView$");
+  assert.equal(logEntry.selectors[0]!.match, "regex");
+  assert.equal(menuEntry.selectors[0]!.automationId, "QApplication.MainWindow.customTitleBar.titleBarMenuButton");
+  assert.equal(closeEntry.confidence, "runtime-verified");
 });
 
 test("profile entries expose confidence and non-sensitive notes", () => {
   for (const [control, rawEntry] of Object.entries(vaporViewProfile.controls)) {
     const entry = normalizeControlEntry(rawEntry)!;
-    assert.ok(entry.confidence === "source-derived" || entry.confidence === "runtime-verified", control);
+    assert.ok(
+      entry.confidence === "source-derived" || entry.confidence === "runtime-verified"
+        || entry.confidence === "action-limited" || entry.confidence === "unsupported",
+      `${control} has confidence ${entry.confidence}`
+    );
     assert.ok(!/runtimeId|hwnd|pid|boundingRect/i.test(entry.notes ?? ""), control);
   }
-  const sidebar = normalizeControlEntry(vaporViewProfile.controls.sidebarButtons)!;
-  assert.match(sidebar.notes ?? "", /index/i);
+  // Sidebar nav buttons share objectName 'appSidebarButton'; disambiguated
+  // by accessibleName, not by fragile index.
+  const sidebarHome = normalizeControlEntry(vaporViewProfile.controls.sidebarHome)!;
+  assert.ok(sidebarHome.selectors[0]!.name, "sidebarHome must disambiguate by name");
+  assert.equal(sidebarHome.confidence, "runtime-verified");
 });
 
 test("mainWindow has multiple candidate selectors tried in order", () => {
   const candidates = getCandidateSelectors(vaporViewProfile, "mainWindow");
   assert.ok(Array.isArray(candidates));
   assert.ok(candidates.length >= 2);
-  // First candidate: title + frameworkId (most specific)
+  // First candidate: title + frameworkId (most specific, locale-stable)
   assert.equal(candidates[0]!.name, "VaporView");
   assert.equal(candidates[0]!.frameworkId, "Qt");
-  // Second candidate: frameworkId only (fallback)
+  // Second candidate: full-path automationId + frameworkId (fallback)
   assert.equal(candidates[1]!.frameworkId, "Qt");
+  assert.ok(candidates[1]!.automationId, "second candidate should have an automationId");
 });
 
 test("getCandidateSelectors wraps a single selector into an array", () => {
@@ -109,7 +120,7 @@ test("profileWindowSelector falls back to profile processName/titleContains", ()
 test("profile does not depend on Chinese-only text for key controls", () => {
   // Key controls should be locatable by automationId/frameworkId, not by
   // locale-specific display text that would break under language changes.
-  const keyControls = ["mainWindow", "windowCloseButton", "logTextEdit", "titleBarMenuButton"];
+  const keyControls = ["mainWindow", "windowCloseButton", "logListView", "titleBarMenuButton"];
   for (const c of keyControls) {
     const sels = getCandidateSelectors(vaporViewProfile, c);
     const hasNonTextLocator = sels.some((s) => s.automationId || s.className || s.frameworkId);
@@ -132,6 +143,9 @@ test("profile resolve records not-found and ambiguous candidates", async () => {
         throw new Error("unused");
       },
       queryUi: async () => {
+        throw new Error("unused");
+      },
+      inspectUiTree: async () => {
         throw new Error("unused");
       }
     }, {
@@ -163,6 +177,9 @@ test("profile resolve short-circuits severe window errors", async () => {
       },
       queryUi: async () => {
         throw new Error("unused");
+      },
+      inspectUiTree: async () => {
+        throw new Error("unused");
       }
     }, {
       profile: "vaporview",
@@ -184,6 +201,7 @@ test("profile action retries element-not-found candidates and preserves attempts
     success: true,
     method: "InvokePattern",
     coordinateFallbackUsed: false,
+    physicalCursorMoved: false,
     before: null,
     after: null,
     elapsedMs: 1
@@ -222,6 +240,9 @@ test("profile action short-circuits severe errors", async () => {
         throw new McpUiError("UIA_ROOT_UNAVAILABLE", "root unavailable");
       },
       queryUi: async () => {
+        throw new Error("unused");
+      },
+      inspectUiTree: async () => {
         throw new Error("unused");
       }
     }, {

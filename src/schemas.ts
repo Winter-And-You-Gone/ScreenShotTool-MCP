@@ -324,22 +324,28 @@ export const uiActionSchema = z.object({
   action: z.enum([
     "invoke", "toggle", "select", "addToSelection", "removeFromSelection",
     "expand", "collapse", "setValue", "setRangeValue", "scrollIntoView",
-    "focus", "legacyDefaultAction", "click"
+    "focus", "legacyDefaultAction", "click",
+    "appendText", "clear", "selectAll", "getValue", "setChecked",
+    "increment", "decrement"
   ]),
   value: z.string().max(uiaValueMaxLen).optional(),
   rangeValue: z.number().optional(),
   allowCoordinateFallback: z.boolean().optional().default(false),
+  allowMessageClickFallback: z.boolean().optional().default(false),
   forceCoordinateClick: z.boolean().optional().default(false),
   includeProcessPopups: z.boolean().optional().default(true),
   maxDepth: uiaMaxDepth.optional().default(15),
   maxNodes: uiaMaxNodes.optional().default(2000),
   timeoutMs: uiaActionTimeout.optional().default(10000)
 }).strict().refine(
-  (value) => value.action === "setValue" ? value.value !== undefined : true,
-  "setValue requires a 'value' string."
+  (value) => value.action === "setValue" || value.action === "appendText" ? value.value !== undefined : true,
+  "setValue/appendText require a 'value' string."
 ).refine(
   (value) => value.action === "setRangeValue" ? value.rangeValue !== undefined : true,
   "setRangeValue requires a 'rangeValue' number."
+).refine(
+  (value) => value.action === "setChecked" ? value.value !== undefined : true,
+  "setChecked requires a 'value' boolean (\"true\"/\"false\")."
 ).refine(
   (value) => value.forceCoordinateClick ? value.allowCoordinateFallback === true : true,
   "forceCoordinateClick requires allowCoordinateFallback=true."
@@ -391,23 +397,37 @@ export const profileActionSchema = z.object({
   action: z.enum([
     "invoke", "toggle", "select", "addToSelection", "removeFromSelection",
     "expand", "collapse", "setValue", "setRangeValue", "scrollIntoView",
-    "focus", "legacyDefaultAction", "click"
+    "focus", "legacyDefaultAction", "click",
+    "appendText", "clear", "selectAll", "getValue", "setChecked",
+    "increment", "decrement",
+    "selectByName", "selectByIndex", "getSelection", "openMenu"
   ]),
   ...windowSelectorFields,
   value: z.string().max(uiaValueMaxLen).optional(),
+  index: z.number().int().min(0).optional(),
   rangeValue: z.number().optional(),
   allowCoordinateFallback: z.boolean().optional().default(false),
+  allowMessageClickFallback: z.boolean().optional().default(false),
   forceCoordinateClick: z.boolean().optional().default(false),
   includeProcessPopups: z.boolean().optional().default(true),
   maxDepth: uiaMaxDepth.optional().default(15),
   maxNodes: uiaMaxNodes.optional().default(2000),
-  timeoutMs: uiaActionTimeout.optional().default(10000)
+  timeoutMs: uiaActionTimeout.optional().default(15000)
 }).strict().refine(
-  (value) => value.action === "setValue" ? value.value !== undefined : true,
-  "setValue requires a 'value' string."
+  (value) => value.action === "setValue" || value.action === "appendText" ? value.value !== undefined : true,
+  "setValue/appendText require a 'value' string."
 ).refine(
   (value) => value.action === "setRangeValue" ? value.rangeValue !== undefined : true,
   "setRangeValue requires a 'rangeValue' number."
+).refine(
+  (value) => value.action === "setChecked" ? value.value !== undefined : true,
+  "setChecked requires a 'value' boolean (\"true\"/\"false\")."
+).refine(
+  (value) => value.action === "selectByName" ? value.value !== undefined : true,
+  "selectByName requires a 'value' name string."
+).refine(
+  (value) => value.action === "selectByIndex" ? value.index !== undefined : true,
+  "selectByIndex requires an 'index' number."
 ).refine(
   (value) => value.forceCoordinateClick ? value.allowCoordinateFallback === true : true,
   "forceCoordinateClick requires allowCoordinateFallback=true."
@@ -421,6 +441,30 @@ export type UiWaitInput = z.infer<typeof uiWaitSchema>;
 export type ProfileListInput = z.infer<typeof profileListSchema>;
 export type ProfileResolveInput = z.infer<typeof profileResolveSchema>;
 export type ProfileActionInput = z.infer<typeof profileActionSchema>;
+
+export const profileLaunchSchema = z.object({
+  profile: z.string().min(1).max(MAX_SELECTOR_STR_LEN),
+  exePath: z.string().min(1).max(1024).optional(),
+  args: z.array(z.string().max(1024)).max(64).optional(),
+  waitForWindow: z.boolean().optional().default(true),
+  noActivate: z.boolean().optional().default(true),
+  startMinimized: z.boolean().optional().default(false),
+  timeoutMs: z.number().int().min(100).max(120000).optional().default(30000),
+  reuseIfRunning: z.boolean().optional().default(true)
+}).strict();
+export type ProfileLaunchInput = z.infer<typeof profileLaunchSchema>;
+
+export const uiCatalogSchema = z.object({
+  ...windowSelectorFields,
+  includeProcessPopups: z.boolean().optional().default(true),
+  visibleOnly: z.boolean().optional().default(true),
+  enabledOnly: z.boolean().optional().default(false),
+  maxDepth: uiaMaxDepth.optional().default(20),
+  maxNodes: uiaMaxNodes.optional().default(5000),
+  timeoutMs: uiaQueryTimeout.optional().default(30000)
+}).strict().refine(windowSelectorRefine, "Provide at least one of hwnd, pid, processName, or titleContains.");
+export type UiCatalogInput = z.infer<typeof uiCatalogSchema>;
+
 export type UiElementSelectorInput = import("./uia/types.js").UiElementSelector;
 
 const hwndSchemaProperty = {
@@ -732,11 +776,12 @@ export const toolInputSchemas = {
       processName: { type: "string" },
       titleContains: { type: "string" },
       selector: uiElementSelectorJsonSchema,
-      action: { type: "string", enum: ["invoke", "toggle", "select", "addToSelection", "removeFromSelection", "expand", "collapse", "setValue", "setRangeValue", "scrollIntoView", "focus", "legacyDefaultAction", "click"] },
-      value: { type: "string", maxLength: 4000, description: "Text for setValue." },
-      rangeValue: { type: "number", description: "Target value for setRangeValue." },
-      allowCoordinateFallback: { type: "boolean", default: false, description: "Allow coordinate-based click fallback ONLY when all UIA patterns are unavailable. Off by default." },
-      forceCoordinateClick: { type: "boolean", default: false, description: "Force a coordinate click (requires allowCoordinateFallback=true). Bypasses patterns." },
+      action: { type: "string", enum: ["invoke", "toggle", "select", "addToSelection", "removeFromSelection", "expand", "collapse", "setValue", "setRangeValue", "scrollIntoView", "focus", "legacyDefaultAction", "click", "appendText", "clear", "selectAll", "getValue", "setChecked", "increment", "decrement"] },
+      value: { type: "string", maxLength: 4000, description: "Text for setValue/appendText; \"true\"/\"false\" for setChecked; item name for selectByName." },
+      rangeValue: { type: "number", description: "Target value for setRangeValue (clamped to [minimum, maximum])." },
+      allowCoordinateFallback: { type: "boolean", default: false, description: "Allow keyboard then coordinate-message click fallback ONLY when all UIA patterns are unavailable. Off by default. Never moves the physical cursor." },
+      allowMessageClickFallback: { type: "boolean", default: false, description: "Alias for allowCoordinateFallback (spec name). Enables the no-mouse window-message fallback chain." },
+      forceCoordinateClick: { type: "boolean", default: false, description: "Force a coordinate message click (requires allowCoordinateFallback=true). Bypasses patterns." },
       includeProcessPopups: { type: "boolean", default: true },
       maxDepth: { type: "integer", minimum: 1, maximum: 30, default: 15 },
       maxNodes: { type: "integer", minimum: 1, maximum: 5000, default: 2000 },
@@ -797,10 +842,12 @@ export const toolInputSchemas = {
     properties: {
       profile: { type: "string", minLength: 1 },
       control: { type: "string", minLength: 1 },
-      action: { type: "string", enum: ["invoke", "toggle", "select", "addToSelection", "removeFromSelection", "expand", "collapse", "setValue", "setRangeValue", "scrollIntoView", "focus", "legacyDefaultAction", "click"] },
-      value: { type: "string", maxLength: 4000 },
+      action: { type: "string", enum: ["invoke", "toggle", "select", "addToSelection", "removeFromSelection", "expand", "collapse", "setValue", "setRangeValue", "scrollIntoView", "focus", "legacyDefaultAction", "click", "appendText", "clear", "selectAll", "getValue", "setChecked", "increment", "decrement", "selectByName", "selectByIndex", "getSelection", "openMenu"], description: "Primitive UIA actions plus composite actions: selectByName/selectByIndex/getSelection (combobox/list), openMenu (title menu). Composite actions handle same-PID popups automatically and verify before/after state." },
+      value: { type: "string", maxLength: 4000, description: "Text for setValue/appendText; \"true\"/\"false\" for setChecked; item name for selectByName." },
+      index: { type: "integer", minimum: 0, description: "0-based index for selectByIndex." },
       rangeValue: { type: "number" },
       allowCoordinateFallback: { type: "boolean", default: false },
+      allowMessageClickFallback: { type: "boolean", default: false, description: "Alias for allowCoordinateFallback (spec name)." },
       forceCoordinateClick: { type: "boolean", default: false },
       hwnd: { ...hwndSchemaProperty },
       pid: { type: "integer", minimum: 1 },
@@ -809,9 +856,41 @@ export const toolInputSchemas = {
       includeProcessPopups: { type: "boolean", default: true },
       maxDepth: { type: "integer", minimum: 1, maximum: 30, default: 15 },
       maxNodes: { type: "integer", minimum: 1, maximum: 5000, default: 2000 },
-      timeoutMs: { type: "integer", minimum: 500, maximum: 120000, default: 10000 }
+      timeoutMs: { type: "integer", minimum: 500, maximum: 120000, default: 15000 }
     },
     required: ["profile", "control", "action"],
+    additionalProperties: false,
+    anyOf: atLeastOneSelectorAnyOf
+  },
+  profile_launch: {
+    type: "object",
+    properties: {
+      profile: { type: "string", minLength: 1, description: "Profile id, e.g. \"vaporview\"." },
+      exePath: { type: "string", description: "Optional explicit path to the executable. Overrides all other resolution." },
+      args: { type: "array", items: { type: "string" }, description: "Process arguments." },
+      waitForWindow: { type: "boolean", default: true },
+      noActivate: { type: "boolean", default: true, description: "Best-effort background launch (recommended)." },
+      startMinimized: { type: "boolean", default: false },
+      timeoutMs: { type: "integer", minimum: 100, maximum: 120000, default: 30000 },
+      reuseIfRunning: { type: "boolean", default: true, description: "If a process with a matching name is already running, attach to it instead of launching a new one." }
+    },
+    required: ["profile"],
+    additionalProperties: false
+  },
+  ui_catalog: {
+    type: "object",
+    properties: {
+      hwnd: { ...hwndSchemaProperty },
+      pid: { type: "integer", minimum: 1 },
+      processName: { type: "string" },
+      titleContains: { type: "string" },
+      includeProcessPopups: { type: "boolean", default: true },
+      visibleOnly: { type: "boolean", default: true, description: "Only catalog onscreen controls." },
+      enabledOnly: { type: "boolean", default: false },
+      maxDepth: { type: "integer", minimum: 1, maximum: 30, default: 20 },
+      maxNodes: { type: "integer", minimum: 1, maximum: 5000, default: 5000 },
+      timeoutMs: { type: "integer", minimum: 500, maximum: 120000, default: 30000 }
+    },
     additionalProperties: false,
     anyOf: atLeastOneSelectorAnyOf
   }

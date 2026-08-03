@@ -197,7 +197,9 @@ test("JSON schema exposes action and condition enums consistently with Zod", () 
   assert.deepEqual(actionEnum, [
     "invoke", "toggle", "select", "addToSelection", "removeFromSelection",
     "expand", "collapse", "setValue", "setRangeValue", "scrollIntoView",
-    "focus", "legacyDefaultAction", "click"
+    "focus", "legacyDefaultAction", "click",
+    "appendText", "clear", "selectAll", "getValue", "setChecked",
+    "increment", "decrement"
   ]);
   const condEnum = toolInputSchemas.ui_wait.properties.condition.enum;
   assert.ok(condEnum.includes("exists"));

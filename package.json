@@ -25,6 +25,7 @@
     "smoke:wait-for-window": "tsx tests/smoke-wait-for-window.ts",
     "smoke:uia-notepad": "tsx tests/smoke-uia-notepad.ts",
     "smoke:uia-vaporview": "tsx tests/smoke-uia-vaporview.ts",
+    "smoke:uia-vaporview-coverage": "tsx tests/smoke-uia-vaporview-coverage.ts",
     "inspect": "npx @modelcontextprotocol/inspector node dist/index.js"
   },
   "engines": {

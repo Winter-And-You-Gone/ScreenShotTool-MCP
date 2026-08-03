@@ -182,8 +182,18 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       },
       {
         name: "profile_action",
-        description: "Perform an action on a logical control from an app profile. Reuses ui_action internally (no pattern logic duplicated). Tries candidate selectors in order until one resolves a unique element.",
+        description: "Perform an action on a logical control from an app profile. Reuses ui_action internally (no pattern logic duplicated). Tries candidate selectors in order until one resolves a unique element. Supports primitive UIA actions plus composite actions (selectByName/selectByIndex/getSelection/openMenu) that handle same-PID popups and verify before/after state. Never moves the physical mouse.",
         inputSchema: schemas.toolInputSchemas.profile_action
+      },
+      {
+        name: "profile_launch",
+        description: "Launch a profiled application (e.g. VaporView) by profile id, resolving the executable via exePath > profile env var > common build dirs > PATH. Returns pid, main-window hwnd/title, whether MCP started it, and whether the UIA root is available. Reuses an already-running instance by default. Never stores local absolute paths in the profile.",
+        inputSchema: schemas.toolInputSchemas.profile_launch
+      },
+      {
+        name: "ui_catalog",
+        description: "List the actionable controls of a target window with a recommendedSelector (pass verbatim to ui_action), supportedActions, patterns, and selector-stability confidence (stable/conditionally-stable/fragile/unsupported). Lets an AI agent enumerate operable controls without understanding the full UIA tree. Auto-enriches with profileControl labels when the target matches a known profile.",
+        inputSchema: schemas.toolInputSchemas.ui_catalog
       }
     ]
   };
@@ -245,6 +255,27 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         return jsonResult(await profiles.resolveProfileControl(uiaDeps, parseArgs(schemas.profileResolveSchema, args)));
       case "profile_action":
         return jsonResult(await profiles.performProfileAction(uiaDeps, parseArgs(schemas.profileActionSchema, args)));
+      case "profile_launch":
+        return jsonResult(await profiles.launchProfile(
+          uiaDeps,
+          async (i) => windows.launchApp({
+            exePath: i.exePath,
+            args: i.args ?? [],
+            waitForWindow: i.waitForWindow ?? true,
+            noActivate: i.noActivate ?? true,
+            startMinimized: i.startMinimized ?? false,
+            timeoutMs: i.timeoutMs ?? 30000
+          }),
+          windows.listWindows,
+          parseArgs(schemas.profileLaunchSchema, args)
+        ));
+      case "ui_catalog": {
+        const catInput = parseArgs(schemas.uiCatalogSchema, args);
+        const catalog = await windows.catalogUi(catInput);
+        const profile = profiles.findProfileForTarget({ processName: catInput.processName, titleContains: catInput.titleContains });
+        catalog.controls = profiles.enrichCatalogControls(profile, catalog.controls);
+        return jsonResult(catalog);
+      }
       default:
         throw new McpError(ErrorCode.MethodNotFound, `Unknown tool: ${name}`);
     }
