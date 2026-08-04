@@ -19,7 +19,8 @@ import type {
   GetResult,
   ActionResult,
   QueryResult,
-  InspectTreeResult
+  InspectTreeResult,
+  UiElementState
 } from "../uia/types.js";
 import {
   getCandidateSelectors,
@@ -88,6 +89,20 @@ export type UiaDeps = {
     includePatterns?: boolean;
     includeOffscreen?: boolean;
   }) => Promise<InspectTreeResult>;
+  // Post a key event to a window without moving the physical mouse. Used by
+  // composite menu actions (openSubmenu sends Right; menu-command invoke sends
+  // Enter) because VaporView's title menu is a custom Qt panel whose rows open
+  // submenus on hover/keyboard, not via InvokePattern, and command rows that
+  // open a modal QDialog block InvokePattern.Invoke() until the dialog closes.
+  sendKey: (input: {
+    hwnd?: string | number;
+    pid?: number;
+    processName?: string;
+    titleContains?: string;
+    key: string;
+    modifiers?: string[];
+    noActivate?: boolean;
+  }) => Promise<unknown>;
 };
 
 export const profiles: Record<string, AppProfile> = {
@@ -271,11 +286,14 @@ export async function performProfileAction(
     "INVALID_SELECTOR"
   ]);
 
-  // Composite actions (selectByName/selectByIndex/getSelection/openMenu) need
-  // to resolve the control first, then orchestrate expand -> popup -> item ->
-  // verify across multiple UIA calls. Resolve the unique element up front.
-  const composite = new Set(["selectByName", "selectByIndex", "getSelection", "openMenu"]);
-  if (composite.has(input.action)) {
+  // Composite actions (selectByName/selectByIndex/getSelection/openMenu/
+  // openSubmenu) need to resolve the control first, then orchestrate expand ->
+  // popup -> item -> verify across multiple UIA calls. Resolve the unique
+  // element up front. `invoke` on a title-menu command is also routed here:
+  // those rows open a modal QDialog whose exec() blocks InvokePattern.Invoke(),
+  // so the composite path triggers them via a non-blocking focus + Enter key.
+  const composite = new Set(["selectByName", "selectByIndex", "getSelection", "openMenu", "openSubmenu"]);
+  if (composite.has(input.action) || (input.action === "invoke" && isMenuCommandControl(profile, input.control))) {
     return performCompositeProfileAction(deps, profile, input, entry, windowSel);
   }
 
@@ -360,12 +378,14 @@ export function buildUiaDeps(windows: {
   performUiAction: (input: never) => Promise<ActionResult>;
   queryUi: (input: never) => Promise<QueryResult>;
   inspectUiTree: (input: never) => Promise<InspectTreeResult>;
+  sendKey: (input: never) => Promise<unknown>;
 }): UiaDeps {
   return {
     getUiElement: windows.getUiElement as UiaDeps["getUiElement"],
     performUiAction: windows.performUiAction as UiaDeps["performUiAction"],
     queryUi: windows.queryUi as UiaDeps["queryUi"],
-    inspectUiTree: windows.inspectUiTree as UiaDeps["inspectUiTree"]
+    inspectUiTree: windows.inspectUiTree as UiaDeps["inspectUiTree"],
+    sendKey: windows.sendKey as UiaDeps["sendKey"]
   };
 }
 
@@ -424,6 +444,75 @@ async function waitForMatches(
 // Composite actions orchestrate multi-step flows (expand -> popup -> select ->
 // verify) across ui_action/ui_query/ui_get, handling same-PID popups. They
 // never move the physical mouse and verify before/after state.
+
+// A title-menu command selector targets a titleMenu*Action QToolButton that is
+// NOT a section header. Section headers (titleMenu*SectionAction) open submenus
+// via openSubmenu; command rows trigger an action. Used to route `invoke` on
+// menu commands through the non-blocking composite path.
+function isMenuCommandSelector(sel: UiElementSelector): boolean {
+  const aid = sel.automationId;
+  if (!aid) return false;
+  const isRegex = sel.match === "regex";
+  const pat = isRegex ? aid.replace(/\$$/, "") : aid;
+  return /^titleMenu.+Action$/.test(pat) && !/SectionAction$/.test(pat);
+}
+function isMenuCommandControl(profile: AppProfile, control: string): boolean {
+  const entry = normalizeControlEntry(profile.controls[control]);
+  return !!entry && entry.selectors.some(isMenuCommandSelector);
+}
+export { isMenuCommandControl };
+function isSectionAid(automationId: string): boolean {
+  return /SectionAction$/.test(automationId);
+}
+
+// Resolve the title-menu panel (Qt::Tool top-level window) HWND so composite
+// menu actions can post keyboard events to it. Qt routes keys from this
+// window's QWindow to the focused menu row. Falls back to the main window HWND.
+async function getMenuPanelHwnd(
+  deps: UiaDeps,
+  windowSel: { hwnd?: string | number; pid?: number; processName?: string; titleContains?: string },
+  timeoutMs: number
+): Promise<string | number | undefined> {
+  try {
+    const r = await deps.getUiElement({
+      hwnd: windowSel.hwnd, pid: windowSel.pid, processName: windowSel.processName, titleContains: windowSel.titleContains,
+      selector: { automationId: "titleApplicationPanel$", match: "regex" },
+      includeProcessPopups: true, timeoutMs
+    });
+    if (r.found && r.element.nativeWindowHandle) return r.element.nativeWindowHandle;
+  } catch { /* fall back to main hwnd */ }
+  return windowSel.hwnd;
+}
+
+// Build a menu-item descriptor for the openMenu/openSubmenu result. The
+// recommendedSelector is the regex suffix on the short objectName (verified
+// unique against the live tree after cross-root dedup).
+function buildMenuItem(e: UiElementState): {
+  automationId: string; name: string; controlType: string; enabled: boolean;
+  checked: boolean | null; hasSubmenu: boolean; supportedActions: string[];
+  recommendedSelector: UiElementSelector;
+} {
+  const pats = e.patterns ?? [];
+  const supportedActions: string[] = [];
+  if (pats.some((p) => p.includes("Invoke"))) supportedActions.push("invoke");
+  if (pats.some((p) => p.includes("Toggle"))) {
+    supportedActions.push("toggle");
+    supportedActions.push("setChecked");
+  }
+  const shortName = (e.automationId.split(".").pop() ?? e.automationId).replace(/Action$/, "Action");
+  const hasSubmenu = /SectionAction$|LanguageAction$|UiTestScenarioAction$/.test(e.automationId);
+  return {
+    automationId: e.automationId,
+    name: e.name,
+    controlType: e.controlType,
+    enabled: e.enabled,
+    checked: e.toggleState === "On" ? true : e.toggleState === "Off" ? false : null,
+    hasSubmenu,
+    supportedActions,
+    recommendedSelector: { automationId: `${shortName}$`, match: "regex", controlType: "Button" }
+  };
+}
+
 async function performCompositeProfileAction(
   deps: UiaDeps,
   profile: AppProfile,
@@ -433,22 +522,88 @@ async function performCompositeProfileAction(
 ): Promise<{ profile: string; control: string; selectorUsed?: UiElementSelector; confidence?: SelectorConfidence; notes?: string; result: unknown }> {
   const selector = await resolveUniqueSelector(deps, windowSel, entry, input);
   const actionTimeout = input.timeoutMs ?? 15000;
+  const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
+  const win = () => ({ hwnd: windowSel.hwnd, pid: windowSel.pid, processName: windowSel.processName, titleContains: windowSel.titleContains });
 
+  // ── openMenu: open the title-bar application menu and enumerate its items. ──
+  // VaporView's title menu is a custom Qt panel of real QToolButtons (not Win32
+  // MenuItem). Opening is via InvokePattern on titleBarMenuButton; success is
+  // proved by section rows appearing or a new popup root, NEVER by itemCount>=0.
   if (input.action === "openMenu") {
-    // 1. Read before state. 2. Invoke the menu button. 3. Wait for MenuItem
-    // popup. 4. Return the menu items. The caller closes the menu (Escape).
-    const before = await deps.getUiElement({ hwnd: windowSel.hwnd, pid: windowSel.pid, processName: windowSel.processName, titleContains: windowSel.titleContains, selector, includeProcessPopups: true, timeoutMs: actionTimeout }).catch(() => null);
-    await deps.performUiAction({ hwnd: windowSel.hwnd, pid: windowSel.pid, processName: windowSel.processName, titleContains: windowSel.titleContains, selector, action: "invoke", includeProcessPopups: true, timeoutMs: actionTimeout });
-    const items = await waitForMatches(deps, windowSel, { controlType: "MenuItem" }, 5000);
+    const treeBefore = await deps.inspectUiTree({ ...win(), includeProcessPopups: true, maxDepth: 2, maxNodes: 60, timeoutMs: 8000 }).catch(() => null);
+    const rootsBefore = treeBefore ? treeBefore.roots.filter((r) => !r.isMain).length : 0;
+    const sectionsBefore = await deps.queryUi({ ...win(), selector: { automationId: "titleMenu.*SectionAction$", match: "regex", controlType: "Button" }, includeProcessPopups: true, maxDepth: 12, maxResults: 20, timeoutMs: 4000 }).catch(() => ({ elements: [] as UiElementState[] }));
+    await deps.performUiAction({ ...win(), selector, action: "invoke", includeProcessPopups: true, timeoutMs: actionTimeout });
+    const sections = await waitForMatches(deps, windowSel, { automationId: "titleMenu.*SectionAction$", match: "regex", controlType: "Button" }, 6000);
+    const treeAfter = await deps.inspectUiTree({ ...win(), includeProcessPopups: true, maxDepth: 2, maxNodes: 60, timeoutMs: 8000 }).catch(() => null);
+    const rootsAfter = treeAfter ? treeAfter.roots.filter((r) => !r.isMain).length : 0;
+    const popupOpened = sections.elements.length > sectionsBefore.elements.length || rootsAfter > rootsBefore;
+    if (!popupOpened) {
+      throw new McpUiError("ACTION_FAILED", "openMenu: menu did not open (no new popup root and no section rows appeared).", { control: input.control, rootsBefore, rootsAfter, sectionsBefore: sectionsBefore.elements.length, sectionsAfter: sections.elements.length });
+    }
     return {
       profile: profile.id, control: input.control, selectorUsed: selector, confidence: entry.confidence, notes: entry.notes,
-      result: { success: true, method: "openMenu", menuItems: items.elements.map((e) => ({ name: e.name, automationId: e.automationId, enabled: e.enabled })), menuItemCount: items.elements.length, before: before?.element ?? null, after: null }
+      result: {
+        success: true, method: "InvokePattern", popupOpened: true,
+        popupRoots: (treeAfter?.roots ?? []).filter((r) => !r.isMain).map((r) => ({ hwnd: r.hwnd, title: r.title, ownerHwnd: windowSel.hwnd })),
+        items: sections.elements.map((e) => buildMenuItem(e)),
+        itemCount: sections.elements.length
+      }
     };
   }
 
+  // ── openSubmenu: open a section's submenu via focus + Right key. ──
+  // Section rows open submenus on hover/keyboard-Right, NOT via InvokePattern
+  // (their QAction handler is empty). Keys are posted to the menu panel HWND.
+  if (input.action === "openSubmenu") {
+    const panelHwnd = await getMenuPanelHwnd(deps, windowSel, actionTimeout);
+    const before = await deps.queryUi({ ...win(), selector: { automationId: "titleMenu.*Action$", match: "regex", controlType: "Button" }, includeProcessPopups: true, maxDepth: 14, maxResults: 60, timeoutMs: 6000 }).catch(() => ({ elements: [] as UiElementState[] }));
+    const beforeAids = new Set(before.elements.filter((e) => !e.offscreen).map((e) => e.automationId));
+    await deps.performUiAction({ ...win(), selector, action: "focus", includeProcessPopups: true, timeoutMs: actionTimeout });
+    await sleep(150);
+    await deps.sendKey({ hwnd: panelHwnd, key: "right", noActivate: true });
+    const after = await waitForMatches(deps, windowSel, { automationId: "titleMenu.*Action$", match: "regex", controlType: "Button" }, 6000);
+    // Submenu items = command rows now visible that were not visible before.
+    const submenuItems = after.elements.filter((e) => !e.offscreen && !beforeAids.has(e.automationId) && !isSectionAid(e.automationId));
+    if (submenuItems.length === 0) {
+      throw new McpUiError("ACTION_FAILED", "openSubmenu: no submenu items appeared after Right key.", { control: input.control, visibleAfter: after.elements.filter((e) => !e.offscreen).length });
+    }
+    return {
+      profile: profile.id, control: input.control, selectorUsed: selector, confidence: entry.confidence, notes: entry.notes,
+      result: {
+        success: true, method: "keyboard-right", popupOpened: true,
+        items: submenuItems.map((e) => buildMenuItem(e)), itemCount: submenuItems.length
+      }
+    };
+  }
+
+  // ── invoke (menu command): trigger via focus + Enter (non-blocking). ──
+  // Command rows that open a modal QDialog block InvokePattern.Invoke() until
+  // the dialog closes, so the composite path posts Enter asynchronously and
+  // returns. The caller verifies the outcome (e.g. aboutDialog appeared).
+  if (input.action === "invoke" && isMenuCommandControl(profile, input.control)) {
+    const panelHwnd = await getMenuPanelHwnd(deps, windowSel, actionTimeout);
+    const treeBefore = await deps.inspectUiTree({ ...win(), includeProcessPopups: true, maxDepth: 2, maxNodes: 60, timeoutMs: 8000 }).catch(() => null);
+    const rootsBefore = treeBefore ? treeBefore.roots.filter((r) => !r.isMain).length : 0;
+    await deps.performUiAction({ ...win(), selector, action: "focus", includeProcessPopups: true, timeoutMs: actionTimeout });
+    await sleep(150);
+    await deps.sendKey({ hwnd: panelHwnd, key: "enter", noActivate: true });
+    await sleep(450);
+    const treeAfter = await deps.inspectUiTree({ ...win(), includeProcessPopups: true, maxDepth: 2, maxNodes: 60, timeoutMs: 8000 }).catch(() => null);
+    const rootsAfter = treeAfter ? treeAfter.roots.filter((r) => !r.isMain).length : 0;
+    return {
+      profile: profile.id, control: input.control, selectorUsed: selector, confidence: entry.confidence, notes: entry.notes,
+      result: {
+        success: true, method: "keyboard-invoke", triggered: true,
+        rootsBefore, rootsAfter,
+        popupRoots: (treeAfter?.roots ?? []).filter((r) => !r.isMain).map((r) => ({ hwnd: r.hwnd, title: r.title, ownerHwnd: windowSel.hwnd }))
+      }
+    };
+  }
+
+  // ── getSelection: query selected ListItems. ──
   if (input.action === "getSelection") {
-    // Query ListItems with selected state. queryUi returns `selected` in state.
-    const r = await deps.queryUi({ hwnd: windowSel.hwnd, pid: windowSel.pid, processName: windowSel.processName, titleContains: windowSel.titleContains, selector: { controlType: "ListItem" }, includeProcessPopups: true, maxDepth: 20, maxResults: 200, timeoutMs: actionTimeout });
+    const r = await deps.queryUi({ ...win(), selector: { controlType: "ListItem" }, includeProcessPopups: true, maxDepth: 20, maxResults: 200, timeoutMs: actionTimeout });
     const selected = r.elements.filter((e) => e.selected === true);
     return {
       profile: profile.id, control: input.control, selectorUsed: selector, confidence: entry.confidence, notes: entry.notes,
@@ -456,48 +611,92 @@ async function performCompositeProfileAction(
     };
   }
 
-  // selectByName / selectByIndex on a ComboBox or List.
-  const before = await deps.getUiElement({ hwnd: windowSel.hwnd, pid: windowSel.pid, processName: windowSel.processName, titleContains: windowSel.titleContains, selector, includeProcessPopups: true, timeoutMs: actionTimeout }).catch(() => null);
+  // ── selectByName / selectByIndex on a ComboBox. ──
+  // Primary: ExpandCollapse + ListItem SelectionItemPattern. Fallback (Qt combos
+  // that do not expose ListItem): keyboard navigation (focus, Alt+Down, Home,
+  // Down×index, Enter). The current value is read before AND after and MUST
+  // change, else the action is reported as failed (not just "keys were sent").
+  const before = await deps.getUiElement({ ...win(), selector, includeProcessPopups: true, timeoutMs: actionTimeout }).catch(() => null);
+  const beforeValue = before?.element?.value ?? null;
 
-  // Expand the combo/list to surface its items in a same-PID popup.
+  let selected: { name: string; automationId: string } | null = null;
+  let method = "keyboard-fallback";
   try {
-    await deps.performUiAction({ hwnd: windowSel.hwnd, pid: windowSel.pid, processName: windowSel.processName, titleContains: windowSel.titleContains, selector, action: "expand", includeProcessPopups: true, timeoutMs: actionTimeout });
-  } catch {
-    // Some controls are already expanded or expose items without a popup.
+    await deps.performUiAction({ ...win(), selector, action: "expand", includeProcessPopups: true, timeoutMs: actionTimeout });
+    const listItems = await waitForMatches(deps, windowSel, { controlType: "ListItem" }, 6000);
+    if (listItems.elements.length > 0) {
+      let target: UiElementState | undefined;
+      if (input.action === "selectByName") {
+        const matches = listItems.elements.filter((e) => e.name === input.value);
+        if (matches.length === 0) throw new McpUiError("ELEMENT_NOT_FOUND", `No ListItem named '${input.value}'.`, { control: input.control, available: listItems.elements.map((e) => e.name) });
+        if (matches.length > 1) throw new McpUiError("ELEMENT_AMBIGUOUS", `${matches.length} ListItems named '${input.value}'.`, { control: input.control });
+        target = matches[0];
+      } else {
+        const idx = input.index ?? 0;
+        if (idx >= listItems.elements.length) throw new McpUiError("ELEMENT_NOT_FOUND", `ListItem index ${idx} out of range (0..${listItems.elements.length - 1}).`, { control: input.control });
+        target = listItems.elements[idx];
+      }
+      if (!target) throw new McpUiError("ELEMENT_NOT_FOUND", `selectByName/Index: target ListItem not resolved.`, { control: input.control });
+      const itemSelector: UiElementSelector = target.automationId
+        ? { automationId: target.automationId, controlType: "ListItem" }
+        : { name: target.name, controlType: "ListItem" };
+      await deps.performUiAction({ ...win(), selector: itemSelector, action: "select", includeProcessPopups: true, timeoutMs: actionTimeout });
+      selected = { name: target.name, automationId: target.automationId };
+      method = "SelectionItemPattern";
+    }
+  } catch (e) {
+    if (e instanceof McpUiError && (e.code === "ELEMENT_AMBIGUOUS" || e.code === "ELEMENT_NOT_FOUND") && e.details && (e.details as { available?: string[] }).available) {
+      throw e;
+    }
+    // otherwise fall through to keyboard fallback
   }
 
-  const listItems = await waitForMatches(deps, windowSel, { controlType: "ListItem" }, 6000);
-  if (listItems.elements.length === 0) {
-    throw new McpUiError("ELEMENT_NOT_FOUND", `selectByName/Index: no ListItem found after expand (control may not expose items via UIA popup).`, { control: input.control });
+  if (!selected) {
+    // Keyboard fallback. Focus the combo, expand with Alt+Down, navigate.
+    await deps.performUiAction({ ...win(), selector, action: "focus", includeProcessPopups: true, timeoutMs: actionTimeout }).catch(() => undefined);
+    await sleep(150);
+    const keyHwnd = windowSel.hwnd;
+    await deps.sendKey({ hwnd: keyHwnd, key: "down", modifiers: ["alt"], noActivate: true });
+    await sleep(400);
+    if (input.action === "selectByIndex") {
+      const idx = input.index ?? 0;
+      await deps.sendKey({ hwnd: keyHwnd, key: "home", noActivate: true });
+      await sleep(120);
+      for (let i = 0; i < idx; i++) {
+        await deps.sendKey({ hwnd: keyHwnd, key: "down", noActivate: true });
+        await sleep(70);
+      }
+      await deps.sendKey({ hwnd: keyHwnd, key: "enter", noActivate: true });
+      await sleep(350);
+      selected = { name: `(keyboard index ${idx})`, automationId: "" };
+      method = "keyboard-index";
+    } else {
+      // selectByName keyboard fallback: close popup, type the exact value as
+      // edit text (Qt combo accepts typed text), then Enter. Verified by the
+      // after-value read below; if it did not take, the action fails.
+      await deps.sendKey({ hwnd: keyHwnd, key: "escape", noActivate: true });
+      await sleep(150);
+      await deps.performUiAction({ ...win(), selector, action: "setValue", value: input.value, includeProcessPopups: true, timeoutMs: actionTimeout }).catch(() => undefined);
+      await sleep(200);
+      await deps.sendKey({ hwnd: keyHwnd, key: "enter", noActivate: true });
+      await sleep(300);
+      selected = { name: input.value ?? "", automationId: "" };
+      method = "keyboard-name";
+    }
   }
 
-  let target: QueryResult["elements"][number] | undefined;
-  if (input.action === "selectByName") {
-    const matches = listItems.elements.filter((e) => e.name === input.value);
-    if (matches.length === 0) throw new McpUiError("ELEMENT_NOT_FOUND", `No ListItem named '${input.value}'.`, { control: input.control, available: listItems.elements.map((e) => e.name) });
-    if (matches.length > 1) throw new McpUiError("ELEMENT_AMBIGUOUS", `${matches.length} ListItems named '${input.value}'.`, { control: input.control });
-    target = matches[0];
-  } else {
-    // selectByIndex
-    const idx = input.index ?? 0;
-    if (idx >= listItems.elements.length) throw new McpUiError("ELEMENT_NOT_FOUND", `ListItem index ${idx} out of range (0..${listItems.elements.length - 1}).`, { control: input.control });
-    target = listItems.elements[idx];
-  }
-
-  // Build a selector for the target item: prefer unique automationId, else name.
-  const itemSelector: UiElementSelector = target!.automationId
-    ? { automationId: target!.automationId, controlType: "ListItem" }
-    : { name: target!.name, controlType: "ListItem" };
-
-  const selectResult = await deps.performUiAction({ hwnd: windowSel.hwnd, pid: windowSel.pid, processName: windowSel.processName, titleContains: windowSel.titleContains, selector: itemSelector, action: "select", includeProcessPopups: true, timeoutMs: actionTimeout });
-
-  // Collapse the popup (best-effort) and read the after state.
-  await deps.performUiAction({ hwnd: windowSel.hwnd, pid: windowSel.pid, processName: windowSel.processName, titleContains: windowSel.titleContains, selector, action: "collapse", includeProcessPopups: true, timeoutMs: actionTimeout }).catch(() => undefined);
-  const after = await deps.getUiElement({ hwnd: windowSel.hwnd, pid: windowSel.pid, processName: windowSel.processName, titleContains: windowSel.titleContains, selector, includeProcessPopups: true, timeoutMs: actionTimeout }).catch(() => null);
+  // Collapse the popup (best-effort) and read the after value.
+  await deps.performUiAction({ ...win(), selector, action: "collapse", includeProcessPopups: true, timeoutMs: actionTimeout }).catch(() => undefined);
+  const after = await deps.getUiElement({ ...win(), selector, includeProcessPopups: true, timeoutMs: actionTimeout }).catch(() => null);
+  const afterValue = after?.element?.value ?? null;
+  const valueChanged = afterValue !== null && afterValue !== beforeValue;
 
   return {
     profile: profile.id, control: input.control, selectorUsed: selector, confidence: entry.confidence, notes: entry.notes,
-    result: { success: true, method: "selectByName/Index", selected: { name: target!.name, automationId: target!.automationId }, selectResult, before: before?.element ?? null, after: after?.element ?? null }
+    result: {
+      success: valueChanged, method, selected, beforeValue, afterValue, valueChanged,
+      popupClosed: true, before: before?.element ?? null, after: after?.element ?? null
+    }
   };
 }
 
@@ -509,8 +708,9 @@ export async function launchProfile(
   deps: UiaDeps,
   windowsLaunch: (input: { exePath: string; args?: string[]; waitForWindow?: boolean; noActivate?: boolean; startMinimized?: boolean; timeoutMs?: number }) => Promise<{ pid: number; window: { hwnd: string; title: string; pid: number; processName: string; className: string; rect: unknown } | null }>,
   listWindows: (filters: { processName?: string }) => Promise<Array<{ hwnd: string; title: string; pid: number; processName: string }>>,
-  input: { profile: string; exePath?: string; args?: string[]; waitForWindow?: boolean; noActivate?: boolean; startMinimized?: boolean; timeoutMs?: number; reuseIfRunning?: boolean }
-): Promise<{ profile: string; pid: number; hwnd?: string; title?: string; startedByMcp: boolean; reused: boolean; uiaRootAvailable: boolean }> {
+  input: { profile: string; exePath?: string; args?: string[]; waitForWindow?: boolean; noActivate?: boolean; startMinimized?: boolean; timeoutMs?: number; reuseIfRunning?: boolean },
+  getExeManifestLevel?: (exePath: string) => Promise<string>
+): Promise<{ profile: string; pid: number; hwnd?: string; title?: string; startedByMcp: boolean; reused: boolean; uiaRootAvailable: boolean; manifestLevel?: string }> {
   const profile = getProfile(input.profile);
   if (!profile) {
     throw new McpUiError("PROFILE_NOT_FOUND", `No profile with id '${input.profile}'.`, { profile: input.profile });
@@ -537,6 +737,24 @@ export async function launchProfile(
   }
 
   const exePath = await resolveProfileExecutable(profile, input.exePath);
+
+  // Manifest check: reject an old elevated build BEFORE spawning it. A
+  // requireAdministrator exe would trigger a UAC prompt and a non-elevated MCP
+  // cannot inspect it anyway. "unknown" (no manifest / unreadable) is reported
+  // as a structured warning but does NOT block launch, so a manifest-less dev
+  // build can still run.
+  let manifestLevel: string | undefined;
+  if (profile.requiresAsInvoker && getExeManifestLevel) {
+    manifestLevel = await getExeManifestLevel(exePath);
+    if (manifestLevel === "requireAdministrator" || manifestLevel === "highestAvailable") {
+      throw new McpUiError(
+        "VAPORVIEW_OLD_ELEVATED_BUILD",
+        `VaporView.exe has a '${manifestLevel}' manifest. A non-elevated MCP cannot inspect it. Rebuild or install the latest VaporView (asInvoker manifest); the MCP server does NOT need to run elevated.`,
+        { profile: profile.id, exePath, manifestLevel }
+      );
+    }
+  }
+
   const launched = await windowsLaunch({
     exePath,
     args: input.args,
@@ -562,7 +780,8 @@ export async function launchProfile(
     title: launched.window?.title,
     startedByMcp: true,
     reused: false,
-    uiaRootAvailable
+    uiaRootAvailable,
+    ...(manifestLevel !== undefined ? { manifestLevel } : {})
   };
 }
 

@@ -214,7 +214,8 @@ export type UiErrorCode =
   | "INVALID_BOUNDING_RECT"
   | "TARGET_PROCESS_EXITED"
   | "UIA_ASSEMBLY_UNAVAILABLE"
-  | "INVALID_SELECTOR";
+  | "INVALID_SELECTOR"
+  | "VAPORVIEW_OLD_ELEVATED_BUILD";
 
 export type UiErrorDetails = {
   selector?: unknown;

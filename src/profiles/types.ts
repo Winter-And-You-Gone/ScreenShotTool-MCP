@@ -43,6 +43,12 @@ export type AppProfile = {
   // Environment variable name (e.g. "VAPORVIEW_EXE") that overrides the
   // executable path. Machine-specific paths must come through this, not source.
   executableEnv?: string;
+  // When true, profile_launch reads the resolved executable's embedded Win32
+  // manifest and REJECTS a requireAdministrator/highestAvailable build before
+  // spawning it (VAPORVIEW_OLD_ELEVATED_BUILD): a non-elevated MCP cannot
+  // inspect an elevated process, and spawning it would trigger a UAC prompt.
+  // The latest VaporView builds asInvoker; old builds were requireAdministrator.
+  requiresAsInvoker?: boolean;
   // Each logical control maps to one or more candidate selectors (tried in
   // order) plus a confidence label. For backwards compatibility a bare
   // selector / selector[] is also accepted and wrapped with the default

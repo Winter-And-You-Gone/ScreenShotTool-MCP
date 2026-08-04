@@ -16,7 +16,9 @@ import { z } from "zod";
 import type * as SchemasModule from "./schemas.js";
 import type * as WindowsModule from "./windows.js";
 import type * as ProfilesModule from "./profiles/registry.js";
+import type { UiaDeps } from "./profiles/registry.js";
 import { McpUiError } from "./uia/results.js";
+import { resolvePlaceholders, validateReferences } from "./piping.js";
 
 type RuntimeModules = {
   version: string;
@@ -194,6 +196,11 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
         name: "ui_catalog",
         description: "List the actionable controls of a target window with a recommendedSelector (pass verbatim to ui_action), supportedActions, patterns, and selector-stability confidence (stable/conditionally-stable/fragile/unsupported). Lets an AI agent enumerate operable controls without understanding the full UIA tree. Auto-enriches with profileControl labels when the target matches a known profile.",
         inputSchema: schemas.toolInputSchemas.ui_catalog
+      },
+      {
+        name: "run_steps",
+        description: "Execute a sequence of tools sequentially in a single server-side call. Each step is {tool, args} where args are exactly the tool's normal arguments. Steps run in order; the chain stops on the first step that errors and later steps are skipped. Returns {success, total, completed, stoppedAtIndex, steps:[{tool, success, result|error}]}. OUTPUT PIPING: a step's args may reference earlier steps' results with ${N.path} placeholders (e.g. {\"pid\": \"${0.pid}\"} or {\"hwnd\": \"${0.window.hwnd}\"}; ${0.0.hwnd} indexes into an array result). A whole-value placeholder preserves the referenced type; an embedded one (\"id-${0.pid}\") is stringified. A step may only reference earlier steps (index < its own) - forward references are rejected before any step runs. Syntax is strict ${digits.dottedPath}; other ${...} strings are left literal. run_steps cannot be used as a step. Use to reduce round-trips for a known multi-step sequence (e.g. launch_app -> wait_for_window {pid: ${0.pid}} -> capture_window {pid: ${0.pid}}). Step latencies stack.",
+        inputSchema: schemas.toolInputSchemas.run_steps
       }
     ]
   };
@@ -203,82 +210,19 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
   const { name, arguments: args } = request.params;
 
   try {
-    const { schemas, windows, profiles } = await loadRuntime();
+    const runtime = await loadRuntime();
     // Build the UIA dependency bag from the CURRENT runtime's windows module.
     // Passing this into the profile layer (rather than letting registry.ts
     // import windows.js itself) is what keeps a single worker across hot
     // reloads: the profile layer never holds a second module instance.
-    const uiaDeps = profiles.buildUiaDeps(windows);
+    const uiaDeps = runtime.profiles.buildUiaDeps(runtime.windows);
 
-    switch (name) {
-      case "launch_app":
-        return jsonResult(await windows.launchApp(parseArgs(schemas.launchAppSchema, args)));
-      case "list_windows":
-        return jsonResult(await windows.listWindows(parseArgs(schemas.listWindowsSchema, args)));
-      case "capture_window":
-        return jsonResult(await windows.captureWindow(parseArgs(schemas.captureWindowSchema, args)));
-      case "capture_screen_region":
-        return jsonResult(await windows.captureScreenRegion(parseArgs(schemas.captureScreenRegionSchema, args)));
-      case "click_window":
-        return jsonResult(await windows.clickWindow(parseArgs(schemas.clickWindowSchema, args)));
-      case "click_menu_item":
-        return jsonResult(await windows.clickMenuItem(parseArgs(schemas.clickMenuItemSchema, args)));
-      case "move_mouse_window":
-        return jsonResult(await windows.moveMouseWindow(parseArgs(schemas.moveMouseWindowSchema, args)));
-      case "close_app":
-        return jsonResult(await windows.closeApp(parseArgs(schemas.closeAppSchema, args).pid));
-      case "type_text":
-        return jsonResult(await windows.typeText(parseArgs(schemas.typeTextSchema, args)));
-      case "send_key":
-        return jsonResult(await windows.sendKey(parseArgs(schemas.sendKeySchema, args)));
-      case "read_clipboard":
-        return jsonResult(await windows.readClipboard(parseArgs(schemas.readClipboardSchema, args)));
-      case "write_clipboard":
-        return jsonResult(await windows.writeClipboard(parseArgs(schemas.writeClipboardSchema, args)));
-      case "get_window_state":
-        return jsonResult(await windows.getWindowState(parseArgs(schemas.getWindowStateSchema, args)));
-      case "wait_for_window":
-        return jsonResult(await windows.waitForWindow(parseArgs(schemas.waitForWindowSchema, args)));
-      case "ui_inspect_tree":
-        return jsonResult(await windows.inspectUiTree(parseArgs(schemas.uiInspectTreeSchema, args)));
-      case "ui_query":
-        return jsonResult(await windows.queryUi(parseArgs(schemas.uiQuerySchema, args)));
-      case "ui_get":
-        return jsonResult(await windows.getUiElement(parseArgs(schemas.uiGetSchema, args)));
-      case "ui_action":
-        return jsonResult(await windows.performUiAction(parseArgs(schemas.uiActionSchema, args)));
-      case "ui_wait":
-        return jsonResult(await windows.waitForUi(parseArgs(schemas.uiWaitSchema, args)));
-      case "profile_list":
-        return jsonResult(profiles.profileList());
-      case "profile_resolve":
-        return jsonResult(await profiles.resolveProfileControl(uiaDeps, parseArgs(schemas.profileResolveSchema, args)));
-      case "profile_action":
-        return jsonResult(await profiles.performProfileAction(uiaDeps, parseArgs(schemas.profileActionSchema, args)));
-      case "profile_launch":
-        return jsonResult(await profiles.launchProfile(
-          uiaDeps,
-          async (i) => windows.launchApp({
-            exePath: i.exePath,
-            args: i.args ?? [],
-            waitForWindow: i.waitForWindow ?? true,
-            noActivate: i.noActivate ?? true,
-            startMinimized: i.startMinimized ?? false,
-            timeoutMs: i.timeoutMs ?? 30000
-          }),
-          windows.listWindows,
-          parseArgs(schemas.profileLaunchSchema, args)
-        ));
-      case "ui_catalog": {
-        const catInput = parseArgs(schemas.uiCatalogSchema, args);
-        const catalog = await windows.catalogUi(catInput);
-        const profile = profiles.findProfileForTarget({ processName: catInput.processName, titleContains: catInput.titleContains });
-        catalog.controls = profiles.enrichCatalogControls(profile, catalog.controls);
-        return jsonResult(catalog);
-      }
-      default:
-        throw new McpError(ErrorCode.MethodNotFound, `Unknown tool: ${name}`);
+    // run_steps orchestrates other tools; it is handled here rather than in
+    // dispatchToolValue so it cannot recurse into itself.
+    if (name === "run_steps") {
+      return jsonResult(await runSteps(args, runtime, uiaDeps));
     }
+    return jsonResult(await dispatchToolValue(name, args, runtime, uiaDeps));
   } catch (error) {
     if (error instanceof McpError) {
       throw error;
@@ -311,6 +255,181 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     };
   }
 });
+
+// Execute a single tool by name, returning its raw result value (the value
+// jsonResult wraps). Extracted from the CallTool handler so run_steps can
+// invoke tools without going through the MCP request layer. run_steps itself
+// is intentionally not dispatchable here: reaching the default branch for it
+// yields MethodNotFound, which prevents nesting.
+async function dispatchToolValue(
+  name: string,
+  args: unknown,
+  runtime: RuntimeModules,
+  uiaDeps: UiaDeps
+): Promise<unknown> {
+  const { schemas, windows, profiles } = runtime;
+
+  switch (name) {
+    case "launch_app":
+      return await windows.launchApp(parseArgs(schemas.launchAppSchema, args));
+    case "list_windows":
+      return await windows.listWindows(parseArgs(schemas.listWindowsSchema, args));
+    case "capture_window":
+      return await windows.captureWindow(parseArgs(schemas.captureWindowSchema, args));
+    case "capture_screen_region":
+      return await windows.captureScreenRegion(parseArgs(schemas.captureScreenRegionSchema, args));
+    case "click_window":
+      return await windows.clickWindow(parseArgs(schemas.clickWindowSchema, args));
+    case "click_menu_item":
+      return await windows.clickMenuItem(parseArgs(schemas.clickMenuItemSchema, args));
+    case "move_mouse_window":
+      return await windows.moveMouseWindow(parseArgs(schemas.moveMouseWindowSchema, args));
+    case "close_app":
+      return await windows.closeApp(parseArgs(schemas.closeAppSchema, args).pid);
+    case "type_text":
+      return await windows.typeText(parseArgs(schemas.typeTextSchema, args));
+    case "send_key":
+      return await windows.sendKey(parseArgs(schemas.sendKeySchema, args));
+    case "read_clipboard":
+      return await windows.readClipboard(parseArgs(schemas.readClipboardSchema, args));
+    case "write_clipboard":
+      return await windows.writeClipboard(parseArgs(schemas.writeClipboardSchema, args));
+    case "get_window_state":
+      return await windows.getWindowState(parseArgs(schemas.getWindowStateSchema, args));
+    case "wait_for_window":
+      return await windows.waitForWindow(parseArgs(schemas.waitForWindowSchema, args));
+    case "ui_inspect_tree":
+      return await windows.inspectUiTree(parseArgs(schemas.uiInspectTreeSchema, args));
+    case "ui_query":
+      return await windows.queryUi(parseArgs(schemas.uiQuerySchema, args));
+    case "ui_get":
+      return await windows.getUiElement(parseArgs(schemas.uiGetSchema, args));
+    case "ui_action":
+      return await windows.performUiAction(parseArgs(schemas.uiActionSchema, args));
+    case "ui_wait":
+      return await windows.waitForUi(parseArgs(schemas.uiWaitSchema, args));
+    case "profile_list":
+      return profiles.profileList();
+    case "profile_resolve":
+      return await profiles.resolveProfileControl(uiaDeps, parseArgs(schemas.profileResolveSchema, args));
+    case "profile_action":
+      return await profiles.performProfileAction(uiaDeps, parseArgs(schemas.profileActionSchema, args));
+    case "profile_launch":
+      return await profiles.launchProfile(
+        uiaDeps,
+        async (i) => windows.launchApp({
+          exePath: i.exePath,
+          args: i.args ?? [],
+          waitForWindow: i.waitForWindow ?? true,
+          noActivate: i.noActivate ?? true,
+          startMinimized: i.startMinimized ?? false,
+          timeoutMs: i.timeoutMs ?? 30000
+        }),
+        windows.listWindows,
+        parseArgs(schemas.profileLaunchSchema, args),
+        windows.getExeManifestLevel
+      );
+    case "ui_catalog": {
+      const catInput = parseArgs(schemas.uiCatalogSchema, args);
+      const catalog = await windows.catalogUi(catInput);
+      const profile = profiles.findProfileForTarget({ processName: catInput.processName, titleContains: catInput.titleContains });
+      catalog.controls = profiles.enrichCatalogControls(profile, catalog.controls);
+      return catalog;
+    }
+    default:
+      throw new McpError(ErrorCode.MethodNotFound, `Unknown tool: ${name}`);
+  }
+}
+
+type StepResult =
+  | { tool: string; success: true; result: unknown }
+  | { tool: string; success: false; error: { code?: string; message: string; details?: unknown } };
+
+interface RunStepsResult {
+  success: boolean;
+  total: number;
+  completed: number;
+  stoppedAtIndex: number | null;
+  steps: StepResult[];
+}
+
+// Execute a sequence of tools sequentially in a single call. Each step is
+// dispatched through dispatchToolValue - the same path as a direct tools/call
+// - so argument validation and error semantics are identical to calling the
+// tool directly. A step's args may contain ${N.path} placeholders that are
+// resolved against earlier steps' results before dispatch (see piping.ts).
+// The chain stops on the first step that errors; later steps are skipped.
+// run_steps is excluded from the schema's tool enum, so it cannot nest.
+async function runSteps(
+  args: unknown,
+  runtime: RuntimeModules,
+  uiaDeps: UiaDeps
+): Promise<RunStepsResult> {
+  const input = parseArgs(runtime.schemas.runStepsSchema, args);
+
+  // Structural pre-check: reject forward/invalid placeholder references
+  // before any step runs. This is a malformed-pipeline error, not a per-step
+  // failure, so it surfaces as InvalidParams on the whole call.
+  const validation = validateReferences(input.steps);
+  if (!validation.ok) {
+    throw new McpError(ErrorCode.InvalidParams, validation.message);
+  }
+
+  const steps: StepResult[] = [];
+  let stoppedAtIndex: number | null = null;
+  // Raw results of completed steps, in order. Used to resolve ${N...}
+  // placeholders in later steps' args.
+  const results: unknown[] = [];
+
+  for (let i = 0; i < input.steps.length; i++) {
+    const step = input.steps[i]!;
+
+    // Resolve placeholders against prior results. A resolution failure (e.g.
+    // a referenced field that doesn't exist) fails this step and stops the
+    // chain, mirroring how a tool-execution failure is handled.
+    const resolution = resolvePlaceholders(step.args, results);
+    if (!resolution.ok) {
+      stoppedAtIndex = i;
+      steps.push({ tool: step.tool, success: false, error: { message: resolution.reason } });
+      break;
+    }
+
+    try {
+      const result = await dispatchToolValue(step.tool, resolution.value, runtime, uiaDeps);
+      results.push(result);
+      steps.push({ tool: step.tool, success: true, result });
+    } catch (error) {
+      stoppedAtIndex = i;
+      steps.push({ tool: step.tool, success: false, error: toStepError(error) });
+      break;
+    }
+  }
+
+  return {
+    success: stoppedAtIndex === null,
+    total: input.steps.length,
+    completed: stoppedAtIndex === null ? steps.length : stoppedAtIndex,
+    stoppedAtIndex,
+    steps
+  };
+}
+
+// Normalize any thrown value from a step into a serializable error object,
+// mirroring the top-level error handling: McpError carries a numeric code,
+// McpUiError carries a string code + details, anything else degrades to a
+// message string.
+function toStepError(error: unknown): { code?: string; message: string; details?: unknown } {
+  if (error instanceof McpError) {
+    return { code: String(error.code), message: error.message };
+  }
+  if (error instanceof McpUiError) {
+    return { code: error.code, message: error.message, details: error.details ?? {} };
+  }
+  if (error instanceof Error) {
+    return { message: error.message };
+  }
+  return { message: String(error) };
+}
 
 async function loadRuntime(): Promise<RuntimeModules> {
   const version = hotReloadEnabled ? await runtimeVersion() : "static";

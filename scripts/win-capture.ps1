@@ -301,6 +301,29 @@ namespace ScreenshotTool {
 
     [DllImport("user32.dll", SetLastError = true)]
     public static extern bool GetLayeredWindowAttributes(IntPtr hWnd, out uint crKey, out byte bAlpha, out uint dwFlags);
+
+    // ── Embedded-manifest reading (RT_MANIFEST, resource type 24) ──
+    // Used by profile_launch to detect an old requireAdministrator build
+    // before spawning it (a non-elevated MCP cannot inspect an elevated exe
+    // and a requireAdministrator exe would trigger a UAC prompt). LOAD_LIBRARY_AS_DATAFILE
+    // loads the PE without running it.
+    [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Auto)]
+    public static extern IntPtr LoadLibraryEx(string lpFileName, IntPtr hFile, uint dwFlags);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    public static extern IntPtr FindResource(IntPtr hModule, IntPtr lpName, uint lpType);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    public static extern uint SizeofResource(IntPtr hModule, IntPtr hResInfo);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    public static extern IntPtr LoadResource(IntPtr hModule, IntPtr hResInfo);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    public static extern IntPtr LockResource(IntPtr hResData);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    public static extern bool FreeLibrary(IntPtr hModule);
   }
 }
 "@
@@ -2552,6 +2575,55 @@ function Wait-And-Suppress {
 #    worker loop (Invoke-Action catch) re-emits them verbatim.
 # ════════════════════════════════════════════════════════════════════════════
 
+# Return a stable string key for an element's RuntimeId. The RuntimeId is the
+# canonical UIA element identity: the same element reached via two roots (e.g.
+# a Qt::Tool panel that is BOTH a child of the main window AND a top-level
+# window of the same PID) yields the same RuntimeId both times. Used to
+# deduplicate multi-root walks so such an element is counted once.
+function Get-UiaRuntimeIdKey {
+  param($Element)
+  try {
+    $rid = @($Element.GetRuntimeId())
+    if ($rid.Count -eq 0) { return $null }
+    return ($rid -join ',')
+  } catch { return $null }
+}
+
+# Read an executable's embedded Win32 manifest (RT_MANIFEST, resource type 24)
+# and return its requestedExecutionLevel ("asInvoker", "requireAdministrator",
+# "highestAvailable", "asInvoker" variants) or "unknown" when no manifest is
+# embedded / cannot be read. Loads the PE as a data file only - never runs it.
+function Get-ExeManifestLevel {
+  param([string]$ExePath)
+  if ([string]::IsNullOrWhiteSpace($ExePath)) { return "unknown" }
+  try {
+    $h = [ScreenshotTool.Native]::LoadLibraryEx($ExePath, [IntPtr]::Zero, [uint32]0x2)
+    if ($h -eq [IntPtr]::Zero) { return "unknown" }
+    try {
+      # RT_MANIFEST resource ids 1 (Win32), 2 (Win16), 3 (MSI). Try each.
+      foreach ($name in @(1, 2, 3)) {
+        $hRes = [ScreenshotTool.Native]::FindResource($h, [IntPtr]::new($name), [uint32]24)
+        if ($hRes -ne [IntPtr]::Zero) {
+          $size = [ScreenshotTool.Native]::SizeofResource($h, $hRes)
+          $hData = [ScreenshotTool.Native]::LoadResource($h, $hRes)
+          $p = [ScreenshotTool.Native]::LockResource($hData)
+          if ($size -gt 0 -and $p -ne [IntPtr]::Zero) {
+            $buf = New-Object byte[] $size
+            [System.Runtime.InteropServices.Marshal]::Copy($p, $buf, 0, $size)
+            $xml = [System.Text.Encoding]::UTF8.GetString($buf)
+            if ($xml -match 'requestedExecutionLevel[^>]*level=["'']([^"'']+)["'']') {
+              return $Matches[1]
+            }
+          }
+        }
+      }
+    } finally {
+      [void][ScreenshotTool.Native]::FreeLibrary($h)
+    }
+  } catch {}
+  return "unknown"
+}
+
 # Pattern identifiers used throughout. Cached once per process.
 function Get-UiaPatternIds {
   return @{
@@ -3111,9 +3183,25 @@ function Resolve-UiaRecordsFromRoots {
     $ancestorSelector = [hashtable]$Selector.ancestor
   }
 
+  # Dedup across roots: a Qt::Tool/QDialog top-level window parented (in the
+  # QObject sense) to the main window is reachable BOTH as a descendant of the
+  # main window root AND as its own top-level root. Walking both double-counts
+  # every element in that subtree. Track non-zero NativeWindowHandles visited
+  # under earlier roots; when a later non-main root's HWND was already visited,
+  # skip the entire root (its subtree was already walked). This is cheap
+  # (NativeWindowHandle is a Current property) and exactly correct for
+  # top-level-window duplication.
+  $visitedHwnds = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::Ordinal)
+
   foreach ($root in $Roots) {
     if ($records.Count -ge $MaxResults) { $truncated = $true; break }
     if ($visited -ge $MaxNodes) { $truncated = $true; break }
+    # Skip a non-main root whose window was already visited as a descendant of
+    # an earlier root (the Qt::Tool-panel-as-both-child-and-root case).
+    if (-not $root.isMain) {
+      $rootHwnd = [string]$root.hwnd
+      if ($rootHwnd -ne "" -and $visitedHwnds.Contains($rootHwnd)) { continue }
+    }
     $deadline = [DateTimeOffset]::UtcNow.AddMilliseconds($PerRootMs)
 
     if ($hasPath) {
@@ -3151,6 +3239,12 @@ function Resolve-UiaRecordsFromRoots {
 
       $node = $stack.Pop()
       $visited++
+      # Track this node's window handle so later non-main roots that resolve to
+      # the same top-level window (Qt::Tool panel / QDialog) are skipped.
+      try {
+        $nh = [int]$node.Element.Current.NativeWindowHandle
+        if ($nh -ne 0) { [void]$visitedHwnds.Add([string]$nh) }
+      } catch {}
       $isMatch = $false
       try { $isMatch = Test-UiaElementMatches -Element $node.Element -Selector $Selector } catch { $isMatch = $false }
       if ($isMatch -and ($null -eq $ancestorSelector -or (Test-UiaAncestorChain -Element $node.Element -AncestorSelector $ancestorSelector -Walker $walker -MaxDepth $MaxDepth))) {
@@ -3225,8 +3319,20 @@ function Invoke-UiInspectTree {
     foreach ($ct in $controlTypes) { $ctrlTypeFilterSet.Add((ConvertTo-UiaControlTypeName $ct)) | Out-Null }
   }
 
+  # Dedup across roots: a Qt::Tool/QDialog top-level window parented (QObject
+  # parent) to the main window is reachable BOTH as a descendant of the main
+  # root AND as its own top-level root. Track visited non-zero window handles;
+  # skip a later non-main root whose window was already visited, so its subtree
+  # is not double-counted (which would make unique AutomationIds look ambiguous).
+  $visitedHwnds = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::Ordinal)
+
   foreach ($root in $roots) {
     if ($script:walkStop) { break }
+    # Skip a non-main root already visited as a descendant of an earlier root.
+    if (-not $root.isMain) {
+      $rootHwnd = [string]$root.hwnd
+      if ($rootHwnd -ne "" -and $visitedHwnds.Contains($rootHwnd)) { continue }
+    }
     $rootDeadline = [DateTimeOffset]::UtcNow.AddMilliseconds($perRootMs)
     $stack = [System.Collections.Stack]::new()
     $stack.Push([pscustomobject]@{ Element = $root.element; Depth = 0; ParentId = $null })
@@ -3255,6 +3361,11 @@ function Invoke-UiInspectTree {
       try { $focusable = [bool]$el.Current.IsKeyboardFocusable } catch {}
       try { $hasFocus = [bool]$el.Current.HasKeyboardFocus } catch {}
 
+      # Track this node's window handle so later non-main roots that resolve to
+      # the same top-level window (Qt::Tool panel / QDialog) are skipped.
+      $nativeHandle = ""
+      try { $nh = $el.Current.NativeWindowHandle; if ($nh -ne 0) { $nativeHandle = [string]$nh; [void]$visitedHwnds.Add($nativeHandle) } } catch {}
+
       # Filtering: filters only affect whether the node is RETURNED, not
       # whether traversal continues past it.
       $include = $true
@@ -3270,8 +3381,6 @@ function Invoke-UiInspectTree {
         try { $r = $el.Current.BoundingRectangle; if ($r.Width -gt 0 -and $r.Height -gt 0) { $rect = [ordered]@{ x=[int]$r.X; y=[int]$r.Y; width=[int]$r.Width; height=[int]$r.Height } } } catch {}
         $pats = @()
         if ($includePatterns) { $pats = (Get-UiaElementState -Element $el -IncludePatterns $true -IncludeValues $false).patterns }
-        $nativeHandle = ""
-        try { $nh = $el.Current.NativeWindowHandle; if ($nh -ne 0) { $nativeHandle = [string]$nh } } catch {}
         $nodes.Add([ordered]@{
           nodeId = $nodeId
           parentNodeId = $node.ParentId
@@ -3968,6 +4077,12 @@ function Invoke-Action {
     }
     "ui-wait" {
       return Invoke-UiWait -Target $Request.target
+    }
+    "get-exe-manifest-level" {
+      $exePath = ""
+      if ($Request.ContainsKey("exePath") -and $null -ne $Request.exePath) { $exePath = [string]$Request.exePath }
+      $level = Get-ExeManifestLevel -ExePath $exePath
+      return [ordered]@{ exePath = $exePath; executionLevel = $level }
     }
     default {
       throw "Unknown action: $($Request.action)"

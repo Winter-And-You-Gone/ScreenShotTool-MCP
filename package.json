@@ -26,6 +26,8 @@
     "smoke:uia-notepad": "tsx tests/smoke-uia-notepad.ts",
     "smoke:uia-vaporview": "tsx tests/smoke-uia-vaporview.ts",
     "smoke:uia-vaporview-coverage": "tsx tests/smoke-uia-vaporview-coverage.ts",
+    "smoke:run-steps": "tsx tests/smoke-run-steps.ts",
+    "smoke:vaporview-runsteps": "tsx tests/smoke-vaporview-runsteps.ts",
     "inspect": "npx @modelcontextprotocol/inspector node dist/index.js"
   },
   "engines": {

@@ -242,6 +242,7 @@ type HelperRequest =
   | { action: "ui-get"; target: UiGetInput }
   | { action: "ui-action"; target: UiActionInput }
   | { action: "ui-wait"; target: Omit<UiWaitInput, "timeoutMs" | "pollIntervalMs"> & { timeoutMs?: number; pollIntervalMs?: number } }
+  | { action: "get-exe-manifest-level"; exePath: string }
 
 export function getDefaultOutputDir(): string {
   return defaultOutputDir
@@ -353,6 +354,8 @@ export async function catalogUi(input: {
     rootHwnd: string;
     recommendedSelector: Record<string, unknown>;
     selectorConfidence: "stable" | "conditionally-stable" | "fragile" | "unsupported";
+    selectorVerified: boolean;
+    selectorMatchCount: number;
     supportedActions: string[];
     patterns: string[];
     profileControl?: string;
@@ -376,14 +379,26 @@ export async function catalogUi(input: {
   });
 
   const nodes = tree.nodes;
-  // Frequency maps for uniqueness checking.
+  // Frequency maps for uniqueness checking. The inspect tree is the same data
+  // the UIA resolver (queryUi/ui_get) walks with the same scope, so a count of
+  // 1 here means the recommendedSelector re-resolves to exactly 1 element via
+  // the resolver (after cross-root dedup). When the tree is truncated, counts
+  // may be under-reported, so verification is disabled in that case.
   const aidCounts = new Map<string, number>();
   const nameTypeCounts = new Map<string, number>();
+  const aidNameCounts = new Map<string, number>();
   for (const n of nodes) {
     if (n.automationId) aidCounts.set(n.automationId, (aidCounts.get(n.automationId) ?? 0) + 1);
-    const nk = `${n.controlType} ${n.name}`;
+    const nk = `${n.controlType} ${n.name}`;
     nameTypeCounts.set(nk, (nameTypeCounts.get(nk) ?? 0) + 1);
+    if (n.automationId && n.name) {
+      const ank = `${n.automationId} ${n.name}`;
+      aidNameCounts.set(ank, (aidNameCounts.get(ank) ?? 0) + 1);
+    }
   }
+  // selectorVerified is only meaningful when the tree is not truncated: a
+  // truncated tree under-reports counts, so a count of 1 is not a guarantee.
+  const canVerify = !tree.truncated;
 
   const controlTypes: Record<string, number> = {};
   const patternCounts: Record<string, number> = {};
@@ -400,6 +415,8 @@ export async function catalogUi(input: {
     enabled: boolean; visible: boolean; offscreen: boolean; rootHwnd: string;
     recommendedSelector: Record<string, unknown>;
     selectorConfidence: "stable" | "conditionally-stable" | "fragile" | "unsupported";
+    selectorVerified: boolean;
+    selectorMatchCount: number;
     supportedActions: string[]; patterns: string[];
   }> = [];
   let stableAutomationIdNodes = 0;
@@ -414,36 +431,69 @@ export async function catalogUi(input: {
     if ((input.visibleOnly ?? true) && n.offscreen) continue;
 
     const aid = n.automationId || "";
-    const aidUnique = aid !== "" && (aidCounts.get(aid) ?? 0) === 1;
-    const nameTypeKey = `${n.controlType} ${n.name}`;
-    const nameTypeUnique = n.name !== "" && (nameTypeCounts.get(nameTypeKey) ?? 0) === 1;
+    const aidCount = aidCounts.get(aid) ?? 0;
+    const aidUnique = aid !== "" && aidCount === 1;
+    const nameTypeKey = `${n.controlType} ${n.name}`;
+    const nameTypeCount = nameTypeCounts.get(nameTypeKey) ?? 0;
+    const nameTypeUnique = n.name !== "" && nameTypeCount === 1;
+    const aidNameCount = aid !== "" && n.name !== "" ? (aidNameCounts.get(`${aid} ${n.name}`) ?? 0) : 0;
+    const aidNameUnique = aidNameCount === 1;
 
     let recommendedSelector: Record<string, unknown>;
     let selectorConfidence: "stable" | "conditionally-stable" | "fragile" | "unsupported";
+    // selectorVerified = the recommendedSelector re-resolves to exactly 1
+    // element via the UIA resolver (same scope as this tree). Computed from the
+    // within-tree count (the resolver's data source); disabled when truncated.
+    let selectorVerified = false;
+    let selectorMatchCount = 0;
 
     if (aidUnique) {
+      // Unique AutomationId, no index, not localized -> stable & directly executable.
       recommendedSelector = { automationId: aid };
       selectorConfidence = "stable";
+      selectorVerified = canVerify;
+      selectorMatchCount = aidCount;
       stableAutomationIdNodes++;
-    } else if (aid !== "") {
-      // AutomationId present but not unique: combine with ControlType (still
-      // not unique, but more stable than Name+index). Caller must add index.
-      recommendedSelector = { automationId: aid, controlType: n.controlType };
+    } else if (aidNameUnique) {
+      // AutomationId shared but unique together with Name (e.g. the shared
+      // 'appSidebarButton' / 'titleBarButton' disambiguated by accessibleName).
+      // Depends on the localized Name -> conditionally-stable.
+      recommendedSelector = { automationId: aid, name: n.name, controlType: n.controlType };
       selectorConfidence = "conditionally-stable";
-    } else if (nameTypeUnique) {
-      recommendedSelector = { name: n.name, controlType: n.controlType };
-      selectorConfidence = "stable";
+      selectorVerified = canVerify;
+      selectorMatchCount = aidNameCount;
       nameOnlyNodes++;
+    } else if (nameTypeUnique) {
+      // Unique Name+ControlType, but Name is localized -> conditionally-stable.
+      recommendedSelector = { name: n.name, controlType: n.controlType };
+      selectorConfidence = "conditionally-stable";
+      selectorVerified = canVerify;
+      selectorMatchCount = nameTypeCount;
+      nameOnlyNodes++;
+    } else if (aid !== "") {
+      // AutomationId present but not unique without an index/ancestor. The
+      // recommendedSelector would trigger ELEMENT_AMBIGUOUS, so it is NOT
+      // directly executable -> fragile, not verified.
+      recommendedSelector = { automationId: aid, controlType: n.controlType };
+      selectorConfidence = "fragile";
+      selectorVerified = false;
+      selectorMatchCount = aidCount;
     } else if (n.name !== "") {
       recommendedSelector = { name: n.name, controlType: n.controlType };
-      selectorConfidence = "conditionally-stable";
+      selectorConfidence = "fragile";
+      selectorVerified = false;
+      selectorMatchCount = nameTypeCount;
       nameOnlyNodes++;
     } else if (n.controlType) {
       recommendedSelector = { controlType: n.controlType };
       selectorConfidence = "fragile";
+      selectorVerified = false;
+      selectorMatchCount = 0;
     } else {
       recommendedSelector = {};
       selectorConfidence = "unsupported";
+      selectorVerified = false;
+      selectorMatchCount = 0;
       unsupportedNodes++;
     }
 
@@ -464,6 +514,8 @@ export async function catalogUi(input: {
       rootHwnd: n.rootHwnd,
       recommendedSelector,
       selectorConfidence,
+      selectorVerified,
+      selectorMatchCount,
       supportedActions,
       patterns: n.patterns
     });
@@ -505,11 +557,22 @@ export async function waitForUi(input: UiWaitInput): Promise<WaitResult> {
   );
 }
 
+// Read an executable's embedded Win32 manifest (RT_MANIFEST) and return its
+// requestedExecutionLevel ("asInvoker" / "requireAdministrator" /
+// "highestAvailable") or "unknown". Loads the PE as a data file only - never
+// runs it. Used by profile_launch to reject an old elevated VaporView build
+// before spawning it (VAPORVIEW_OLD_ELEVATED_BUILD).
+export async function getExeManifestLevel(exePath: string): Promise<string> {
+  const r = await runHelper<{ exePath: string; executionLevel: string }>(
+    { action: "get-exe-manifest-level", exePath }
+  );
+  return r.executionLevel ?? "unknown";
+}
+
 export async function ensureExecutablePath(exePath: string): Promise<void> {
   if (!path.isAbsolute(exePath)) {
     throw new Error("exePath must be an absolute path.");
   }
-
   if (path.extname(exePath).toLowerCase() !== ".exe") {
     throw new Error("exePath must point to a .exe file.");
   }

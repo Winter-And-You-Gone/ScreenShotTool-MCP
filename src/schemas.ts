@@ -400,7 +400,7 @@ export const profileActionSchema = z.object({
     "focus", "legacyDefaultAction", "click",
     "appendText", "clear", "selectAll", "getValue", "setChecked",
     "increment", "decrement",
-    "selectByName", "selectByIndex", "getSelection", "openMenu"
+    "selectByName", "selectByIndex", "getSelection", "openMenu", "openSubmenu"
   ]),
   ...windowSelectorFields,
   value: z.string().max(uiaValueMaxLen).optional(),
@@ -466,6 +466,27 @@ export const uiCatalogSchema = z.object({
 export type UiCatalogInput = z.infer<typeof uiCatalogSchema>;
 
 export type UiElementSelectorInput = import("./uia/types.js").UiElementSelector;
+
+// Tools that may appear as a step inside run_steps. run_steps itself is
+// intentionally excluded to prevent unbounded nesting.
+export const chainableToolNames = [
+  "launch_app", "list_windows", "capture_window", "capture_screen_region",
+  "click_window", "click_menu_item", "move_mouse_window", "close_app",
+  "type_text", "send_key", "read_clipboard", "write_clipboard",
+  "get_window_state", "wait_for_window",
+  "ui_inspect_tree", "ui_query", "ui_get", "ui_action", "ui_wait", "ui_catalog",
+  "profile_list", "profile_resolve", "profile_action", "profile_launch"
+] as const;
+
+const runStepsStepSchema = z.object({
+  tool: z.enum(chainableToolNames),
+  args: z.record(z.string(), z.unknown()).optional().default({})
+}).strict();
+
+export const runStepsSchema = z.object({
+  steps: z.array(runStepsStepSchema).min(1).max(20)
+}).strict();
+export type RunStepsInput = z.infer<typeof runStepsSchema>;
 
 const hwndSchemaProperty = {
   anyOf: [
@@ -842,7 +863,7 @@ export const toolInputSchemas = {
     properties: {
       profile: { type: "string", minLength: 1 },
       control: { type: "string", minLength: 1 },
-      action: { type: "string", enum: ["invoke", "toggle", "select", "addToSelection", "removeFromSelection", "expand", "collapse", "setValue", "setRangeValue", "scrollIntoView", "focus", "legacyDefaultAction", "click", "appendText", "clear", "selectAll", "getValue", "setChecked", "increment", "decrement", "selectByName", "selectByIndex", "getSelection", "openMenu"], description: "Primitive UIA actions plus composite actions: selectByName/selectByIndex/getSelection (combobox/list), openMenu (title menu). Composite actions handle same-PID popups automatically and verify before/after state." },
+      action: { type: "string", enum: ["invoke", "toggle", "select", "addToSelection", "removeFromSelection", "expand", "collapse", "setValue", "setRangeValue", "scrollIntoView", "focus", "legacyDefaultAction", "click", "appendText", "clear", "selectAll", "getValue", "setChecked", "increment", "decrement", "selectByName", "selectByIndex", "getSelection", "openMenu", "openSubmenu"], description: "Primitive UIA actions plus composite actions: selectByName/selectByIndex/getSelection (combobox/list), openMenu (title menu), openSubmenu (title-menu section). Composite actions handle same-PID popups automatically and verify before/after state. Menu commands that open a modal dialog use a non-blocking focus+Enter trigger." },
       value: { type: "string", maxLength: 4000, description: "Text for setValue/appendText; \"true\"/\"false\" for setChecked; item name for selectByName." },
       index: { type: "integer", minimum: 0, description: "0-based index for selectByIndex." },
       rangeValue: { type: "number" },
@@ -893,5 +914,34 @@ export const toolInputSchemas = {
     },
     additionalProperties: false,
     anyOf: atLeastOneSelectorAnyOf
+  },
+  run_steps: {
+    type: "object",
+    properties: {
+      steps: {
+        type: "array",
+        minItems: 1,
+        maxItems: 20,
+        items: {
+          type: "object",
+          properties: {
+            tool: {
+              type: "string",
+              enum: [...chainableToolNames],
+              description: "Name of a tool to execute as a step. run_steps itself cannot be used as a step (no nesting)."
+            },
+            args: {
+              type: "object",
+              description: "Arguments for the tool, exactly as you would pass them to a direct tools/call. Validated against that tool's own input schema at execution time. Omit for tools that take no arguments (e.g. read_clipboard, profile_list). Values may contain ${N.path} placeholders that are resolved against earlier steps' results before dispatch (e.g. \"${0.pid}\", \"${0.window.hwnd}\", \"${0.0.hwnd}\" for an array index); a whole-value placeholder preserves the referenced type, an embedded one is stringified."
+            }
+          },
+          required: ["tool"],
+          additionalProperties: false
+        },
+        description: "Ordered list of tool invocations. Executed sequentially; the chain stops on the first step that errors and all later steps are skipped. A step may reference earlier steps' results via ${N.path} placeholders in its args - a step may only reference steps with a smaller index than its own."
+      }
+    },
+    required: ["steps"],
+    additionalProperties: false
   }
 } as const;

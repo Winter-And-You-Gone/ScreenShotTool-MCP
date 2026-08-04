@@ -8,7 +8,9 @@ import {
   listProfiles,
   profileList,
   resolveProfileControl,
-  performProfileAction
+  performProfileAction,
+  launchProfile,
+  isMenuCommandControl
 } from "../src/profiles/registry.js";
 import { McpUiError } from "../src/uia/results.js";
 import type { GetResult, ActionResult } from "../src/uia/types.js";
@@ -32,11 +34,46 @@ test("vaporview profile maps expected stable controls", () => {
   const expected = [
     "mainWindow", "centralWidget", "mainPageStack", "appSidebar",
     "windowMinimizeButton", "windowMaximizeButton", "windowCloseButton",
-    "titleBarMenuButton", "logListView", "logSearchEdit", "epsilonPortCombo", "pressurePortCombo"
+    "titleBarMenuButton", "logListView", "logSearchButton", "logFilterButton",
+    "logFilterMenu", "logFilterAutoFollowMenuAction", "logSearchEdit",
+    "epsilonPortCombo", "pressurePortCombo",
+    "titleMenuFileSection", "titleMenuViewSection", "titleMenuDeveloperSection", "titleMenuHelpSection",
+    "titleMenuAbout", "titleMenuCheckUpdates", "titleMenuExit", "titleMenuViewLogPanel",
+    "titleMenuLanguage", "titleMenuLanguageChinese", "titleMenuLanguageEnglish",
+    "titleMenuUiTestMode", "titleMenuUiTestScenario", "titleMenuRecordingFolder", "titleMenuDataViewer",
+    "aboutDialog", "aboutDialogOkButton"
   ];
   for (const c of expected) {
     assert.ok(vaporViewProfile.controls[c], `missing control: ${c}`);
   }
+});
+
+test("vaporview profile requires asInvoker manifest", () => {
+  assert.equal(vaporViewProfile.requiresAsInvoker, true);
+});
+
+test("title menu controls are runtime-verified with regex-suffix selectors", () => {
+  const menuControls = [
+    "titleMenuFileSection", "titleMenuHelpSection", "titleMenuAbout",
+    "titleMenuCheckUpdates", "titleMenuLanguageChinese", "aboutDialog", "aboutDialogOkButton"
+  ];
+  for (const c of menuControls) {
+    const entry = normalizeControlEntry(vaporViewProfile.controls[c])!;
+    assert.equal(entry.confidence, "runtime-verified", `${c} should be runtime-verified`);
+    const sel = entry.selectors[0]!;
+    assert.equal(sel.match, "regex", `${c} selector should use regex suffix match`);
+    assert.ok(sel.automationId?.endsWith("$"), `${c} selector automationId should end with $`);
+  }
+});
+
+test("menu command selectors are detected for non-blocking invoke routing", () => {
+  // Command rows (About, Exit) route invoke to the composite non-blocking path.
+  assert.equal(isMenuCommandControl(vaporViewProfile, "titleMenuAbout"), true);
+  assert.equal(isMenuCommandControl(vaporViewProfile, "titleMenuExit"), true);
+  // Section rows are NOT commands (they use openSubmenu, not invoke).
+  assert.equal(isMenuCommandControl(vaporViewProfile, "titleMenuHelpSection"), false);
+  assert.equal(isMenuCommandControl(vaporViewProfile, "titleBarMenuButton"), false);
+  assert.equal(isMenuCommandControl(vaporViewProfile, "mainWindow"), false);
 });
 
 test("profile contains NO RuntimeId, HWND, PID, or absolute coordinates", () => {
@@ -263,4 +300,49 @@ test("profile action short-circuits severe errors", async () => {
 test("listProfiles returns the vaporview profile", () => {
   const all = listProfiles();
   assert.ok(all.some((p) => p.id === "vaporview"));
+});
+
+// A minimal UiaDeps mock for launchProfile tests. The launch path only calls
+// getUiElement (for the UIA-root check after launch); sendKey/query/etc are
+// unused but included so the object satisfies the UiaDeps shape.
+function mockLaunchDeps(): import("../src/profiles/registry.js").UiaDeps {
+  const notUsed = async () => { throw new Error("unused"); };
+  return {
+    getUiElement: async () => ({ found: true, element: {} as never, elapsedMs: 1 }),
+    performUiAction: notUsed as never,
+    queryUi: notUsed as never,
+    inspectUiTree: notUsed as never,
+    sendKey: notUsed as never
+  };
+}
+
+test("profile_launch rejects a requireAdministrator build before spawning", async () => {
+  let launchCalled = false;
+  await assert.rejects(
+    () => launchProfile(
+      mockLaunchDeps(),
+      async () => { launchCalled = true; return { pid: 1, window: null }; },
+      async () => [],
+      { profile: "vaporview", exePath: process.execPath, reuseIfRunning: false },
+      async () => "requireAdministrator"
+    ),
+    (error: unknown) => {
+      assert.ok(error instanceof McpUiError);
+      assert.equal(error.code, "VAPORVIEW_OLD_ELEVATED_BUILD");
+      return true;
+    }
+  );
+  assert.equal(launchCalled, false, "windowsLaunch must NOT be called for an elevated build");
+});
+
+test("profile_launch proceeds for an asInvoker build and reports manifestLevel", async () => {
+  const r = await launchProfile(
+    mockLaunchDeps(),
+    async () => ({ pid: 4242, window: { hwnd: "99", title: "VaporView", pid: 4242, processName: "VaporView", className: "Qt", rect: null } }),
+    async () => [],
+    { profile: "vaporview", exePath: process.execPath, reuseIfRunning: false },
+    async () => "asInvoker"
+  );
+  assert.equal(r.manifestLevel, "asInvoker");
+  assert.equal(r.pid, 4242);
 });

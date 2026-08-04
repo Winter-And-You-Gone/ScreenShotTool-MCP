@@ -1,20 +1,29 @@
 // VaporView UIA coverage report.
 //
-// Visits every sidebar page (home, device config, temperature, rtk) to expose
-// all controls, aggregates ui_catalog results by control category, and reports
-// how many are operable via each UIA mechanism. Also reports Profile mapped vs
-// unmapped controls. No physical mouse movement; restores the page to home.
+// Distinguishes three NON-equivalent coverage notions (per spec):
+//   pattern-exposed         - the control exposes a UIA pattern (ExpandCollapse,
+//                             Invoke, Value, Toggle, ...). This is NOT "operated".
+//   action-smoke-verified   - the control was actually operated end-to-end with
+//                             a verified state change in smoke:uia-vaporview.
+//   profile-runtime-verified- a profile selector resolved the control uniquely
+//                             against the live tree (confidence runtime-verified).
+// These are reported separately and NEVER collapsed into a single "100%
+// operated" figure. Also reports Pattern coverage %, action-smoke sample %,
+// and profile runtime verification %.
+//
+// No physical mouse movement; restores the page to home. Menu controls are
+// verified by opening the menu (Help section) without invoking destructive
+// commands.
 //
 // Env: VAPORVIEW_EXE (required), VAPORVIEW_SMOKE_STRICT (optional).
 
-import { spawnSync } from "node:child_process";
 import { access, constants as fsConstants } from "node:fs/promises";
 import { writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 
-import { catalogUi, closeApp, getUiElement, performUiAction, queryUi, inspectUiTree, listWindows } from "../src/windows.js";
-import { launchProfile, buildUiaDeps } from "../src/profiles/registry.js";
+import { catalogUi, closeApp, getUiElement, performUiAction, queryUi, inspectUiTree, listWindows, sendKey } from "../src/windows.js";
+import { launchProfile, resolveProfileControl, performProfileAction, buildUiaDeps } from "../src/profiles/registry.js";
 import { vaporViewProfile } from "../src/profiles/vaporview.js";
 import { normalizeControlEntry } from "../src/profiles/types.js";
 
@@ -27,34 +36,68 @@ if (!exePath) {
 }
 try { await access(exePath, fsConstants.X_OK); } catch { console.error(`FAIL: EXE not found: ${exePath}`); process.exit(1); }
 
-const deps = buildUiaDeps({ getUiElement, performUiAction, queryUi, inspectUiTree });
+const deps = buildUiaDeps({ getUiElement, performUiAction, queryUi, inspectUiTree, sendKey });
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+const SIDEBAR = "QApplication.MainWindow.appCentralWidget.appLayoutSplitter.appSidebar.appSidebarButton";
 
 console.log(`Launching VaporView: ${exePath}`);
 const launched = await launchProfile(deps, async (i) => {
   const { launchApp } = await import("../src/windows.js");
   return launchApp({ exePath: i.exePath, args: i.args ?? [], waitForWindow: i.waitForWindow ?? true, noActivate: i.noActivate ?? true, startMinimized: i.startMinimized ?? false, timeoutMs: i.timeoutMs ?? 30000 });
 }, (f) => listWindows(f), { profile: "vaporview", exePath, noActivate: true, timeoutMs: 30000, reuseIfRunning: false });
-
 const pid = launched.pid;
 const hwnd = launched.hwnd;
 
-type CatEntry = { total: number; operable: number; methods: Record<string, number> };
+// Controls actually operated end-to-end (verified state change) by the strict
+// smoke (smoke:uia-vaporview). This is the action-smoke-verified set - it is a
+// SAMPLE, not the full control set, and is reported as such.
+const ACTION_SMOKE_VERIFIED = new Set([
+  "titleBarMenuButton", "titleMenuHelpSection", "titleMenuAbout", "aboutDialogOkButton",
+  "logSidePanelToggleButton", "logSearchButton", "logFilterButton",
+  "ai8TemperatureRateCombo",
+  "sidebarHome", "sidebarTemperature", "sidebarDeviceConfig"
+]);
+
+// Category aggregation: pattern-exposed vs unsupported.
+type CatEntry = { total: number; patternExposed: number; unsupported: number; methods: Record<string, number> };
 const byCat: Record<string, CatEntry> = {};
-const bump = (cat: string, operable: boolean, method: string) => {
-  byCat[cat] ??= { total: 0, operable: 0, methods: {} };
+const bump = (cat: string, patternExposed: boolean, method: string) => {
+  byCat[cat] ??= { total: 0, patternExposed: 0, unsupported: 0, methods: {} };
   byCat[cat].total++;
-  if (operable) byCat[cat].operable++;
+  if (patternExposed) byCat[cat].patternExposed++; else byCat[cat].unsupported++;
   byCat[cat].methods[method] = (byCat[cat].methods[method] ?? 0) + 1;
 };
 
+// profile-runtime-verified: profile controls whose selectors resolve uniquely.
+let profileRuntimeVerified = 0;
+let profileSourceDerived = 0;
+let profileUnresolved = 0;
+const unresolved: string[] = [];
+
+async function resolveProfileControlSafe(control: string, entry: { selectors: unknown[]; confidence?: string }, openMenu = false) {
+  try {
+    if (openMenu) {
+      await performProfileAction(deps, { profile: "vaporview", control: "titleBarMenuButton", action: "openMenu", pid, hwnd, timeoutMs: 15000 }).catch(() => undefined);
+      await sleep(400);
+    }
+    const r = await resolveProfileControl(deps, { profile: "vaporview", control, pid, hwnd, includeProcessPopups: true, timeoutMs: 8000 });
+    if (r.found) {
+      if (entry.confidence === "runtime-verified") profileRuntimeVerified++;
+      else profileSourceDerived++;
+    } else { profileUnresolved++; unresolved.push(control); }
+  } catch {
+    profileUnresolved++; unresolved.push(control);
+  }
+}
+
+let exitCode = 0;
 try {
-  // Visit each sidebar page and catalog.
-  const pages: Array<{ name: string; sel: { automationId: string; name: string } }> = [
-    { name: "home", sel: { automationId: "QApplication.MainWindow.appCentralWidget.appLayoutSplitter.appSidebar.appSidebarButton", name: "首页" } },
-    { name: "device", sel: { automationId: "QApplication.MainWindow.appCentralWidget.appLayoutSplitter.appSidebar.appSidebarButton", name: "设备配置" } },
-    { name: "temperature", sel: { automationId: "QApplication.MainWindow.appCentralWidget.appLayoutSplitter.appSidebar.appSidebarButton", name: "温控" } },
-    { name: "rtk", sel: { automationId: "QApplication.MainWindow.appCentralWidget.appLayoutSplitter.appSidebar.appSidebarButton", name: "RTK配置" } },
+  // ── Pattern-exposed coverage across sidebar pages ──
+  const pages = [
+    { name: "home", sel: { automationId: SIDEBAR, name: "首页" } },
+    { name: "device", sel: { automationId: SIDEBAR, name: "设备配置" } },
+    { name: "temperature", sel: { automationId: SIDEBAR, name: "温控" } },
+    { name: "rtk", sel: { automationId: SIDEBAR, name: "RTK配置" } },
   ];
   const seenAids = new Set<string>();
   for (const p of pages) {
@@ -73,76 +116,146 @@ try {
       const ct = c.controlType.replace(/^ControlType\./, "");
       const acts = new Set(c.supportedActions);
       const pats = c.patterns.join(",");
-      if (ct === "Button") bump("button", acts.has("invoke") || acts.has("toggle"), acts.has("invoke") ? "InvokePattern" : (acts.has("toggle") ? "TogglePattern" : "none"));
-      else if (ct === "Edit") bump("edit", acts.has("getValue") && acts.has("setValue"), "ValuePattern");
-      else if (ct === "ComboBox") bump("combobox", acts.has("expand") || pats.includes("ExpandCollapse"), "ExpandCollapsePattern");
-      else if (ct === "MenuItem") bump("menuItem", acts.has("invoke"), "InvokePattern");
-      else if (ct === "CheckBox" || ct === "RadioButton") bump("switch", acts.has("toggle") || acts.has("setChecked"), "TogglePattern");
-      else if (ct === "TabItem") bump("tab", acts.has("select"), "SelectionItemPattern");
-      else if (ct === "Slider" || ct === "Spinner") bump("slider", acts.has("setRangeValue") || pats.includes("RangeValue"), "RangeValuePattern");
-      else if (ct === "ListItem" || ct === "TreeItem" || ct === "DataItem") bump("listItem", acts.has("select") || acts.has("invoke"), "SelectionItemPattern");
+      const exposed = c.patterns.length > 0;
+      if (ct === "Button") bump("button", exposed, acts.has("invoke") ? "InvokePattern" : (acts.has("toggle") ? "TogglePattern" : "none"));
+      else if (ct === "Edit") bump("edit", exposed, "ValuePattern");
+      else if (ct === "ComboBox") bump("combobox", exposed, pats.includes("ExpandCollapse") ? "ExpandCollapsePattern" : "ValuePattern");
+      else if (ct === "MenuItem") bump("menuItem", exposed, "InvokePattern");
+      else if (ct === "CheckBox" || ct === "RadioButton") bump("switch", exposed, "TogglePattern");
+      else if (ct === "TabItem") bump("tab", exposed, "SelectionItemPattern");
+      else if (ct === "Slider" || ct === "Spinner") bump("slider", exposed, "RangeValuePattern");
+      else if (ct === "ListItem" || ct === "TreeItem" || ct === "DataItem") bump("listItem", exposed, "SelectionItemPattern");
       else if (ct === "Custom" || ct === "Image" || ct === "Text") bump("custom", c.enabled && c.focusable, "KeyboardFallback");
-      else bump("other", acts.size > 0, "patterns");
+      else bump("other", exposed, "patterns");
     }
   }
-  // Restore home.
   await performUiAction({ hwnd: hwnd!, selector: pages[0]!.sel, action: "invoke", timeoutMs: 10000 }).catch(() => undefined);
+  await sleep(400);
 
-  // Profile mapping coverage.
-  let profileMapped = 0;
-  let profileUnmapped = 0;
-  const unmapped: string[] = [];
+  // ── Profile runtime verification (non-menu controls) ──
+  // Home-page controls resolve on the home page.
+  const deviceControls = new Set([
+    "epsilonPortCombo", "pressurePortCombo", "humidityPortCombo", "lidarPortCombo",
+    "temperaturePortCombo", "ai8TemperaturePortCombo", "ai8TemperatureBaudCombo",
+    "ai8TemperatureRateCombo", "pressureSourceCombo", "humiditySourceCombo"
+  ]);
   for (const [name, raw] of Object.entries(vaporViewProfile.controls)) {
     const entry = normalizeControlEntry(raw);
     if (!entry) continue;
-    try {
-      const r = await getUiElement({ pid, hwnd, selector: entry.selectors[0]!, timeoutMs: 6000 });
-      if (r.found) profileMapped++;
-      else { profileUnmapped++; unmapped.push(`${name} (${entry.confidence})`); }
-    } catch {
-      profileUnmapped++;
-      unmapped.push(`${name} (${entry.confidence})`);
+    if (/^titleMenu|^aboutDialog/.test(name)) continue;       // verified with menu open
+    if (deviceControls.has(name)) continue;                    // verified on device page
+    if (/^logFilter.+MenuAction$/.test(name)) continue;        // verified with filter menu open
+    if (name === "logFilterMenu") continue;                    // window is lazily created on first open
+    if (entry.confidence === "unsupported") continue;          // expected unresolvable
+    await resolveProfileControlSafe(name, entry);
+  }
+  // Device-page controls resolve on the device-config page.
+  await performUiAction({ hwnd: hwnd!, selector: { automationId: SIDEBAR, name: "设备配置" }, action: "invoke", timeoutMs: 10000 }).catch(() => undefined);
+  await sleep(1000);
+  for (const name of deviceControls) {
+    const entry = normalizeControlEntry(vaporViewProfile.controls[name]);
+    if (entry) await resolveProfileControlSafe(name, entry);
+  }
+  await performUiAction({ hwnd: hwnd!, selector: { automationId: SIDEBAR, name: "首页" }, action: "invoke", timeoutMs: 10000 }).catch(() => undefined);
+  await sleep(400);
+
+  // ── Profile runtime verification (menu + dialog controls) ──
+  // Open the menu once, resolve the section rows and the Help submenu items.
+  let menuOpened = false;
+  try {
+    await performProfileAction(deps, { profile: "vaporview", control: "titleBarMenuButton", action: "openMenu", pid, hwnd, timeoutMs: 15000 });
+    menuOpened = true;
+    await sleep(300);
+    for (const name of Object.keys(vaporViewProfile.controls)) {
+      if (!/^titleMenuFileSection$|^titleMenuViewSection$|^titleMenuDeveloperSection$|^titleMenuHelpSection$/.test(name)) continue;
+      const entry = normalizeControlEntry(vaporViewProfile.controls[name])!;
+      await resolveProfileControlSafe(name, entry);
     }
+    // Help submenu items
+    await performProfileAction(deps, { profile: "vaporview", control: "titleMenuHelpSection", action: "openSubmenu", pid, hwnd, timeoutMs: 15000 }).catch(() => undefined);
+    await sleep(400);
+    for (const name of ["titleMenuCheckUpdates", "titleMenuAbout"]) {
+      const entry = normalizeControlEntry(vaporViewProfile.controls[name])!;
+      await resolveProfileControlSafe(name, entry);
+    }
+    // Close the menu via Escape (no mouse).
+    await sendKey({ hwnd: hwnd!, key: "escape", noActivate: true }).catch(() => undefined);
+    await sleep(300);
+    await sendKey({ hwnd: hwnd!, key: "escape", noActivate: true }).catch(() => undefined);
+    await sleep(300);
+  } catch { /* menu probe best-effort */ }
+  void menuOpened;
+
+  // ── Profile runtime verification (log-filter menu rows) ──
+  // Rows only exist in the tree while logFilterMenu is open.
+  try {
+    await performProfileAction(deps, { profile: "vaporview", control: "logFilterButton", action: "invoke", pid, hwnd, timeoutMs: 10000 }).catch(() => undefined);
+    await sleep(400);
+    for (const name of ["logFilterMenu", "logFilterAttentionMenuAction", "logFilterAllMenuAction", "logFilterDebugMenuAction", "logFilterAutoFollowMenuAction"]) {
+      const entry = normalizeControlEntry(vaporViewProfile.controls[name])!;
+      await resolveProfileControlSafe(name, entry);
+    }
+    // Close the filter menu via Escape on its popup window.
+    const filterWin = await getUiElement({ pid, selector: { automationId: "QApplication.logFilterMenu" }, includeProcessPopups: true, timeoutMs: 5000 }).catch(() => null);
+    if (filterWin && filterWin.found) {
+      await sendKey({ hwnd: filterWin.element!.nativeWindowHandle, key: "escape", noActivate: true }).catch(() => undefined);
+      await sleep(300);
+    }
+  } catch { /* filter-menu probe best-effort */ }
+
+  // ── action-smoke-verified: count how many of the ACTION_SMOKE_VERIFIED set
+  // are profile controls (they were operated in smoke:uia-vaporview). ──
+  let actionSmokeVerified = 0;
+  for (const c of ACTION_SMOKE_VERIFIED) {
+    if (normalizeControlEntry(vaporViewProfile.controls[c])) actionSmokeVerified++;
   }
 
   const report = {
     byCategory: byCat,
-    profileMapped,
-    profileUnmapped,
-    unmappedControls: unmapped,
+    actionSmokeVerifiedCount: actionSmokeVerified,
+    actionSmokeVerifiedSet: [...ACTION_SMOKE_VERIFIED],
+    profileRuntimeVerified,
+    profileSourceDerived,
+    profileUnresolved,
+    unresolvedControls: unresolved,
     generatedAt: new Date().toISOString(),
   };
 
   console.log("\n=== VAPORVIEW UIA COVERAGE ===");
-  console.log("category              total  operable  method");
+  console.log("(pattern-exposed != action-verified. These are reported separately.)\n");
+  console.log("category              total  patternExposed  unsupported  method");
   for (const [cat, e] of Object.entries(byCat)) {
     const methods = Object.entries(e.methods).map(([k, v]) => `${k}=${v}`).join(" ");
-    console.log(`${cat.padEnd(20)}  ${String(e.total).padStart(5)}  ${String(e.operable).padStart(8)}  ${methods}`);
+    console.log(`${cat.padEnd(20)}  ${String(e.total).padStart(5)}  ${String(e.patternExposed).padStart(14)}  ${String(e.unsupported).padStart(11)}  ${methods}`);
   }
-  console.log(`\nProfile mapped:   ${profileMapped}`);
-  console.log(`Profile unmapped: ${profileUnmapped}`);
-  if (unmapped.length) console.log("Unmapped: " + unmapped.join(", "));
+  const totalCats = Object.values(byCat).reduce((a, e) => a + e.total, 0);
+  const totalExposed = Object.values(byCat).reduce((a, e) => a + e.patternExposed, 0);
+  console.log(`\nPattern-exposed coverage:        ${totalExposed}/${totalCats} (${totalCats ? Math.round(100 * totalExposed / totalCats) : 0}%)`);
+  console.log(`Action-smoke-verified (sample):  ${actionSmokeVerified} controls (operated in smoke:uia-vaporview with verified state change)`);
+  console.log(`Profile runtime-verified:        ${profileRuntimeVerified}`);
+  console.log(`Profile source-derived:          ${profileSourceDerived}`);
+  console.log(`Profile unresolved:              ${profileUnresolved}`);
+  if (unresolved.length) console.log("Unresolved: " + unresolved.join(", "));
 
   const outPath = path.join(tmpdir(), `vaporview-coverage-${pid}.json`);
   await writeFile(outPath, JSON.stringify(report, null, 2), "utf8");
   console.log(`\nCoverage report written to: ${outPath} (temp dir, not committed)`);
 
-  // Exit non-zero if any standard control category has operable < total with no
-  // documented reason (the "no unknown-uncovered" rule). Custom-painted
-  // controls are allowed to be non-operable (documented limitation).
-  const standardCats = ["button", "edit", "combobox", "switch", "tab", "slider"];
-  let undoc = 0;
-  for (const cat of standardCats) {
+  // Custom-painted non-interactive Text/Image controls are NOT required to be
+  // clickable (documented); only flag standard categories that are unexpectedly
+  // non-pattern-exposed as a NOTE (disabled/offscreen is acceptable).
+  for (const cat of ["button", "edit", "combobox", "switch", "tab", "slider"]) {
     const e = byCat[cat];
-    if (e && e.operable < e.total) {
-      console.log(`NOTE: ${cat} has ${e.total - e.operable} non-operable (may be disabled/offscreen - acceptable)`);
+    if (e && e.patternExposed < e.total) {
+      console.log(`NOTE: ${cat} has ${e.total - e.patternExposed} non-pattern-exposed (may be disabled/offscreen - acceptable)`);
     }
   }
-  void undoc;
 } catch (e) {
   console.error("COVERAGE FAILED:", e instanceof Error ? e.message : String(e));
-  process.exitCode = 1;
+  exitCode = 1;
 } finally {
   await closeApp(pid).catch(() => undefined);
   console.log(`Cleaned up pid=${pid}.`);
 }
+if (exitCode !== 0) process.exit(exitCode);
+console.log("smoke:uia-vaporview-coverage DONE");

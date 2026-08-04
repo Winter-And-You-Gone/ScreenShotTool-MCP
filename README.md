@@ -273,11 +273,11 @@ npm run smoke:no-activate
 | `ui_get` | 读取**唯一**控件的状态（比 ui_query 轻）。0 个=found:false，1 个=状态，多个=ELEMENT_AMBIGUOUS。 |
 | `ui_action` | 对控件执行动作（invoke/toggle/select/expand/setValue/appendText/clear/selectAll/getValue/setChecked/increment/decrement 等），优先用 UIA Pattern，其次键盘降级，坐标降级默认关闭。物理鼠标永远不移动。 |
 | `ui_wait` | 等待 UI 状态变化（exists/enabled/valueEquals 等），不截图轮询。运行在独立 PowerShell 进程，不阻塞共享 worker。`exists` 只要有一个匹配即可；状态条件要求唯一元素（可用 `index` 消除歧义）。超时返回 `matched:false,timedOut:true`；窗口/UIA/权限错误不会被吞掉。 |
-| `ui_catalog` | 枚举目标窗口所有可操作控件，返回 `recommendedSelector`/`supportedActions`/`selectorConfidence`，可直接传给 `ui_action`。目标匹配已知 profile 时附加 `profileControl` 标签。 |
+| `ui_catalog` | 枚举目标窗口所有可操作控件，返回 `recommendedSelector`（已验证唯一，可直接传给 `ui_action`）/`selectorVerified`/`selectorMatchCount`/`supportedActions`/`selectorConfidence`。目标匹配已知 profile 时附加 `profileControl` 标签。 |
 | `profile_list` | 列出可用应用 profile（如 VaporView）。 |
-| `profile_launch` | 按 profile 启动应用，解析可执行文件（exePath > 环境变量 > 配置 > 构建目录 > PATH），返回 pid/hwnd/title 及 UIA Root 可用性，默认复用已运行实例。 |
+| `profile_launch` | 按 profile 启动应用，解析可执行文件（exePath > 环境变量 > 配置 > 构建目录 > PATH），返回 pid/hwnd/title、UIA Root 可用性、`manifestLevel`。对 `requiresAsInvoker` profile 在 spawn 前检测内嵌 manifest，拒绝旧管理员构建（`VAPORVIEW_OLD_ELEVATED_BUILD`）。默认复用已运行实例。 |
 | `profile_resolve` | 按 profile + 逻辑控件名解析为真实元素。 |
-| `profile_action` | 对 profile 中的逻辑控件执行动作（基本 + 复合：selectByName/selectByIndex/getSelection/openMenu，自动处理 popup 并验证 before/after）。 |
+| `profile_action` | 对 profile 中的逻辑控件执行动作（基本 + 复合：selectByName/selectByIndex/getSelection/openMenu/openSubmenu，自动处理 popup、键盘降级并验证 before/after；菜单命令 invoke 用非阻塞 focus+Enter）。物理鼠标永远不移动。 |
 
 ### Selector 说明
 
@@ -399,8 +399,14 @@ VaporView 的 profile（`vaporview`）映射关键控件。最新构建使用 `a
 - 窗口控制按钮：`windowMinimizeButton` / `windowMaximizeButton` / `windowCloseButton`
 - 容器：`appCentralWidget` / `mainPageStack` / `appSidebar` / `mainContentSplitter`
 - 侧栏导航按钮（共享 objectName `appSidebarButton`，按 accessibleName 区分）：`sidebarHome` / `sidebarDeviceConfig` / `sidebarTemperature` / `sidebarRtkConfig`
-- 日志面板：`logSidePanel` / `logListView`（日志视图）/ `logSearchEdit`（可编辑搜索框）/ `logAutoFollowButton`（日志过滤复选框）
-- 菜单入口：`titleBarMenuButton`（打开自定义 Qt 菜单）
+- 日志面板：`logSidePanel` / `logListView`（日志视图）/ `logSearchButton`（搜索按钮，打开搜索弹窗）/ `logFilterButton`（日志视图过滤按钮）/ `logFilterMenu`（过滤弹窗）/ `logFilterAutoFollowMenuAction`（自动跟随行）/ `logSidePanelToggleButton`（日志面板开关）
+- 日志搜索框 `logSearchEdit`：最新构建中它位于 `logSearchMenu` 的 `QWidgetAction` 弹窗内，UIA **未暴露**（弹窗只暴露 `QWidgetAction` MenuItem，无子 Edit 节点），标记为 `unsupported`，不能作为输入控件驱动
+- 菜单入口：`titleBarMenuButton`（打开标题栏应用菜单）
+- **标题栏菜单项（真实 `QToolButton`，runtime-verified）**：分组行 `titleMenuFileSection` / `titleMenuViewSection` / `titleMenuDeveloperSection` / `titleMenuHelpSection`；命令行 `titleMenuRecordingFolder` / `titleMenuDataViewer` / `titleMenuExit` / `titleMenuViewLogPanel` / `titleMenuLanguage` / `titleMenuLanguageChinese` / `titleMenuLanguageEnglish` / `titleMenuUiTestMode` / `titleMenuUiTestScenario` / `titleMenuCheckUpdates` / `titleMenuAbout`
+- **About 对话框**：`aboutDialog`（模态 `QDialog`）/ `aboutDialogOkButton`（`QPushButton`，InvokePattern）
+- **设备配置页 ComboBox（runtime-verified）**：`epsilonPortCombo` / `pressurePortCombo` / `humidityPortCombo` / `lidarPortCombo` / `temperaturePortCombo` / `ai8TemperaturePortCombo` / `ai8TemperatureBaudCombo` / `ai8TemperatureRateCombo` / `pressureSourceCombo` / `humiditySourceCombo`
+
+> 标题栏菜单项**不再是自绘行**：最新 VaporView 已将菜单行改为真实 `QToolButton`（带稳定 `objectName` == commandId），UIA 暴露为 `ControlType.Button` + `InvokePattern`，可通过 `openMenu` / `openSubmenu` / `invoke` 操作。详见下文[标题栏菜单操作](#标题栏菜单操作)。
 
 已对最新 asInvoker 构建实机验证的控件标记 `runtime-verified`；仅源码确认的标记 `source-derived`（用正则后缀匹配确认的短 objectName）。profile 不存储 HWND/PID/RuntimeId/绝对路径/屏幕坐标。
 
@@ -424,7 +430,9 @@ profile 找不到控件时会按候选 selector 顺序尝试，并返回每个�
 { "tool": "profile_launch", "arguments": { "profile": "vaporview", "noActivate": true } }
 ```
 
-按优先级解析可执行文件：显式 `exePath` > 环境变量 `VAPORVIEW_EXE` > 配置 > 常见构建目录 > PATH。返回 `pid`、主窗口 `hwnd`/`title`、是否由 MCP 启动、UIA Root 是否可用。默认复用已运行实例。不在 profile 中保存本机绝对路径。
+按优先级解析可执行文件：显式 `exePath` > 环境变量 `VAPORVIEW_EXE` > 配置 > 常见构建目录 > PATH。返回 `pid`、主窗口 `hwnd`/`title`、是否由 MCP 启动、UIA Root 是否可用、`manifestLevel`。默认复用已运行实例。不在 profile 中保存本机绝对路径。
+
+> **`profile_launch` 自带旧管理员构建检测**：对标记 `requiresAsInvoker` 的 profile（如 VaporView），`profile_launch` 在 spawn 前读取可执行文件内嵌的 Win32 manifest（`RT_MANIFEST`），若为 `requireAdministrator` / `highestAvailable` 直接返回 `VAPORVIEW_OLD_ELEVATED_BUILD`（不 spawn、不触发 UAC），提示重建最新 asInvoker 版本。manifest 无法读取时返回 `manifestLevel:"unknown"`（结构化警告，不阻断启动）。该检测不再只存在于 smoke test。
 
 #### ui_catalog（枚举可操作控件）
 
@@ -432,11 +440,61 @@ profile 找不到控件时会按候选 selector 顺序尝试，并返回每个�
 { "tool": "ui_catalog", "arguments": { "pid": 12345, "includeProcessPopups": true } }
 ```
 
-返回当前页面所有可操作控件，每个带 `recommendedSelector`（可直接传给 `ui_action`）、`supportedActions`、`patterns` 和 `selectorConfidence`（`stable` / `conditionally-stable` / `fragile` / `unsupported`）。目标匹配已知 profile 时自动附加 `profileControl` 标签。让 AI Agent 不理解完整 UIA 树即可枚举可操作控件。
+返回当前页面所有可操作控件，每个带 `recommendedSelector`（**已经过唯一性验证**，可直接传给 `ui_action`）、`selectorVerified`（重新解析是否只匹配 1 个）、`selectorMatchCount`、`supportedActions`、`patterns` 和 `selectorConfidence`（`stable` / `conditionally-stable` / `fragile` / `unsupported`）。目标匹配已知 profile 时自动附加 `profileControl` 标签。让 AI Agent 不理解完整 UIA 树即可枚举可操作控件。
+
+> **`recommendedSelector` 已验证唯一**：catalog 生成 selector 后用同一棵 UIA 树（与 resolver 同 scope，已做跨 root 去重）验证匹配数。`stable` = 唯一 AutomationId，重新解析只匹配 1，不依赖 index/语言；`conditionally-stable` = AutomationId+Name 或 Name+ControlType 唯一（Name 本地化敏感）；`fragile` = 需要 index 或本地化 Name；`unsupported` = 无法生成唯一 selector。树被截断（`truncated:true`）时 `selectorVerified=false`（无法保证）。
 
 #### profile_action 复合动作
 
-除基本 UIA 动作外，支持复合动作：`selectByName` / `selectByIndex`（下拉框/列表，自动处理同 PID popup）、`getSelection`、`openMenu`（打开菜单并枚举 MenuItem）。复合动作读取 before 状态、执行、验证 after 状态，不只报告 Pattern 未抛异常。基本动作新增：`appendText` / `clear` / `selectAll` / `getValue` / `setChecked`（幂等）/ `increment` / `decrement`（带 min/max 边界检查）。
+除基本 UIA 动作外，支持复合动作：`selectByName` / `selectByIndex`（下拉框/列表，自动处理同 PID popup，**带键盘降级与值验证**）、`getSelection`、`openMenu`（打开标题菜单并枚举真实 Button 菜单项）、`openSubmenu`（打开分组子菜单）。复合动作读取 before 状态、执行、验证 after 状态，不只报告 Pattern 未抛异常。基本动作新增：`appendText` / `clear` / `selectAll` / `getValue` / `setChecked`（幂等）/ `increment` / `decrement`（带 min/max 边界检查）。
+
+> **`openMenu` 不再只查 `MenuItem`**：VaporView 标题菜单项是真实 `QToolButton`（`Button` + `InvokePattern`），`openMenu` 枚举 `titleMenu*SectionAction` 按钮并验证 popup 真实打开（popup root 增加或菜单项出现），不使用 `itemCount >= 0` 这类永真断言。
+>
+> **菜单命令 `invoke` 的非阻塞触发**：`About`/`CheckUpdates` 等命令会打开**模态 `QDialog`**（`dialog.exec()` 阻塞调用线程），`InvokePattern.Invoke()` 会阻塞直到对话框关闭。因此对 `titleMenu*` 命令控件，`profile_action` 的 `invoke` 改用**非阻塞的 focus + Enter 键**触发（投递 `WM_KEYDOWN`，不移动鼠标），由调用方随后 `ui_get`/`ui_wait` 验证对话框出现。
+
+### 标题栏菜单操作
+
+VaporView 标题栏菜单是自定义 Qt 浮动面板（`titleApplicationPanel`，`Qt::Tool` 顶层窗口），其行是真实 `QToolButton`。分组行通过**键盘 Right** 打开子菜单（非 InvokePattern，其 QAction handler 为空）；命令行通过 Enter/InvokePattern 触发。
+
+```json
+// 1. 打开标题菜单（枚举分组行）
+{ "tool": "profile_action", "arguments": {
+    "profile": "vaporview", "pid": 12345,
+    "control": "titleBarMenuButton", "action": "openMenu" } }
+
+// 2. 打开 Help 分组子菜单（focus + Right 键，枚举命令行）
+{ "tool": "profile_action", "arguments": {
+    "profile": "vaporview", "pid": 12345,
+    "control": "titleMenuHelpSection", "action": "openSubmenu" } }
+
+// 3. 执行 About（非阻塞 focus + Enter，随后验证 aboutDialog 出现）
+{ "tool": "profile_action", "arguments": {
+    "profile": "vaporview", "pid": 12345,
+    "control": "titleMenuAbout", "action": "invoke" } }
+
+// 4. 验证 About 对话框出现，再关闭
+{ "tool": "ui_get", "arguments": {
+    "pid": 12345, "selector": { "automationId": "aboutDialog$", "match": "regex" },
+    "includeProcessPopups": true } }
+{ "tool": "profile_action", "arguments": {
+    "profile": "vaporview", "pid": 12345,
+    "control": "aboutDialogOkButton", "action": "invoke" } }
+```
+
+`openMenu` / `openSubmenu` 返回结构含 `popupOpened`、`popupRoots` 和 `items`（每个含 `automationId`/`name`/`controlType`/`enabled`/`checked`/`hasSubmenu`/`supportedActions`/`recommendedSelector`）。菜单打开成功由 popup root 增加或菜单 command 元素出现证明。
+
+### ComboBox 选择（含键盘降级）
+
+Qt `QComboBox` 弹出项**不作为标准 UIA `ListItem` 暴露**（弹出层是 `QAbstractItemView`，无 ListItem 子节点），因此 `selectByName`/`selectByIndex` 先尝试 `ExpandCollapse` + `ListItem` 选择，失败则走**键盘降级**：`focus` → `Alt+Down` 展开 → `Home` → `Down × index` → `Enter`，全部通过 `PostMessage` 投递（不移动鼠标）。操作后**读取 ValuePattern 当前值并验证变化**，仅"按键已发送"不算成功。
+
+```json
+// 按索引选择（AI8 温度采样率）
+{ "tool": "profile_action", "arguments": {
+    "profile": "vaporview", "pid": 12345,
+    "control": "ai8TemperatureRateCombo", "action": "selectByIndex", "index": 0 } }
+```
+
+`selectByIndex` 返回 `beforeValue` / `afterValue` / `valueChanged`（`success === valueChanged`）。设备页 port/baud/source/rate combo 都有稳定 `device<Device><Field>Combo` AutomationId（runtime-verified，唯一），不再使用全页 ComboBox 序号。
 
 > **VaporView 不再需要管理员权限**：最新 `VaporView.exe` 使用 `asInvoker` / `uiAccess=false` manifest，普通权限的 MCP server 可直接读取其 UIA 树。若传入旧版 `requireAdministrator` 构建，smoke test 会返回 `VAPORVIEW_OLD_ELEVATED_BUILD` 并提示重建/安装最新版。**MCP server 不需要以管理员运行**。
 
@@ -454,14 +512,15 @@ npm run smoke:uia-vaporview-coverage
 
 未设置 `VAPORVIEW_EXE` 时：普通模式输出 `SKIPPED`，strict 模式 FAIL。EXE 不存在 FAIL。旧管理员构建 FAIL（`VAPORVIEW_OLD_ELEVATED_BUILD`）。UIA Root 不可用 FAIL。报告写入系统临时目录，不提交 Git。
 
-### Qt 自绘控件的 UIA 限制（真实限制，已实机确认）
+### Qt 控件的 UIA 限制（真实限制，已实机确认）
 
 VaporView 等 Qt 应用的部分控件是自绘的（`QPainter` paintEvent），UIA 无法访问其内部视觉元素。以下限制不谎称已适配：
 
-- **标题栏菜单项**：`titleBarMenuButton` 可通过 `InvokePattern` 打开（popup 作为同 PID 顶层窗口出现），但其菜单项是自定义 `titleApplicationMenuItem` 行，**不是标准 UIA `MenuItem`**，`openMenu` 枚举标准 MenuItem 返回 0 项。关闭菜单用 `send_key` Escape（投递消息，不移动鼠标）。
-- **QComboBox 弹出项**：设备配置页的 ComboBox 暴露 `ExpandCollapsePattern`（可展开/收起），但弹出项不作为标准 `ListItem` 出现（Qt combo popup 结构），`selectByName` 可能找不到 ListItem。
-- **设备页 ComboBox 的 AutomationId**：运行时暴露 Qt 默认 objectName `QComboBox`（非唯一），而非源码 `setObjectName` 设置的 `skyTelemetryPortCombo` 等名称，因此这些 port combo selector 未在运行时解析成功（标记 `source-derived`）。操作设备页 combo 应改用 `ui_query` controlType=ComboBox + ancestor。
-- 自绘控件（`Custom`/`Image`/`Text` 等）约 94 个，无标准 UIA Pattern；启用且可聚焦的可通过键盘降级（Focus + Enter/Space 投递消息），其余标记 `unsupported`。
+- **标题栏菜单项已可访问**：最新 VaporView 将菜单行改为真实 `QToolButton`（`ControlType.Button` + `InvokePattern`），不再是自绘 `titleApplicationMenuItem` 行。`openMenu` 枚举真实 Button 菜单项（`titleMenu*SectionAction`），`openSubmenu` 打开分组子菜单，`invoke` 触发命令。关闭菜单用 `send_key` Escape（投递消息，不移动鼠标）。
+- **QComboBox 弹出项不暴露为 ListItem**：Qt combo 弹出层是 `QAbstractItemView`，弹出项不作为标准 UIA `ListItem` 出现。`selectByName`/`selectByIndex` 因此走**键盘降级**（focus + Alt+Down + Home + Down×index + Enter）并读取 ValuePattern 值验证，详见上文 [ComboBox 选择](#combobox-选择含键盘降级)。Qt combo 仍暴露 `ExpandCollapsePattern`（可展开/收起用于探测）和 `ValuePattern`（读当前值）。
+- **设备页 ComboBox 有稳定 AutomationId**：port/baud/source/rate combo 运行时暴露 `device<Device><Field>Combo`（如 `deviceAi8TemperatureRateCombo`），**唯一**且 runtime-verified，不再使用 Qt 默认 `QComboBox`。仅有波特率等少数 combo 用默认 `QComboBox`（无 objectName），需用 ancestor 限定。
+- 自绘的非交互 `Custom`/`Image`/`Text` 控件无标准 UIA Pattern，**不属于"必须可点击"的范围**；启用且可聚焦的可通过键盘降级（Focus + Enter/Space 投递消息），其余标记 `unsupported`。不谎称这些控件已逐个实机操作成功。
+- **Pattern 暴露 ≠ 实机操作验证**：`ui_catalog` 的 `patternExposed` 只表示控件暴露了某 Pattern；是否真正操作成功由 strict smoke 的动作抽样验证（`action-smoke-verified`）。覆盖率报告区分 `pattern-exposed` / `action-smoke-verified` / `profile-runtime-verified`，不混成一个"100% 已操作"。
 
 ### 无鼠标操作机制
 
@@ -508,7 +567,7 @@ npm run smoke:uia-vaporview-coverage
 
 `smoke:uia-notepad` 验证：启动 -> inspect_tree -> 找到 Document 控件 -> ValuePattern 写入文字 -> 读回值 -> InvokePattern 点击 Close -> ui_wait notExists -> 物理鼠标未移动 -> 前台窗口未被永久改变。
 
-`smoke:uia-vaporview` 验证 12 项：profile_launch -> ui_catalog 枚举 -> 完整性级别（旧管理员构建检测）-> 按钮 invoke+恢复 -> 菜单打开/关闭 -> 输入框 setValue+恢复 -> 下拉框 expand/collapse -> 侧栏 select+toggleState 验证 -> 复选框 setChecked+恢复 -> profile 一致性（resolve==ui_query）-> **物理鼠标未移动**。全部 PASS 才算通过。
+`smoke:uia-vaporview`（strict）验证 19 项：`profile_launch`（含 manifest 自检）-> `ui_catalog` + verified selector -> 主窗口解析 -> **三路一致性**（profile_resolve == ui_query == ui_catalog，覆盖 titleBarMenuButton/logSidePanelToggle/logSearchButton/sidebarHome/titleMenuAbout/aboutDialogOkButton/ai8RateCombo）-> 日志侧栏按钮 toggle + **真实状态验证**（presence 变化）+ 恢复 -> **搜索弹窗生命周期**（invoke logSearchButton -> logSearchMenu 出现 -> 断言嵌套 QLineEdit `logSearchEdit` 未暴露 -> Escape 关闭）-> **日志过滤菜单枚举**（invoke logFilterButton -> 枚举 关注/全部/调试/自动跟随 4 行 -> 断言 auto-follow 无 TogglePattern（勾选态仅绘制）-> Escape 关闭）-> **标题菜单全链路**（openMenu -> openSubmenu(Help) -> invoke(About) -> aboutDialog 出现 -> invoke(OK) -> 对话框消失 -> 菜单关闭）-> **ComboBox selectByIndex + 值变化验证 + 恢复 + popup 关闭** -> 侧栏切换 + toggleState 验证 + 恢复 -> **物理鼠标未移动** -> 菜单/对话框 popup 全部关闭。无 `itemCount >= 0` 永真断言；只打印 warning 后继续视为 FAIL；对 UIA 未暴露的控件（如 `logSearchEdit`）断言其缺失而非伪造 setValue。全部 PASS 才算通过。
 
 ## 示例调用
 

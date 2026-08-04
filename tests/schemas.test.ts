@@ -4,12 +4,14 @@ import test from "node:test";
 import {
   captureScreenRegionSchema,
   captureWindowSchema,
+  chainableToolNames,
   clickMenuItemSchema,
   clickWindowSchema,
   closeAppSchema,
   launchAppSchema,
   listWindowsSchema,
   moveMouseWindowSchema,
+  runStepsSchema,
   sendKeySchema,
   typeTextSchema,
   readClipboardSchema,
@@ -378,4 +380,53 @@ test("tool JSON schemas expose runtime selector and enum constraints", () => {
   assert.equal(toolInputSchemas.capture_window.properties.region.properties.width.maximum, 16_384);
   assert.equal(toolInputSchemas.capture_screen_region.properties.region.properties.height.maximum, 16_384);
   assert.deepEqual(toolInputSchemas.click_window.properties.button.enum, ["left", "right", "middle"]);
+});
+
+test("run_steps accepts a valid steps array and defaults args to {}", () => {
+  const parsed = runStepsSchema.parse({
+    steps: [
+      { tool: "launch_app", args: { exePath: "C:\\test.exe" } },
+      { tool: "list_windows" },
+      { tool: "read_clipboard" }
+    ]
+  });
+
+  assert.equal(parsed.steps.length, 3);
+  assert.equal(parsed.steps[0]!.tool, "launch_app");
+  assert.deepEqual(parsed.steps[0]!.args, { exePath: "C:\\test.exe" });
+  // args omitted -> defaults to empty object.
+  assert.deepEqual(parsed.steps[1]!.args, {});
+  assert.deepEqual(parsed.steps[2]!.args, {});
+});
+
+test("run_steps rejects empty, oversized, and misshapen step arrays", () => {
+  assert.throws(() => runStepsSchema.parse({ steps: [] }));
+  assert.throws(() => runStepsSchema.parse({}));
+  assert.throws(() => runStepsSchema.parse({
+    steps: Array.from({ length: 21 }, () => ({ tool: "read_clipboard" }))
+  }));
+  // A step without a tool field is invalid.
+  assert.throws(() => runStepsSchema.parse({ steps: [{ args: {} }] }));
+});
+
+test("run_steps rejects unknown tool names, including run_steps itself", () => {
+  assert.throws(() => runStepsSchema.parse({ steps: [{ tool: "not_a_tool" }] }));
+  // Nesting run_steps inside run_steps is forbidden by the enum.
+  assert.throws(() => runStepsSchema.parse({ steps: [{ tool: "run_steps" }] }));
+});
+
+test("run_steps rejects unknown fields on the step object", () => {
+  assert.throws(() => runStepsSchema.parse({
+    steps: [{ tool: "read_clipboard", extra: true }]
+  }), /unrecognized/i);
+});
+
+test("run_steps JSON schema enum mirrors chainableToolNames and excludes run_steps", () => {
+  assert.deepEqual(toolInputSchemas.run_steps.properties.steps.items.properties.tool.enum, [...chainableToolNames]);
+  assert.equal(toolInputSchemas.run_steps.properties.steps.maxItems, 20);
+  assert.equal(toolInputSchemas.run_steps.properties.steps.minItems, 1);
+  assert.equal(
+    toolInputSchemas.run_steps.properties.steps.items.properties.tool.enum.includes("run_steps"),
+    false
+  );
 });
