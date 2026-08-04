@@ -1,7 +1,7 @@
 {
   "name": "screenshottool-mcp",
   "version": "0.1.0",
-  "description": "Windows screenshot MCP server for launching apps and capturing windows or screen regions.",
+  "description": "Generic Windows UI Automation MCP server: app launch, window/UIA control, pipelines (named steps, exports, expect, retry, finally, continue), and declarative App Packs for any desktop app.",
   "type": "module",
   "bin": {
     "screenshottool-mcp": "./dist/index.js"
@@ -24,11 +24,12 @@
     "smoke:window-state": "tsx tests/smoke-window-state.ts",
     "smoke:wait-for-window": "tsx tests/smoke-wait-for-window.ts",
     "smoke:uia-notepad": "tsx tests/smoke-uia-notepad.ts",
-    "smoke:uia-vaporview": "tsx tests/smoke-uia-vaporview.ts",
-    "smoke:uia-vaporview-coverage": "tsx tests/smoke-uia-vaporview-coverage.ts",
     "smoke:run-steps": "tsx tests/smoke-run-steps.ts",
-    "smoke:vaporview-runsteps": "tsx tests/smoke-vaporview-runsteps.ts",
-    "inspect": "npx @modelcontextprotocol/inspector node dist/index.js"
+    "inspect": "npx @modelcontextprotocol/inspector node dist/index.js",
+    "smoke:app-pack": "tsx tests/smoke-app-pack.ts",
+    "smoke:continue-run": "tsx tests/smoke-continue-run.ts",
+    "smoke:first-use-pipeline": "tsx tests/smoke-first-use-pipeline.ts",
+    "smoke:private-app-pack": "tsx tests/smoke-private-pack.ts"
   },
   "engines": {
     "node": ">=20"

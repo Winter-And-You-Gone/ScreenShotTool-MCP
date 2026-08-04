@@ -1,0 +1,112 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://screenshottool-mcp.local/schemas/workflows.schema.json",
+  "title": "App Pack Workflows",
+  "type": "object",
+  "description": "workflows.json - reusable named pipelines for the pack's app. Workflow steps use the same shape as run_steps steps and may reference ${pack.id} and ${inputs.x}.",
+  "properties": {
+    "workflows": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "id": { "type": "string", "pattern": "^[a-z][a-z0-9_-]{0,63}$" },
+          "description": { "type": "string", "maxLength": 1024 },
+          "safe": { "type": "boolean", "default": false, "description": "True when the workflow performs no destructive actions." },
+          "tested": { "type": "boolean", "default": false, "description": "True when the workflow has been verified against the live app." },
+          "restoresState": { "type": "boolean", "default": false },
+          "visibility": { "type": "string", "enum": ["session", "hidden", "internal"], "default": "session" },
+          "inputSchema": {
+            "type": "object",
+            "properties": {
+              "type": { "const": "object" },
+              "properties": { "type": "object" },
+              "required": { "type": "array", "items": { "type": "string" }, "maxItems": 32 },
+              "additionalProperties": { "type": "boolean", "default": false }
+            },
+            "additionalProperties": false
+          },
+          "steps": {
+            "type": "array",
+            "items": { "$ref": "#/definitions/step" },
+            "minItems": 1,
+            "maxItems": 50
+          },
+          "finally": { "type": "array", "items": { "$ref": "#/definitions/step" }, "maxItems": 20 },
+          "captureBefore": { "type": "array", "items": { "$ref": "#/definitions/capture" }, "maxItems": 32 },
+          "restore": { "type": "string", "enum": ["always", "never", "onFailure"], "default": "never" }
+        },
+        "required": ["id", "steps"],
+        "additionalProperties": false
+      }
+    }
+  },
+  "required": ["workflows"],
+  "additionalProperties": false,
+  "definitions": {
+    "step": {
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "pattern": "^[A-Za-z][A-Za-z0-9_-]{0,63}$", "description": "Unique step id; named references use ${id.path}." },
+        "tool": { "type": "string", "minLength": 1, "description": "MCP tool name (from tools/list)." },
+        "args": { "type": "object", "description": "Tool arguments; values may contain ${id.path} / ${N.path} / ${pack.id} / ${inputs.x} placeholders." },
+        "exports": { "type": "object", "additionalProperties": { "type": "string" }, "description": "Export result fields: {name: \"path.in.result\"}." },
+        "expect": {
+          "oneOf": [
+            {
+              "type": "object",
+              "properties": {
+                "profileControl": { "type": "string" },
+                "selector": { "type": "object" },
+                "condition": { "type": "string", "enum": ["exists", "notExists", "visible", "hidden", "enabled", "disabled", "valueEquals", "valueContains", "toggleStateEquals", "selected", "notSelected", "expanded", "collapsed", "countEquals"] },
+                "timeoutMs": { "type": "integer", "minimum": 100, "maximum": 300000 },
+                "pollIntervalMs": { "type": "integer", "minimum": 50, "maximum": 10000 },
+                "expectedValue": { "type": "string" },
+                "toggleState": { "type": "string", "enum": ["On", "Off", "Indeterminate"] },
+                "expectedCount": { "type": "integer", "minimum": 0 }
+              },
+              "required": ["condition"],
+              "additionalProperties": false
+            },
+            { "const": false, "description": "Disable the pack's defaultExpect." }
+          ]
+        },
+        "retry": {
+          "type": "object",
+          "properties": {
+            "maxAttempts": { "type": "integer", "minimum": 1, "maximum": 5, "default": 3 },
+            "delayMs": { "type": "integer", "minimum": 0, "maximum": 60000, "default": 200 },
+            "backoffMultiplier": { "type": "number", "minimum": 1, "maximum": 10, "default": 1.5 },
+            "onlyCodes": { "type": "array", "items": { "type": "string" }, "maxItems": 16 }
+          },
+          "additionalProperties": false
+        },
+        "captureBefore": { "$ref": "#/definitions/capture" },
+        "ignoreCodes": {
+          "type": "array",
+          "items": { "type": "string" },
+          "maxItems": 16,
+          "description": "Finally-only: error codes that are tolerated (the step is reported as skipped instead of failed)."
+        }
+      },
+      "required": ["tool"],
+      "additionalProperties": false
+    },
+    "capture": {
+      "type": "object",
+      "properties": {
+        "saveAs": { "type": "string", "pattern": "^[A-Za-z][A-Za-z0-9_-]{0,63}$" },
+        "read": {
+          "type": "object",
+          "properties": {
+            "tool": { "type": "string", "default": "ui_get" },
+            "args": { "type": "object" }
+          },
+          "additionalProperties": false
+        }
+      },
+      "required": ["saveAs"],
+      "additionalProperties": false
+    }
+  }
+}

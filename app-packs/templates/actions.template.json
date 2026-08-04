@@ -1,0 +1,17 @@
+{
+  "contracts": [
+    {
+      "control": "confirmButton",
+      "action": "invoke",
+      "idempotent": false,
+      "retrySafe": false,
+      "destructive": false,
+      "defaultExpect": {
+        "profileControl": "resultPanel",
+        "condition": "exists",
+        "timeoutMs": 5000,
+        "pollIntervalMs": 150
+      }
+    }
+  ]
+}

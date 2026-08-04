@@ -1,0 +1,78 @@
+{
+  "controls": {
+    "mainWindow": {
+      "selectors": [
+        {
+          "controlType": "Window",
+          "name": "^Generic Qt App$",
+          "match": "regex",
+          "frameworkId": "Qt"
+        }
+      ],
+      "confidence": "runtime-verified",
+      "description": "Main application window."
+    },
+    "menuButton": {
+      "selectors": [
+        { "automationId": "menuButton$", "match": "regex", "controlType": "Button" }
+      ],
+      "confidence": "runtime-verified",
+      "description": "Application menu button. openMenu enumerates the menu; sections declared with menu.opensSubmenu open via keyboard-Right.",
+      "menu": {
+        "sectionControl": "menuSections",
+        "panelControl": "menuPanel"
+      }
+    },
+    "menuSections": {
+      "selectors": [
+        { "automationId": "menu.*SectionAction$", "match": "regex", "controlType": "Button" }
+      ],
+      "confidence": "runtime-verified",
+      "description": "Menu section rows (File/Edit/View/Help sections)."
+    },
+    "menuPanel": {
+      "selectors": [
+        { "automationId": "menuPanel$", "match": "regex" }
+      ],
+      "confidence": "runtime-verified",
+      "description": "The Qt::Tool panel window that receives keyboard events while the menu is open."
+    },
+    "menuHelpSection": {
+      "selectors": [
+        { "automationId": "menuHelpSectionAction$", "match": "regex", "controlType": "Button" }
+      ],
+      "confidence": "runtime-verified",
+      "description": "Help menu section. Use openSubmenu.",
+      "menu": { "opensSubmenu": true, "panelControl": "menuPanel" }
+    },
+    "menuAbout": {
+      "selectors": [
+        { "automationId": "menuAboutAction$", "match": "regex", "controlType": "Button" }
+      ],
+      "confidence": "runtime-verified",
+      "description": "Help submenu command: About. Opens a modal dialog that blocks InvokePattern - use keyboard-enter mode.",
+      "menu": { "command": true, "invokeMode": "keyboard-enter", "panelControl": "menuPanel" }
+    },
+    "aboutDialog": {
+      "selectors": [
+        { "automationId": "aboutDialog$", "match": "regex", "controlType": "Window" }
+      ],
+      "confidence": "runtime-verified",
+      "description": "Modal About dialog."
+    },
+    "aboutDialogOkButton": {
+      "selectors": [
+        { "automationId": "aboutDialogOkButton$", "match": "regex", "controlType": "Button" }
+      ],
+      "confidence": "runtime-verified",
+      "description": "About dialog OK button."
+    },
+    "settingsCombo": {
+      "selectors": [
+        { "automationId": "settingsCombo$", "match": "regex", "controlType": "ComboBox" }
+      ],
+      "confidence": "runtime-verified",
+      "description": "Settings combo box. selectByName/selectByIndex use SelectionItemPattern when available, keyboard fallback otherwise, and verify the value changed."
+    }
+  }
+}

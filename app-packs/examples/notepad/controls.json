@@ -1,0 +1,44 @@
+{
+  "controls": {
+    "mainWindow": {
+      "selectors": [
+        {
+          "controlType": "Window",
+          "name": "(Notepad|记事本|Editor|编辑器)",
+          "match": "regex",
+          "frameworkId": "Win32"
+        }
+      ],
+      "confidence": "runtime-verified",
+      "description": "Main editor window. Title contains the editor name in the current UI language."
+    },
+    "editArea": {
+      "selectors": [
+        {
+          "controlType": "Edit",
+          "className": "Edit"
+        },
+        {
+          "controlType": "Document",
+          "className": "RichEditD2DPT"
+        },
+        {
+          "controlType": "Pane",
+          "className": "Scintilla"
+        }
+      ],
+      "confidence": "source-derived",
+      "description": "Text editing area. Classic Notepad: Edit (no automationId). Windows 11 Notepad: RichEditD2DPT Document. Notepad3: Scintilla Pane, which exposes NO ValuePattern - use type_text/send_key instead of setValue."
+    },
+    "statusBar": {
+      "selectors": [
+        {
+          "controlType": "StatusBar",
+          "className": "msctls_statusbar32"
+        }
+      ],
+      "confidence": "source-derived",
+      "description": "Optional status bar (absent on some editors)."
+    }
+  }
+}

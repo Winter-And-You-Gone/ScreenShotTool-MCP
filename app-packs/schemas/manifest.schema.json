@@ -1,0 +1,31 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://screenshottool-mcp.local/schemas/manifest.schema.json",
+  "title": "App Pack Manifest",
+  "type": "object",
+  "description": "manifest.json - required for every App Pack directory.",
+  "properties": {
+    "schemaVersion": { "const": 1, "description": "Pack format version. Current: 1." },
+    "id": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9._-]{0,63}$",
+      "description": "Unique pack id. Lowercase start, [a-z0-9._-] afterwards, max 64 chars."
+    },
+    "displayName": { "type": "string", "minLength": 1, "maxLength": 256 },
+    "version": { "type": "string", "minLength": 1, "maxLength": 256, "description": "Pack version, e.g. \"1.0.0\". Used by continue_run to detect pack changes." },
+    "description": { "type": "string", "maxLength": 1024 },
+    "profileFile": { "type": "string", "description": "Defaults to profile.json." },
+    "controlsFile": { "type": "string", "description": "Defaults to controls.json. Optional file." },
+    "actionsFile": { "type": "string", "description": "Defaults to actions.json. Optional file." },
+    "workflowsFile": { "type": "string", "description": "Defaults to workflows.json. Optional file." },
+    "catalogVisibility": {
+      "type": "string",
+      "enum": ["session", "hidden", "internal"],
+      "default": "session",
+      "description": "session: exposed to the MCP client; hidden: callable by id but not listed; internal: only callable from the pack's own workflows."
+    },
+    "enabled": { "type": "boolean", "default": true }
+  },
+  "required": ["schemaVersion", "id", "displayName", "version"],
+  "additionalProperties": false
+}

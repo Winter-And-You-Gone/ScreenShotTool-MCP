@@ -1,0 +1,69 @@
+{
+  "workflows": [
+    {
+      "id": "type_text",
+      "description": "Launch the editor (or attach to a running instance), type the input text, select all, copy to the clipboard, and export the round-tripped text. Works on any editor (classic Notepad, Windows 11 Notepad, Notepad3/Scintilla). Note: briefly activates the window and overwrites the clipboard.",
+      "safe": true,
+      "tested": true,
+      "restoresState": false,
+      "inputSchema": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "text": { "type": "string", "minLength": 1, "maxLength": 200 }
+        },
+        "required": ["text"]
+      },
+      "steps": [
+        {
+          "id": "launch",
+          "tool": "profile_launch",
+          "args": { "profile": "${pack.id}" },
+          "exports": { "pid": "pid", "hwnd": "hwnd" }
+        },
+        {
+          "id": "waitWindow",
+          "tool": "ui_wait",
+          "args": {
+            "pid": "${launch.pid}",
+            "selector": { "controlType": "Window" },
+            "condition": "exists",
+            "timeoutMs": 10000
+          }
+        },
+        {
+          "id": "typeText",
+          "tool": "type_text",
+          "args": {
+            "pid": "${launch.pid}",
+            "text": "${inputs.text}",
+            "delayMs": 10
+          }
+        },
+        {
+          "id": "selectAll",
+          "tool": "send_key",
+          "args": {
+            "pid": "${launch.pid}",
+            "key": "a",
+            "modifiers": ["ctrl"]
+          }
+        },
+        {
+          "id": "copy",
+          "tool": "send_key",
+          "args": {
+            "pid": "${launch.pid}",
+            "key": "c",
+            "modifiers": ["ctrl"]
+          }
+        },
+        {
+          "id": "readClip",
+          "tool": "read_clipboard",
+          "exports": { "typedText": "text" }
+        }
+      ]
+    }
+  ]
+}

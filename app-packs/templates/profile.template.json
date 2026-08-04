@@ -1,0 +1,21 @@
+{
+  "id": "my-app",
+  "displayName": "My App",
+  "executableNames": [
+    "MyApp.exe"
+  ],
+  "executableEnv": "MY_APP_EXE",
+  "mainWindow": {
+    "title": "^My App$",
+    "titleMatch": "regex",
+    "frameworkId": "Qt"
+  },
+  "launch": {
+    "reuseIfRunning": true,
+    "waitForWindow": true,
+    "timeoutMs": 30000
+  },
+  "security": {
+    "requiresAsInvoker": false
+  }
+}

@@ -1,0 +1,68 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://screenshottool-mcp.local/schemas/profile.schema.json",
+  "title": "App Pack Profile",
+  "type": "object",
+  "description": "profile.json - application launch and window identification. NEVER store absolute executable paths, PIDs, HWNDs, coordinates, or credentials.",
+  "properties": {
+    "id": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9._-]{0,63}$",
+      "description": "Must match the manifest id."
+    },
+    "displayName": { "type": "string", "maxLength": 256 },
+    "executableNames": {
+      "type": "array",
+      "items": { "type": "string", "minLength": 1, "maxLength": 256 },
+      "minItems": 1,
+      "maxItems": 16,
+      "description": "Executable file name(s) (e.g. [\"Example.exe\"]). profile_launch resolves via exePath > executableEnv > common build dirs > PATH."
+    },
+    "executableEnv": {
+      "type": "string",
+      "pattern": "^[A-Z][A-Z0-9_]{0,63}$",
+      "description": "Environment variable name that overrides the executable path (e.g. \"MY_APP_EXE\"). Machine-specific paths must come through this, never the pack."
+    },
+    "mainWindow": {
+      "type": "object",
+      "properties": {
+        "title": { "type": "string", "minLength": 1 },
+        "titleMatch": { "type": "string", "enum": ["exact", "contains", "regex"], "default": "exact" },
+        "frameworkId": { "type": "string", "description": "e.g. Qt, Win32, WPF, WinForm." },
+        "className": { "type": "string" }
+      },
+      "additionalProperties": false
+    },
+    "titleContains": { "type": "array", "items": { "type": "string", "minLength": 1 }, "maxItems": 8 },
+    "processNames": { "type": "array", "items": { "type": "string", "minLength": 1 }, "maxItems": 16 },
+    "launch": {
+      "type": "object",
+      "properties": {
+        "reuseIfRunning": { "type": "boolean", "default": true },
+        "waitForWindow": { "type": "boolean", "default": true },
+        "timeoutMs": { "type": "integer", "minimum": 100, "maximum": 300000, "default": 30000 },
+        "noActivate": { "type": "boolean", "default": true }
+      },
+      "additionalProperties": false
+    },
+    "security": {
+      "type": "object",
+      "properties": {
+        "requiresAsInvoker": {
+          "type": "boolean",
+          "default": false,
+          "description": "When true, profile_launch rejects an elevated (requireAdministrator) build with ELEVATED_MANIFEST_REJECTED before spawning it."
+        }
+      },
+      "additionalProperties": false
+    },
+    "submenuAidPatterns": {
+      "type": "array",
+      "items": { "type": "string" },
+      "maxItems": 16,
+      "description": "AutomationId regexes identifying menu rows that open a submenu; used by openMenu/openSubmenu to label items."
+    }
+  },
+  "required": ["id", "executableNames"],
+  "additionalProperties": false
+}

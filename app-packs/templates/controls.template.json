@@ -1,0 +1,25 @@
+{
+  "controls": {
+    "mainWindow": {
+      "selectors": [
+        {
+          "controlType": "Window",
+          "name": "^My App$",
+          "match": "regex"
+        }
+      ],
+      "confidence": "runtime-verified"
+    },
+    "confirmButton": {
+      "selectors": [
+        {
+          "automationId": "confirmButton$",
+          "match": "regex",
+          "controlType": "Button"
+        }
+      ],
+      "confidence": "runtime-verified",
+      "description": "Confirm current operation"
+    }
+  }
+}

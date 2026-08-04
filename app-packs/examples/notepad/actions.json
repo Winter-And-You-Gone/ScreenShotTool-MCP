@@ -1,0 +1,23 @@
+{
+  "contracts": [
+    {
+      "control": "editArea",
+      "action": "setValue",
+      "idempotent": true,
+      "retrySafe": true,
+      "destructive": false,
+      "defaultExpect": {
+        "profileControl": "editArea",
+        "condition": "exists",
+        "timeoutMs": 3000
+      }
+    },
+    {
+      "control": "editArea",
+      "action": "appendText",
+      "idempotent": false,
+      "retrySafe": false,
+      "destructive": false
+    }
+  ]
+}

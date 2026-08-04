@@ -1,0 +1,77 @@
+{
+  "workflows": [
+    {
+      "id": "open_about",
+      "description": "Open the application menu, drill into Help, invoke About (non-blocking focus+Enter), and verify the About dialog appeared.",
+      "safe": true,
+      "tested": true,
+      "restoresState": false,
+      "inputSchema": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {}
+      },
+      "steps": [
+        {
+          "id": "launch",
+          "tool": "profile_launch",
+          "args": { "profile": "${pack.id}" },
+          "exports": { "pid": "pid", "hwnd": "hwnd" }
+        },
+        {
+          "id": "openMenu",
+          "tool": "profile_action",
+          "args": {
+            "profile": "${pack.id}",
+            "pid": "${launch.pid}",
+            "control": "menuButton",
+            "action": "openMenu"
+          }
+        },
+        {
+          "id": "openHelp",
+          "tool": "profile_action",
+          "args": {
+            "profile": "${pack.id}",
+            "pid": "${launch.pid}",
+            "control": "menuHelpSection",
+            "action": "openSubmenu"
+          }
+        },
+        {
+          "id": "showAbout",
+          "tool": "profile_action",
+          "args": {
+            "profile": "${pack.id}",
+            "pid": "${launch.pid}",
+            "control": "menuAbout",
+            "action": "invoke"
+          }
+        },
+        {
+          "id": "verifyDialog",
+          "tool": "profile_resolve",
+          "args": {
+            "profile": "${pack.id}",
+            "pid": "${launch.pid}",
+            "control": "aboutDialog"
+          },
+          "exports": { "aboutFound": "found" }
+        }
+      ],
+      "finally": [
+        {
+          "id": "closeAbout",
+          "tool": "profile_action",
+          "args": {
+            "profile": "${pack.id}",
+            "pid": "${launch.pid}",
+            "control": "aboutDialogOkButton",
+            "action": "invoke"
+          },
+          "ignoreCodes": ["PROFILE_CONTROL_NOT_FOUND", "ELEMENT_NOT_FOUND"]
+        }
+      ]
+    }
+  ]
+}

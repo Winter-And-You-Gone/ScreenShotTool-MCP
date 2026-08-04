@@ -560,8 +560,8 @@ export async function waitForUi(input: UiWaitInput): Promise<WaitResult> {
 // Read an executable's embedded Win32 manifest (RT_MANIFEST) and return its
 // requestedExecutionLevel ("asInvoker" / "requireAdministrator" /
 // "highestAvailable") or "unknown". Loads the PE as a data file only - never
-// runs it. Used by profile_launch to reject an old elevated VaporView build
-// before spawning it (VAPORVIEW_OLD_ELEVATED_BUILD).
+// runs it. Used by profile_launch to reject an elevated build before spawning
+// it (ELEVATED_MANIFEST_REJECTED) for profiles with requiresAsInvoker.
 export async function getExeManifestLevel(exePath: string): Promise<string> {
   const r = await runHelper<{ exePath: string; executionLevel: string }>(
     { action: "get-exe-manifest-level", exePath }

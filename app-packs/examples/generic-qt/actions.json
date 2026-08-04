@@ -1,0 +1,58 @@
+{
+  "contracts": [
+    {
+      "control": "menuButton",
+      "action": "openMenu",
+      "idempotent": true,
+      "retrySafe": true,
+      "destructive": false
+    },
+    {
+      "control": "menuHelpSection",
+      "action": "openSubmenu",
+      "idempotent": true,
+      "retrySafe": true,
+      "destructive": false
+    },
+    {
+      "control": "menuAbout",
+      "action": "invoke",
+      "idempotent": false,
+      "retrySafe": false,
+      "destructive": false,
+      "defaultExpect": {
+        "profileControl": "aboutDialog",
+        "condition": "exists",
+        "timeoutMs": 5000,
+        "pollIntervalMs": 150
+      }
+    },
+    {
+      "control": "aboutDialogOkButton",
+      "action": "invoke",
+      "idempotent": true,
+      "retrySafe": true,
+      "destructive": false,
+      "defaultExpect": {
+        "profileControl": "aboutDialog",
+        "condition": "notExists",
+        "timeoutMs": 5000,
+        "pollIntervalMs": 150
+      }
+    },
+    {
+      "control": "settingsCombo",
+      "action": "selectByIndex",
+      "idempotent": false,
+      "retrySafe": false,
+      "destructive": false
+    },
+    {
+      "control": "settingsCombo",
+      "action": "selectByName",
+      "idempotent": false,
+      "retrySafe": false,
+      "destructive": false
+    }
+  ]
+}

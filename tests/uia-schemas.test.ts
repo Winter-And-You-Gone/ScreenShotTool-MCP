@@ -180,16 +180,16 @@ test("ui schemas reject unknown fields (additionalProperties:false)", () => {
 
 test("profile schemas validate", () => {
   assert.deepEqual(profileListSchema.parse({}), {});
-  const r = profileResolveSchema.parse({ profile: "vaporview", control: "mainWindow", pid: 1234 });
-  assert.equal(r.profile, "vaporview");
+  const r = profileResolveSchema.parse({ profile: "example-app", control: "mainWindow", pid: 1234 });
+  assert.equal(r.profile, "example-app");
   assert.equal(r.control, "mainWindow");
-  const a = profileActionSchema.parse({ profile: "vaporview", control: "windowCloseButton", action: "invoke", pid: 1234 });
+  const a = profileActionSchema.parse({ profile: "example-app", control: "windowCloseButton", action: "invoke", pid: 1234 });
   assert.equal(a.action, "invoke");
 });
 
 test("profile schemas require window selector", () => {
-  assert.throws(() => profileResolveSchema.parse({ profile: "vaporview", control: "x" }));
-  assert.throws(() => profileActionSchema.parse({ profile: "vaporview", control: "x", action: "invoke" }));
+  assert.throws(() => profileResolveSchema.parse({ profile: "example-app", control: "x" }));
+  assert.throws(() => profileActionSchema.parse({ profile: "example-app", control: "x", action: "invoke" }));
 });
 
 test("JSON schema exposes action and condition enums consistently with Zod", () => {

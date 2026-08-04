@@ -6,3 +6,7 @@ outputs/
 npm-debug.log*
 .claude/
 AGENTS.md
+# Private App Packs - never commit machine-specific adaptations.
+local-app-packs/
+private-app-packs/
+runtime-app-pack-cache/

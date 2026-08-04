@@ -1,0 +1,38 @@
+{
+  "workflows": [
+    {
+      "id": "open_settings",
+      "description": "Open the settings dialog and verify it appears.",
+      "safe": true,
+      "tested": true,
+      "restoresState": false,
+      "inputSchema": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {}
+      },
+      "steps": [
+        {
+          "id": "launch",
+          "tool": "profile_launch",
+          "args": {
+            "profile": "${pack.id}"
+          },
+          "exports": {
+            "pid": "pid"
+          }
+        },
+        {
+          "id": "openSettings",
+          "tool": "profile_action",
+          "args": {
+            "profile": "${pack.id}",
+            "pid": "${launch.pid}",
+            "control": "settingsButton",
+            "action": "invoke"
+          }
+        }
+      ]
+    }
+  ]
+}

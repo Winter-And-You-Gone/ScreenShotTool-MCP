@@ -1,0 +1,13 @@
+{
+  "schemaVersion": 1,
+  "id": "generic-qt",
+  "displayName": "Generic Qt App",
+  "version": "1.0.0",
+  "description": "Example App Pack for a generic Qt Widgets application. Demonstrates menu routing hints (section rows, keyboard-enter command rows, menu panel window), combo-box controls, and a modal dialog - the app-specific bits a real Qt pack must declare.",
+  "profileFile": "profile.json",
+  "controlsFile": "controls.json",
+  "actionsFile": "actions.json",
+  "workflowsFile": "workflows.json",
+  "catalogVisibility": "session",
+  "enabled": true
+}

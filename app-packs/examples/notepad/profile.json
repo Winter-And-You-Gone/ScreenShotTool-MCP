@@ -1,0 +1,20 @@
+{
+  "id": "notepad",
+  "displayName": "Windows Notepad",
+  "executableNames": [
+    "notepad.exe"
+  ],
+  "mainWindow": {
+    "title": "(Notepad|记事本|Editor|编辑器)",
+    "titleMatch": "regex",
+    "frameworkId": "Win32"
+  },
+  "launch": {
+    "reuseIfRunning": true,
+    "waitForWindow": true,
+    "timeoutMs": 15000
+  },
+  "security": {
+    "requiresAsInvoker": false
+  }
+}

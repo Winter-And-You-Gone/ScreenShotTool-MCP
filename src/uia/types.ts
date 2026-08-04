@@ -215,7 +215,7 @@ export type UiErrorCode =
   | "TARGET_PROCESS_EXITED"
   | "UIA_ASSEMBLY_UNAVAILABLE"
   | "INVALID_SELECTOR"
-  | "VAPORVIEW_OLD_ELEVATED_BUILD";
+  | "ELEVATED_MANIFEST_REJECTED";
 
 export type UiErrorDetails = {
   selector?: unknown;

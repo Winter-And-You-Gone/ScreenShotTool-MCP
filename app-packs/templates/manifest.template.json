@@ -1,0 +1,13 @@
+{
+  "schemaVersion": 1,
+  "id": "my-app",
+  "displayName": "My App",
+  "version": "1.0.0",
+  "description": "Private UI automation pack for My App",
+  "profileFile": "profile.json",
+  "controlsFile": "controls.json",
+  "actionsFile": "actions.json",
+  "workflowsFile": "workflows.json",
+  "catalogVisibility": "session",
+  "enabled": true
+}

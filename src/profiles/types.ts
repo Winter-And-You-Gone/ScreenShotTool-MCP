@@ -29,6 +29,26 @@ export type ControlEntry = {
   selectors: UiElementSelector[];
   confidence: SelectorConfidence;
   notes?: string;
+  // Menu-routing hints for composite actions (data-driven; expressed by App
+  // Packs, interpreted by the generic profile layer - the core never knows
+  // any specific app's menu structure).
+  menu?: {
+    // True when the control is a menu section row whose submenu opens via
+    // keyboard-Right rather than InvokePattern.
+    opensSubmenu?: boolean;
+    // True when the control is a menu command row.
+    command?: boolean;
+    // "keyboard-enter": trigger via focus + Enter (non-blocking) instead of
+    // InvokePattern. Needed for commands that open a modal dialog which
+    // blocks InvokePattern.Invoke().
+    invokeMode?: "pattern" | "keyboard-enter";
+    // Logical control name of the menu panel window that receives keyboard
+    // events (e.g. a Qt::Tool top-level window). Resolved via the profile.
+    panelControl?: string;
+    // Logical control name of a selector matching the menu's section rows
+    // (used by openMenu to enumerate sections and prove the menu opened).
+    sectionControl?: string;
+  };
 };
 
 export type AppProfile = {
@@ -40,21 +60,30 @@ export type AppProfile = {
   // Never stores an absolute path; resolution uses exePath > env var > config
   // > common build dirs > PATH at runtime.
   executableNames?: string[];
-  // Environment variable name (e.g. "VAPORVIEW_EXE") that overrides the
+  // Environment variable name (e.g. "MY_APP_EXE") that overrides the
   // executable path. Machine-specific paths must come through this, not source.
   executableEnv?: string;
   // When true, profile_launch reads the resolved executable's embedded Win32
   // manifest and REJECTS a requireAdministrator/highestAvailable build before
-  // spawning it (VAPORVIEW_OLD_ELEVATED_BUILD): a non-elevated MCP cannot
+  // spawning it (ELEVATED_MANIFEST_REJECTED): a non-elevated MCP cannot
   // inspect an elevated process, and spawning it would trigger a UAC prompt.
-  // The latest VaporView builds asInvoker; old builds were requireAdministrator.
   requiresAsInvoker?: boolean;
+  // Launch defaults (from the pack's profile.json launch section).
+  launch?: {
+    reuseIfRunning?: boolean;
+    waitForWindow?: boolean;
+    timeoutMs?: number;
+    noActivate?: boolean;
+  };
   // Each logical control maps to one or more candidate selectors (tried in
   // order) plus a confidence label. For backwards compatibility a bare
   // selector / selector[] is also accepted and wrapped with the default
   // confidence "source-derived".
   controls: Record<string, ControlEntry | UiElementSelector | UiElementSelector[]>;
-};
+  // AutomationId regexes that identify menu rows which open a submenu. Used
+  // by the generic openMenu/openSubmenu composites to label items; empty for
+  // apps without such a convention.
+  submenuAidPatterns?: string[];};
 
 export type ProfileRegistry = {
   profiles: Record<string, AppProfile>;

@@ -1,0 +1,77 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://screenshottool-mcp.local/schemas/controls.schema.json",
+  "title": "App Pack Controls",
+  "type": "object",
+  "description": "controls.json - maps logical control names to UIA selector candidates. Each control entry is a selector, a selector array, or an object {selectors, confidence, description, notes, menu}.",
+  "properties": {
+    "controls": {
+      "type": "object",
+      "additionalProperties": {
+        "oneOf": [
+          { "$ref": "#/definitions/selector" },
+          {
+            "type": "array",
+            "items": { "$ref": "#/definitions/selector" },
+            "minItems": 1,
+            "maxItems": 8
+          },
+          {
+            "type": "object",
+            "properties": {
+              "selectors": {
+                "type": "array",
+                "items": { "$ref": "#/definitions/selector" },
+                "minItems": 1,
+                "maxItems": 8
+              },
+              "confidence": {
+                "type": "string",
+                "enum": ["stable", "conditionally-stable", "fragile", "source-derived", "runtime-verified", "unsupported", "action-limited", "ambiguous"],
+                "default": "source-derived"
+              },
+              "description": { "type": "string", "maxLength": 1024 },
+              "notes": { "type": "string", "maxLength": 4096 },
+              "menu": {
+                "type": "object",
+                "description": "Menu-routing hints for composite actions. All optional.",
+                "properties": {
+                  "opensSubmenu": { "type": "boolean", "description": "Section row whose submenu opens via keyboard-Right, not InvokePattern." },
+                  "command": { "type": "boolean", "description": "Menu command row." },
+                  "invokeMode": { "type": "string", "enum": ["pattern", "keyboard-enter"], "description": "keyboard-enter: trigger via focus+Enter (non-blocking), for commands that open a modal dialog blocking InvokePattern." },
+                  "panelControl": { "type": "string", "description": "Logical control name of the menu panel window receiving keyboard events." },
+                  "sectionControl": { "type": "string", "description": "Logical control name whose selector matches the menu's section rows (used by openMenu)." }
+                },
+                "additionalProperties": false
+              }
+            },
+            "additionalProperties": false
+          }
+        ]
+      }
+    }
+  },
+  "required": ["controls"],
+  "additionalProperties": false,
+  "definitions": {
+    "selector": {
+      "type": "object",
+      "description": "UIA element selector. At least one locator field (automationId/name/controlType/className/frameworkId/ancestor/path) is required.",
+      "properties": {
+        "automationId": { "type": "string", "maxLength": 256 },
+        "name": { "type": "string", "maxLength": 256 },
+        "controlType": { "type": "string", "maxLength": 256, "description": "Short name (Button) or full name (ControlType.Button) - both accepted." },
+        "className": { "type": "string", "maxLength": 256 },
+        "frameworkId": { "type": "string", "maxLength": 256, "description": "e.g. Win32, Qt, WPF, WinForm." },
+        "match": { "type": "string", "enum": ["exact", "contains", "regex"], "default": "exact" },
+        "caseSensitive": { "type": "boolean", "default": false },
+        "index": { "type": "integer", "minimum": 0, "description": "0-based index into the match list." },
+        "visibleOnly": { "type": "boolean" },
+        "enabledOnly": { "type": "boolean" },
+        "ancestor": { "$ref": "#/definitions/selector" },
+        "path": { "type": "array", "items": { "$ref": "#/definitions/selector" }, "maxItems": 12 }
+      },
+      "additionalProperties": false
+    }
+  }
+}

@@ -1,0 +1,58 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://screenshottool-mcp.local/schemas/actions.schema.json",
+  "title": "App Pack Actions",
+  "type": "object",
+  "description": "actions.json - per-control action contracts: idempotency, retry safety, destructiveness, and default postconditions (defaultExpect).",
+  "properties": {
+    "contracts": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "control": { "type": "string", "minLength": 1, "description": "Logical control name from controls.json." },
+          "action": { "type": "string", "minLength": 1, "description": "UIA action (invoke/toggle/select/setValue/selectByName/selectByIndex/openMenu/openSubmenu/...)." },
+          "idempotent": { "type": "boolean", "default": false, "description": "Repeating the action is safe (required before automatic retry is allowed)." },
+          "retrySafe": { "type": "boolean", "default": false, "description": "Transient failures may be retried. Non-idempotent + retrySafe is a validation error (UNSAFE_RETRY)." },
+          "destructive": { "type": "boolean", "default": false },
+          "requiresConfirmation": { "type": "boolean", "default": false },
+          "defaultExpect": {
+            "description": "Postcondition applied automatically when the caller provides none. Set to false to disable.",
+            "oneOf": [
+              { "$ref": "#/definitions/expect" },
+              { "const": false }
+            ]
+          },
+          "preferredMethod": { "type": "string", "description": "Informational: preferred trigger method." },
+          "fallbackPolicy": { "type": "string", "enum": ["default", "disabled"], "default": "default" },
+          "maxAttempts": { "type": "integer", "minimum": 1, "maximum": 5 }
+        },
+        "required": ["control", "action"],
+        "additionalProperties": false
+      }
+    }
+  },
+  "required": ["contracts"],
+  "additionalProperties": false,
+  "definitions": {
+    "expect": {
+      "type": "object",
+      "description": "Postcondition verified after the tool succeeds. Step success = tool OK AND condition matched.",
+      "properties": {
+        "profileControl": { "type": "string", "description": "Logical control name (resolved via the pack)." },
+        "selector": { "type": "object", "description": "Or a raw UIA selector." },
+        "condition": {
+          "type": "string",
+          "enum": ["exists", "notExists", "visible", "hidden", "enabled", "disabled", "valueEquals", "valueContains", "toggleStateEquals", "selected", "notSelected", "expanded", "collapsed", "countEquals"]
+        },
+        "timeoutMs": { "type": "integer", "minimum": 100, "maximum": 300000, "default": 5000 },
+        "pollIntervalMs": { "type": "integer", "minimum": 50, "maximum": 10000, "default": 150 },
+        "expectedValue": { "type": "string", "maxLength": 4000 },
+        "toggleState": { "type": "string", "enum": ["On", "Off", "Indeterminate"] },
+        "expectedCount": { "type": "integer", "minimum": 0, "maximum": 100 }
+      },
+      "required": ["condition"],
+      "additionalProperties": false
+    }
+  }
+}

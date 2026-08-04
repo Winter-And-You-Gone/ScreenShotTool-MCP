@@ -1,0 +1,13 @@
+{
+  "schemaVersion": 1,
+  "id": "notepad",
+  "displayName": "Windows Notepad",
+  "version": "1.0.0",
+  "description": "Example App Pack for the Windows text editor (Notepad / Notepad3 / equivalents). Demonstrates launch, window identification, edit control candidates, and a clipboard-verified type_text workflow that works on any editor, including Scintilla-based ones without ValuePattern.",
+  "profileFile": "profile.json",
+  "controlsFile": "controls.json",
+  "actionsFile": "actions.json",
+  "workflowsFile": "workflows.json",
+  "catalogVisibility": "session",
+  "enabled": true
+}

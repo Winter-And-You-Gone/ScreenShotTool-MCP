@@ -1,174 +1,47 @@
 # ScreenShotTool MCP
 
-> ⚠️ **截图很慢！每次 capture_window / capture_screen_region 需要 1-5 秒，且可能阻塞目标应用的渲染线程（PrintWindow 发 WM_PRINT 消息，目标必须同步响应）。**
-> **优先用其他工具替代截图：** `list_windows` / `get_window_state` / `click_window` + 再次 `list_windows` 验证状态变化、从目标应用日志/文件读数据。**只在真正需要视觉内容时才截图。**
+> ⚠️ **截图很慢！** 每次 `capture_window` / `capture_screen_region` 需要 1-5 秒，且可能阻塞目标应用的渲染线程（PrintWindow 发 WM_PRINT 消息，目标必须同步响应）。
+> **优先用其他工具替代截图：** `list_windows` / `get_window_state` / `ui_get` / `ui_wait` 验证状态变化，或从目标应用日志/文件读数据。**只在真正需要视觉内容时才截图。**
 
-Windows 本地截图与窗口操控 MCP Server，供 Codex、Claude Code 等 MCP 客户端通过 stdio 调用。支持启动应用、发现窗口、截取窗口或屏幕区域、模拟鼠标/键盘操作、点击原生菜单。多数窗口操作支持 best-effort 后台模式：尽量不抢焦点、不移动鼠标、不改变用户当前前台窗口。
+一个**通用的 Windows UI Automation MCP Server**，供 Codex、Claude Code 等 MCP 客户端通过 stdio 调用。核心能力：
 
-## 功能
+- 启动应用、发现窗口、截取窗口或屏幕区域、投递鼠标/键盘消息（不移动物理鼠标）。
+- **UI Automation（UIA）优先**：读取控件树、按 selector 查询控件、通过 UIA Pattern 操作控件、等待状态变化。
+- **App Pack 声明式适配**：任何桌面软件都可以通过一个 JSON 目录（App Pack）接入，无需修改 MCP 源码。
+- **管道引擎**：`run_steps` / `profile_run_steps` / `run_workflow` 服务端串联多步操作，支持命名步骤、`exports`、后置条件（expect）、重试、finally 清理、状态恢复与失败续接（continue_run）。
 
-- `launch_app` — 启动指定 `.exe`，可等待第一个可见窗口。`noActivate:true` 会在发现新窗口后恢复原前台窗口，并把目标窗口压到 z-order 底部；`startMinimized:true` 会在发现窗口后请求后台/最小化呈现。少数程序启动时仍可能短暂置顶或自行抢焦点。
-- `list_windows` — 按 `pid`、进程名、标题关键字列出可见窗口。
-- `capture_window` — ⚠️ 截图很慢（1-5s），尽量用其他工具替代。截取窗口。**默认使用 `captureMethod:"print"`（PrintWindow API）**，可截取被遮挡或最小化的窗口。仅当 `print` 模式抓不到的场景（如需要捕获 Qt ToolTip、Electron 子窗口等独立顶层弹窗）才改为 `captureMethod:"screen"`。`noActivate:true` 自动使用 PrintWindow，不操作 z-order，不闪烁。
-- `capture_screen_region` — ⚠️ 截图很慢（1-5s），尽量避免使用。按屏幕绝对坐标截取矩形。
-- `click_window` — 按窗口相对坐标投递鼠标点击消息，不移动主机物理鼠标。
-- `move_mouse_window` — 按窗口相对坐标投递鼠标移动消息，不移动主机物理鼠标。
-- `click_menu_item` — 按原生菜单路径触发菜单命令，支持中文菜单名，不移动主机物理鼠标。
-- `close_app` — 用 `taskkill /T /F` 终止指定 `pid` 及其子进程树。
-- `type_text` — 输入文本。`noActivate:true` 用 `PostMessage(WM_CHAR)` 直接投递到目标窗口的编辑控件，窗口无需焦点、无需前台。注意：对标准 Edit/RichEdit 控件可能走 `EM_REPLACESEL`，会**替换当前选区**而不是在光标处插入；若需要纯插入，先发一个取消选区的按键即可。
-- `send_key` — 发送按键。`noActivate:true` 用 `PostMessage(WM_KEYDOWN/WM_KEYUP)`，窗口无需焦点。
-- `read_clipboard` — 读取 Windows 剪贴板文本。无文本时返回 `available:false`。
-- `write_clipboard` — 写文本到剪贴板（支持 Unicode、CJK、换行；传空串清空）。上限 1,000,000 字符。配合 `send_key` 的 Ctrl+V 比逐字符 `type_text` 快很多。
-- `get_window_state` — 查询单个窗口的详细状态（minimized/maximized/foreground/topmost/layered/cloaked/style 等），比 `list_windows` 信息更全。
-- `wait_for_window` — 阻塞等待匹配窗口出现 (`mode:"appear"`) 或消失 (`mode:"disappear"`)。超时返回 `found:false` 而不是抛错，比客户端轮询高效。
+## 目录
 
-- **UI Automation 工具**（UIA 优先，详见下文 [UI Automation](#ui-automationuia) 章节）：`ui_inspect_tree` 读取控件树、`ui_query`/`ui_get` 查找控件、`ui_action` 通过 UIA Pattern 操作控件、`ui_wait` 等待状态变化、`profile_list`/`profile_resolve`/`profile_action` 操作应用 profile（如 VaporView）。这些工具不依赖截图或固定坐标，不移动真实鼠标。
+1. [快速开始](#快速开始)
+2. [App Pack 是什么](#app-pack-是什么)
+3. [创建自己的 App Pack](#创建自己的-app-pack)
+4. [App Pack 文件格式](#app-pack-文件格式)
+5. [加载本地私有 Pack](#加载本地私有-pack)
+6. [验证 Pack](#验证-pack)
+7. [生成 Pack 草稿](#生成-pack-草稿)
+8. [使用 Workflow](#使用-workflow)
+9. [profile_run_steps](#profile_run_steps)
+10. [命名步骤与 exports](#命名步骤与-exports)
+11. [expect / retry / finally](#expect--retry--finally)
+12. [续接失败的 run](#续接失败的-run)
+13. [输出 Schema 与 structuredContent](#输出-schema-与-structuredcontent)
+14. [安全限制](#安全限制)
+15. [私有 Pack 与公共仓库](#私有-pack-与公共仓库)
+16. [测试](#测试)
 
-截图默认保存到：
+## 快速开始
 
-```text
-X:\MCP\ScreenShotTool\outputs\YYYYMMDD-HHMMSS-xxxxxx.png
-```
-
-工具返回 JSON 文本，包含：
-
-```json
-{
-  "path": "X:\\MCP\\ScreenShotTool\\outputs\\20260524-120000-abc123.png",
-  "width": 800,
-  "height": 600,
-  "target": "window:123456",
-  "rect": { "x": 0, "y": 0, "width": 800, "height": 600 },
-  "timestamp": "2026-05-24T04:00:00.0000000Z"
-}
-```
-
-## 后台模式
-
-后台操作推荐显式传入 `noActivate:true`，截图时再配合 `captureMethod:"print"` 和 `focus:false`。这是一组 Win32 best-effort 策略，不是操作系统级沙箱：如果目标程序启动时主动调用 `SetForegroundWindow`、忽略窗口消息、或安全策略禁止后台输入，工具只能尽量恢复原前台窗口并把目标窗口压到底层。
-
-| 工具 | noActivate 行为 |
-|------|-----------------|
-| `launch_app` | 新窗口出现后立即推到 `HWND_BOTTOM`，并恢复用户原来的前台窗口。发现窗口后会继续持续监控至少 8 秒，且不短于本次 `timeoutMs`：压制多窗口 app 的后续窗口、捕获 app 自激活恢复、以及覆盖较慢启动的窗口。使用 Alt 键技巧绕过 `SetForegroundWindow` 限制。当 app 启动超慢、`Wait-And-Suppress` 没能先发现窗口时，还有一个 fallback 阶段会对已找到的窗口补做持续压制。 |
-| `capture_window` | 自动切换到 `PrintWindow` 模式，从窗口绘制表面直接捕获，无需操作 z-order，不会导致窗口闪现。 |
-| `type_text` | 通过 `GetGUIThreadInfo` 定位焦点子控件（如 Scintilla、Edit），再用 `PostMessage(WM_CHAR)` 投递字符；窗口在后台时用 `EnumChildWindows` 按类名查找编辑控件。 |
-| `send_key` | 用 `PostMessage(WM_KEYDOWN/WM_KEYUP)` 代替 `keybd_event`，无需前台焦点。 |
-
-**完整示例——后台启动记事本、输入文字、截图、关闭：**
-
-```json
-// 1. 启动（best-effort 不抢焦点，并压到底层）
-{ "exePath": "C:\\Windows\\System32\\notepad.exe", "waitForWindow": true, "noActivate": true, "startMinimized": true }
-
-// 2. 输入文字（noActivate，PostMessage WM_CHAR 直达编辑控件）
-{ "hwnd": "123456", "text": "Hello from background!", "noActivate": true }
-
-// 3. 截图（默认 PrintWindow，不把窗口拉到前台）
-{ "hwnd": "123456", "focus": false, "noActivate": true }
-
-// 4. 关闭
-{ "pid": 7890 }
-```
-
-VaporView 这类 Qt 程序建议使用同一套参数：
-
-```json
-// launch_app
-{
-  "exePath": "X:\\Project\\GPS\\VaporView\\build\\Release\\VaporView.exe",
-  "waitForWindow": true,
-  "timeoutMs": 10000,
-  "noActivate": true,
-  "startMinimized": true
-}
-
-// click_window: 本身使用窗口消息，不移动物理鼠标
-{ "hwnd": "123456", "x": 535, "y": 50, "delayMs": 300 }
-
-// capture_window（默认 PrintWindow）
-{ "hwnd": "123456", "focus": false, "noActivate": true }
-```
-
-## 安装与构建
+前置条件：Windows 桌面会话、Node.js >= 20、可调用 PowerShell（pwsh.exe 优先）。
 
 ```powershell
-npm install
-npm run build
-```
-
-开发时直接运行：
-
-```powershell
-npm run dev
-```
-
-构建后运行：
-
-```powershell
-npm start
-```
-
-## 热重载
-
-`npm start` 启动的 MCP server 默认启用工具层热重载：每次 `tools/list` 或工具调用前会检查 `dist/schemas.js`、`dist/windows.js` 和 `scripts/win-capture.ps1` 的修改时间；如果发生变化，会重新加载工具模块，并重启长驻 PowerShell helper。这样修改截图/点击/窗口操作逻辑后，通常不用重启 Codex 或 Inspector。
-
-TypeScript 源码改动仍然需要先编译到 `dist/`。开发时可以另开一个终端运行：
-
-```powershell
-npm run build:watch
-```
-
-然后保持 MCP 客户端继续使用：
-
-```powershell
-npm start
-```
-
-热重载边界：
-
-- `scripts/win-capture.ps1` 改动：下一次工具调用直接生效。
-- `src/windows.ts` / `src/schemas.ts` 改动：`npm run build` 或 `npm run build:watch` 编译后，下一次工具调用生效。
-- `src/index.ts`、依赖、启动参数、MCP transport 层改动：仍需重启 MCP server。
-- 如需关闭热重载，可设置环境变量 `SCREENSHOTTOOL_HOT_RELOAD=0` 后再启动 server。
-
----
-
-## 🤖 给 AI Agent 的安装指引
-
-> 这一节专门写给 Codex / Claude Code 等 AI Agent 阅读，按顺序执行即可完成安装和接入。
-
-### 前置条件检查
-
-```powershell
-# 1. 必须是 Windows 桌面会话
-[System.Environment]::OSVersion.Platform   # 期望: Win32NT
-
-# 2. Node 版本必须 >= 20
-node --version
-
-# 3. 必须能调用 PowerShell（pwsh.exe 优先，否则 powershell.exe）
-where.exe pwsh.exe
-where.exe powershell.exe
-```
-
-如果 Node 缺失或版本过低，先告知用户并停止。**不要**自动安装 Node。
-
-### 克隆 + 构建
-
-```powershell
-# 选一个目录（示例用 X:\MCP，你可以换成任意绝对路径）
-cd X:\MCP
-git clone git@github.com:Winter-And-You-Gone/ScreenShotTool-MCP.git
+git clone https://github.com/Winter-And-You-Gone/ScreenShotTool-MCP.git
 cd ScreenShotTool-MCP
 npm install
 npm run build
+npm test
 ```
 
-构建产物在 `dist/index.js`，**这就是 MCP 客户端要调用的入口**。
-
-### 配置 MCP 客户端
-
-把以下条目写入客户端的 `mcpServers` 配置（**绝对路径**必须用双反斜杠转义）：
+在 MCP 客户端配置（stdio）：
 
 ```json
 {
@@ -176,560 +49,249 @@ npm run build
     "screenshottool": {
       "command": "node",
       "args": ["X:\\MCP\\ScreenShotTool\\dist\\index.js"],
-      "cwd": "X:\\MCP\\ScreenShotTool"
+      "env": { "MY_APP_EXE": "X:\\path\\to\\your-app.exe" }
     }
   }
 }
 ```
 
-开发期也可以用 `tsx` 直接运行 TypeScript 源码（无需每次构建）：
+首次接入推荐顺序（模型第一次使用时）：
 
-```json
-{
-  "mcpServers": {
-    "screenshottool": {
-      "command": "npx",
-      "args": ["tsx", "X:\\MCP\\ScreenShotTool\\src\\index.ts"],
-      "cwd": "X:\\MCP\\ScreenShotTool"
-    }
-  }
-}
+```
+已加载 App Pack：  app_pack_list → app_pack_describe → workflow_catalog → run_workflow
+                  或 app_pack_describe → profile_run_steps
+未知应用：         launch_app → ui_catalog → app_pack_probe → 创建 App Pack
+                  → app_pack_validate → 加载 Pack
+底层高级用户：     validate_steps → run_steps → continue_run
 ```
 
-不同客户端的配置文件位置：
-- **Claude Code**: `%APPDATA%\Claude\claude_desktop_config.json` 或 `~/.claude.json`
-- **Codex CLI**: `~/.codex/config.toml`（TOML 格式，需要换种写法）
-- **MCP Inspector**: `npm run inspect`
+## App Pack 是什么
 
-### 自检（不依赖客户端）
+App Pack 是一个**声明式 JSON 目录**，把"某个软件的启动方式、窗口识别、逻辑控件名、UIA selector、动作契约、默认后置条件、可复用工作流"全部描述为数据。任何用户都可以为自己的 Windows 软件创建一个 App Pack，**不需要修改 MCP 源码**。
+
+核心不包含任何具体软件的硬编码（启动、窗口、菜单、控件、工作流全部来自 Pack）。公共仓库只附带两个**通用示例 Pack**：
+
+- `app-packs/examples/notepad/` — 记事本/编辑器（演示 launch、窗口识别、多候选 selector、剪贴板验证的输入工作流）。
+- `app-packs/examples/generic-qt/` — 通用 Qt 应用（演示菜单路由 hints、模态对话框、ComboBox 契约）。
+
+## 创建自己的 App Pack
+
+1. 启动目标应用。
+2. `app_pack_probe { "pid": <pid> }` 生成草稿（候选主窗口规则 + 控件清单 + controls.json 草稿）。
+3. 复制 `app-packs/templates/` 到你的包目录，按草稿填写。
+4. `app_pack_validate { "packPath": "你的包目录" }` 本地校验（不安装）。
+5. 通过 `SCREENSHOT_MCP_APP_PACK_DIRS` 或本地目录加载，用 `run_workflow` / `profile_run_steps` 验证。
 
 ```powershell
-# 单元测试
-npm test                    # 期望全部通过
-
-# 启动 + 关闭 Notepad 的端到端测试
-npm run smoke:notepad
-
-# 验证 noActivate 不抢焦点
-npm run smoke:no-activate
+$env:SCREENSHOT_MCP_APP_PACK_DIRS = "X:\Private\AppPacks;D:\Team\AppPacks"
 ```
 
-如果 `smoke:no-activate` 失败，通常是因为：
-1. 当前没有桌面会话（远程会话/服务模式跑不动）
-2. UAC 阻止了 `keybd_event`（用普通用户权限运行即可，**不要**用管理员权限）
+## App Pack 文件格式
 
-### 接入后的第一次调用
+每个 App Pack 是一个目录，其中 `manifest.json` 与 `profile.json` 必须存在，其余文件可选：
 
-确认接入成功的最小调用：
+```text
+<pack-directory>/
+├─ manifest.json    必选：id、版本、可见性、文件引用
+├─ profile.json     必选：可执行文件、主窗口规则、启动与安全参数
+├─ controls.json    逻辑控件名 → UIA selector 候选
+├─ actions.json     控件+动作契约（幂等、可重试、defaultExpect）
+├─ workflows.json   可复用命名工作流
+└─ README.md        说明
+```
+
+完整 JSON Schema 见 `app-packs/schemas/`（`manifest.schema.json`、`profile.schema.json`、`controls.schema.json`、`actions.schema.json`、`workflows.schema.json`），模板见 `app-packs/templates/`。
 
 ```jsonc
-// 1. 列出当前可见窗口（不会改变任何状态）
-{ "tool": "list_windows", "arguments": {} }
+// manifest.json
+{ "schemaVersion": 1, "id": "example-app", "displayName": "Example App",
+  "version": "1.0.0", "catalogVisibility": "session", "enabled": true }
 
-// 2. noActivate 启动记事本（不抢焦点）
-{ "tool": "launch_app", "arguments": {
-    "exePath": "C:\\Windows\\System32\\notepad.exe",
-    "waitForWindow": true,
-    "noActivate": true
-} }
+// profile.json —— 禁止保存绝对路径、PID、HWND、坐标、凭据
+{ "id": "example-app", "executableNames": ["Example.exe"],
+  "executableEnv": "EXAMPLE_APP_EXE",
+  "mainWindow": { "title": "^Example App$", "titleMatch": "regex", "frameworkId": "Qt" },
+  "security": { "requiresAsInvoker": false } }
+
+// controls.json
+{ "controls": {
+    "mainWindow": { "selectors": [{ "controlType": "Window", "name": "^Example App$", "match": "regex" }],
+                    "confidence": "runtime-verified" },
+    "confirmButton": { "selectors": [{ "automationId": "confirmButton$", "match": "regex", "controlType": "Button" }],
+                       "confidence": "runtime-verified" } } }
+
+// actions.json —— 幂等/可重试/默认后置条件
+{ "contracts": [ { "control": "confirmButton", "action": "invoke",
+                   "idempotent": false, "retrySafe": false,
+                   "defaultExpect": { "profileControl": "resultPanel", "condition": "exists",
+                                      "timeoutMs": 5000 } } ] }
+
+// workflows.json —— ${pack.id} 由服务端注入
+{ "workflows": [ { "id": "open_settings", "safe": true, "tested": true,
+                   "steps": [
+                     { "id": "launch", "tool": "profile_launch", "args": { "profile": "${pack.id}" },
+                       "exports": { "pid": "pid" } },
+                     { "id": "openSettings", "tool": "profile_action",
+                       "args": { "profile": "${pack.id}", "pid": "${launch.pid}",
+                                 "control": "settingsButton", "action": "invoke" } } ] } ] }
 ```
 
-返回的 `window.hwnd` 就是后续 `type_text`、`capture_window`、`click_window` 的目标。
+要点：
 
-### 常见错误
+- `id` 必须匹配 `^[a-z][a-z0-9._-]{0,63}$`，与 profile.json 一致。
+- `catalogVisibility`：`session`（对客户端可见）/ `hidden`（知道 id 可调用，不列出）/ `internal`（仅 Pack 内部工作流可用）。
+- selector 支持 `automationId` / `name` / `controlType` / `className` / `frameworkId` + `match`（exact/contains/regex）+ `ancestor` / `path` / `index`。
+- confidence 支持 `stable` / `conditionally-stable` / `fragile` / `source-derived` / `runtime-verified` / `unsupported` / `action-limited`。
+- 菜单类控件用 `menu` hints 声明：`opensSubmenu`（键盘 Right 打开子菜单）、`invokeMode:"keyboard-enter"`（模态对话框命令的非阻塞触发）、`panelControl`（接收键盘事件的菜单面板窗口）、`sectionControl`（openMenu 枚举 section 的 selector）。
 
-| 现象 | 原因 | 修复 |
-|------|------|------|
-| `exePath must be an absolute path` | 路径不是绝对路径 | 用 `C:\\Windows\\System32\\notepad.exe` 这类完整路径 |
-| `outputPath must end with .png` | 输出路径后缀不对 | 省略 `outputPath` 让工具自动生成，或确保以 `.png` 结尾 |
-| `PowerShell helper exited unexpectedly` | helper 进程崩溃（一般是首次启动慢） | 重试一次；持续失败查看 `outputs/` 同级是否有报错日志 |
-| `noActivate` 模式下窗口仍然闪一下 | 极少数程序自身会调用 `SetForegroundWindow` | 这是程序行为，工具层面已尽力抑制 |
-| 中文菜单匹配失败 | 旧版本 (< 73a9fa6) 的 ANSI 编码问题 | 拉取最新 main 重新构建 |
+## 加载本地私有 Pack
 
-### 不要做的事
+加载来源优先级从高到低：
 
-- ❌ 不要自动 `git pull` 升级——可能引入 break change
-- ❌ 不要修改 `outputs/`、`dist/`、`.claude/` 目录——都被 gitignore
-- ❌ 不要给 `type_text` 传超长字符串（单次最多 1000 字符，且会按 `delayMs + pressMs` 拒绝预计过慢的请求），分段发送更可靠
-- ❌ 不要在 `click_window` 之后立刻 `capture_window`——加 `delayMs: 200` 给 UI 重绘时间
-
-## UI Automation（UIA）
-
-除了基于窗口坐标的操作，本工具还提供 **Microsoft UI Automation** 优先的控件读取与操作能力。UIA 通过控件的 `AutomationId` / `Name` / `ControlType` / `ClassName` / `FrameworkId` 定位，比截图或固定坐标更稳定，不受分辨率、DPI、窗口位置变化影响，也不需要移动物理鼠标。
-
-### 为什么 UIA 优先于截图和固定坐标
-
-- 截图很慢（1-5s）且只能看静态画面；UIA 直接读取控件树和状态，毫秒级返回。
-- 固定坐标在 DPI 缩放、多显示器、窗口移动后会失效；UIA 控件定位与坐标无关。
-- 截图无法读取控件值/状态（如文本框内容、勾选状态、下拉选中项）；UIA 通过 Pattern 直接读取。
-- 截图不能"点击"；UIA 通过 `InvokePattern` / `ValuePattern` 等真正触发控件行为，且不移动真实鼠标。
-
-### UIA 工具列表
-
-| 工具 | 用途 |
-|------|------|
-| `ui_inspect_tree` | 读取目标窗口的 UIA 控件树（扁平 nodeId/parentNodeId 结构，带 patterns/boundingRect）。 |
-| `ui_query` | 按 selector 查找控件，返回匹配元素及值/状态。 |
-| `ui_get` | 读取**唯一**控件的状态（比 ui_query 轻）。0 个=found:false，1 个=状态，多个=ELEMENT_AMBIGUOUS。 |
-| `ui_action` | 对控件执行动作（invoke/toggle/select/expand/setValue/appendText/clear/selectAll/getValue/setChecked/increment/decrement 等），优先用 UIA Pattern，其次键盘降级，坐标降级默认关闭。物理鼠标永远不移动。 |
-| `ui_wait` | 等待 UI 状态变化（exists/enabled/valueEquals 等），不截图轮询。运行在独立 PowerShell 进程，不阻塞共享 worker。`exists` 只要有一个匹配即可；状态条件要求唯一元素（可用 `index` 消除歧义）。超时返回 `matched:false,timedOut:true`；窗口/UIA/权限错误不会被吞掉。 |
-| `ui_catalog` | 枚举目标窗口所有可操作控件，返回 `recommendedSelector`（已验证唯一，可直接传给 `ui_action`）/`selectorVerified`/`selectorMatchCount`/`supportedActions`/`selectorConfidence`。目标匹配已知 profile 时附加 `profileControl` 标签。 |
-| `profile_list` | 列出可用应用 profile（如 VaporView）。 |
-| `profile_launch` | 按 profile 启动应用，解析可执行文件（exePath > 环境变量 > 配置 > 构建目录 > PATH），返回 pid/hwnd/title、UIA Root 可用性、`manifestLevel`。对 `requiresAsInvoker` profile 在 spawn 前检测内嵌 manifest，拒绝旧管理员构建（`VAPORVIEW_OLD_ELEVATED_BUILD`）。默认复用已运行实例。 |
-| `profile_resolve` | 按 profile + 逻辑控件名解析为真实元素。 |
-| `profile_action` | 对 profile 中的逻辑控件执行动作（基本 + 复合：selectByName/selectByIndex/getSelection/openMenu/openSubmenu，自动处理 popup、键盘降级并验证 before/after；菜单命令 invoke 用非阻塞 focus+Enter）。物理鼠标永远不移动。 |
-
-### Selector 说明
-
-`selector` 支持以下字段，至少提供一个定位字段：
-
-| 字段 | 默认匹配 | 说明 |
-|------|----------|------|
-| `automationId` | exact | Qt 的 objectName、WPF 的 AutomationId。最稳定。 |
-| `name` | exact | 控件显示文本（本地化敏感）。 |
-| `controlType` | exact（不区分大小写） | 接受 `Button` / `ControlType.Button` / `button`。 |
-| `className` | exact | Win32 窗口类名（如 `Edit`、`RICHEDIT50W`）。 |
-| `frameworkId` | exact | `Win32` / `Qt` / `WPF` / `WinForm`。 |
-| `match` | - | `exact`（默认）/ `contains` / `regex`。正则限长 256 字符。 |
-| `caseSensitive` | false | 大小写敏感。 |
-| `index` | - | 0-based。多匹配时必须提供，否则返回 ELEMENT_AMBIGUOUS；支持 `index >= 2`。 |
-| `visibleOnly` / `enabledOnly` | - | 过滤器（非定位字段）。 |
-| `ancestor` | - | 从候选元素向父链进行有界匹配（受 `maxDepth` 限制）。 |
-| `path` | - | direct-child 层级路径，从 root 逐级匹配（最多 12 级）；不会把任意 descendant 当作下一段。 |
-
-> **不要把 `RuntimeId` 当作长期 selector**——它可能在 UI 重建后变化。`RuntimeId` 仅用于单次结果诊断。
-
-### 各 Pattern 对应操作
-
-| 控件类型 | 动作 | Pattern 优先级 |
-|----------|------|----------------|
-| 按钮 | invoke | InvokePattern → 坐标降级 |
-| 开关/复选框 | toggle | TogglePattern → InvokePattern → 坐标降级 |
-| 列表项/标签页 | select | SelectionItemPattern.Select → InvokePattern → 坐标降级 |
-| 下拉框 | expand/collapse | ExpandCollapsePattern |
-| 文本框 | setValue | ValuePattern（**不**用 WM_CHAR 替代） |
-| 滑块 | setRangeValue | RangeValuePattern（**禁止**拖拽模拟） |
-| 滚动到可见 | scrollIntoView | ScrollItemPattern |
-
-> **LegacyIAccessiblePattern 不可用**：本工具使用的托管 `System.Windows.Automation` API 不暴露 `LegacyIAccessiblePattern`（它仅存在于 COM `IUIAutomation` 接口）。`legacyDefaultAction` 动作会退化为 InvokePattern，失败时按坐标降级（需显式开启）。这是 API 层限制，非缺陷。
-
-### 坐标降级（默认关闭）
-
-坐标降级是**严格受控的最终方案**，仅在以下条件**全部**满足时才使用：
-
-1. 调用方显式传入 `allowCoordinateFallback: true`；
-2. 元素唯一定位成功；
-3. 元素有有效 BoundingRectangle；
-4. 元素非 offscreen、宽高均 > 0；
-5. 中心点位于目标窗口范围内；
-6. UIA Pattern 不可用或调用失败。
-
-降级时基于**当前** BoundingRectangle 动态计算中心点，转换为窗口相对坐标，复用 `click_window` 能力，**不移动真实鼠标**。profile 中**不允许**保存绝对屏幕坐标或固定分辨率坐标。
-
-强制坐标点击需同时设置 `forceCoordinateClick: true` 和 `allowCoordinateFallback: true`。
-
-### ui_inspect_tree 示例
-
-```json
-{
-  "tool": "ui_inspect_tree",
-  "arguments": {
-    "processName": "VaporView",
-    "interactiveOnly": true,
-    "includeProcessPopups": true,
-    "maxDepth": 10,
-    "maxNodes": 1500
-  }
-}
+```text
+1. 命令行 --app-pack-dir <dir>
+2. 环境变量 SCREENSHOT_MCP_APP_PACK_DIRS（平台路径分隔符分号/冒号分隔多目录）
+3. %APPDATA%\ScreenShotTool-MCP\app-packs
+4. <项目>/local-app-packs/           （私有 Pack，gitignored）
+5. <项目>/app-packs/examples/        （公共示例）
 ```
 
-返回扁平节点列表，每个节点含 `nodeId` / `parentNodeId` / `controlType` / `automationId` / `name` / `patterns` / `boundingRect`，以及 `truncated` 标记和 `elapsedMs`。
+规则：
 
-### ui_query 示例
+- 只扫描每个来源的**直接子目录**，每个子目录必须含 `manifest.json`。
+- 同名 Pack 报 `PACK_ID_CONFLICT`，不静默覆盖。
+- 引用文件必须位于 Pack 根目录内；`../` 与符号链接逃逸被拒绝（`PATH_ESCAPE`）。
+- Pack 只包含 JSON，**不执行任何代码**。
+- `app_pack_reload` 原子重载：新配置校验失败时保留旧配置；正在运行的管道继续使用启动时快照。
 
-```json
-{
-  "tool": "ui_query",
-  "arguments": {
-    "processName": "VaporView",
-    "selector": {
-      "controlType": "Button",
-      "name": "设置"
-    }
-  }
-}
+## 验证 Pack
+
+```jsonc
+// 校验已加载的 Pack
+{ "pack": "example-app" }
+// 本地校验一个目录（不安装）
+{ "packPath": "X:\\Private\\AppPacks\\example-app" }
 ```
 
-### ui_action 示例
+检查项：manifest/profile/controls/actions/workflows 的 Schema、control 引用、workflow 工具名、参数 Schema、输出引用路径、循环/前向引用、敏感字段、目录逃逸、绝对路径、重复 ID、未知动作、不安全重试（非幂等 + retrySafe）。返回 `{ valid, errors[], warnings[], checked[] }`。
 
-```json
-{
-  "tool": "ui_action",
-  "arguments": {
-    "processName": "VaporView",
-    "selector": { "controlType": "Button", "name": "设置" },
-    "action": "invoke",
-    "allowCoordinateFallback": false
-  }
-}
+## 生成 Pack 草稿
+
+```jsonc
+{ "pid": 12345, "includeProcessPopups": true }
 ```
 
-### ui_wait 示例
+`app_pack_probe` 返回：候选主窗口规则、可操作控件（稳定 automationId、推荐 selector、Patterns）、可能的菜单层级、输入控件、Dialog、无法访问控件，以及 `controls.json` / `profile.json` 草稿（可写入临时目录）。草稿**不会自动安装**。
 
-```json
-{
-  "tool": "ui_wait",
-  "arguments": {
-    "processName": "VaporView",
-    "selector": { "controlType": "Dialog" },
-    "condition": "exists",
-    "timeoutMs": 10000,
-    "pollIntervalMs": 200
-  }
-}
+## 使用 Workflow
+
+```jsonc
+{ "pack": "example-app", "workflow": "open_settings", "inputs": {} }
 ```
 
-超时返回 `matched:false,timedOut:true`（不是错误）。`ui_wait` 运行在独立 PowerShell 进程，不会阻塞共享 worker 的其他工具调用。`ui_query`/`ui_get` 的零结果返回 `found:false`；`ui_action` 的零结果返回 `ELEMENT_NOT_FOUND`，多结果返回 `ELEMENT_AMBIGUOUS`。
+- 输入按 workflow 的 `inputSchema` 校验（required / additionalProperties）。
+- `${pack.id}` 服务端注入；`${inputs.x}` 引用工作流输入。
+- Pack 的 `defaultExpect` 自动生效；步骤可引用前序步骤：`${launch.pid}`。
+- 返回 `runId`、命名步骤结果、`exports`、`finallyResults`。
+- `internal` 可见性的工作流只能被 Pack 内部工作流调用，直接调用返回 `WORKFLOW_INTERNAL`。
 
-### VaporView Profile
+## profile_run_steps
 
-VaporView 的 profile（`vaporview`）映射关键控件。最新构建使用 `asInvoker` manifest，普通权限 MCP 可直接读取 UIA 树。运行时 AutomationId 是完整 Qt 路径（如 `QApplication.MainWindow.customTitleBar.titleBarMenuButton`）：
+模型不需要重复传 `profile` / `pid` / `includeProcessPopups`：
 
-- `mainWindow`（标题 `"VaporView"`，FrameworkId 为 `Qt`）
-- 窗口控制按钮：`windowMinimizeButton` / `windowMaximizeButton` / `windowCloseButton`
-- 容器：`appCentralWidget` / `mainPageStack` / `appSidebar` / `mainContentSplitter`
-- 侧栏导航按钮（共享 objectName `appSidebarButton`，按 accessibleName 区分）：`sidebarHome` / `sidebarDeviceConfig` / `sidebarTemperature` / `sidebarRtkConfig`
-- 日志面板：`logSidePanel` / `logListView`（日志视图）/ `logSearchButton`（搜索按钮，打开搜索弹窗）/ `logFilterButton`（日志视图过滤按钮）/ `logFilterMenu`（过滤弹窗）/ `logFilterAutoFollowMenuAction`（自动跟随行）/ `logSidePanelToggleButton`（日志面板开关）
-- 日志搜索框 `logSearchEdit`：最新构建中它位于 `logSearchMenu` 的 `QWidgetAction` 弹窗内，UIA **未暴露**（弹窗只暴露 `QWidgetAction` MenuItem，无子 Edit 节点），标记为 `unsupported`，不能作为输入控件驱动
-- 菜单入口：`titleBarMenuButton`（打开标题栏应用菜单）
-- **标题栏菜单项（真实 `QToolButton`，runtime-verified）**：分组行 `titleMenuFileSection` / `titleMenuViewSection` / `titleMenuDeveloperSection` / `titleMenuHelpSection`；命令行 `titleMenuRecordingFolder` / `titleMenuDataViewer` / `titleMenuExit` / `titleMenuViewLogPanel` / `titleMenuLanguage` / `titleMenuLanguageChinese` / `titleMenuLanguageEnglish` / `titleMenuUiTestMode` / `titleMenuUiTestScenario` / `titleMenuCheckUpdates` / `titleMenuAbout`
-- **About 对话框**：`aboutDialog`（模态 `QDialog`）/ `aboutDialogOkButton`（`QPushButton`，InvokePattern）
-- **设备配置页 ComboBox（runtime-verified）**：`epsilonPortCombo` / `pressurePortCombo` / `humidityPortCombo` / `lidarPortCombo` / `temperaturePortCombo` / `ai8TemperaturePortCombo` / `ai8TemperatureBaudCombo` / `ai8TemperatureRateCombo` / `pressureSourceCombo` / `humiditySourceCombo`
-
-> 标题栏菜单项**不再是自绘行**：最新 VaporView 已将菜单行改为真实 `QToolButton`（带稳定 `objectName` == commandId），UIA 暴露为 `ControlType.Button` + `InvokePattern`，可通过 `openMenu` / `openSubmenu` / `invoke` 操作。详见下文[标题栏菜单操作](#标题栏菜单操作)。
-
-已对最新 asInvoker 构建实机验证的控件标记 `runtime-verified`；仅源码确认的标记 `source-derived`（用正则后缀匹配确认的短 objectName）。profile 不存储 HWND/PID/RuntimeId/绝对路径/屏幕坐标。
-
-```json
-{
-  "tool": "profile_action",
-  "arguments": {
-    "profile": "vaporview",
-    "control": "windowCloseButton",
-    "action": "invoke",
-    "pid": 1234
-  }
-}
+```jsonc
+{ "profile": "example-app", "launch": { "reuseIfRunning": true },
+  "steps": [
+    { "id": "openMenu", "control": "mainMenuButton", "action": "openMenu" },
+    { "id": "openSettings", "control": "settingsButton", "action": "invoke" } ] }
 ```
 
-profile 找不到控件时会按候选 selector 顺序尝试，并返回每个候选的失败摘要。每个控件带有 `confidence`：`runtime-verified`（实机验证）/ `source-derived`（源码确认）/ `action-limited`（可达但无标准 Pattern）/ `unsupported` / `ambiguous`。profile 层不直接调用 PowerShell，完全复用通用 UIA 层；hot reload 时通过依赖注入复用同一个 shared worker。
+服务端自动：`profile_launch`（可复用运行中实例）→ 注入 profile/pid/hwnd → 按 Pack selector 解析控件 → 复合动作（`selectByName` / `selectByIndex` / `openMenu` / `openSubmenu` / `ensureSelected`）处理同 PID popup 并验证前后状态 → 应用 `defaultExpect` → finally 清理。**永不移动物理鼠标。**
 
-#### profile_launch（启动 profile 应用）
+## 命名步骤与 exports
 
-```json
-{ "tool": "profile_launch", "arguments": { "profile": "vaporview", "noActivate": true } }
+```jsonc
+{ "steps": [
+    { "id": "app", "tool": "profile_launch", "args": { "profile": "example-app" },
+      "exports": { "pid": "pid", "hwnd": "hwnd" } },
+    { "id": "check", "tool": "ui_wait",
+      "args": { "pid": "${app.pid}", "selector": { "controlType": "Window" }, "condition": "exists" } } ] }
 ```
 
-按优先级解析可执行文件：显式 `exePath` > 环境变量 `VAPORVIEW_EXE` > 配置 > 常见构建目录 > PATH。返回 `pid`、主窗口 `hwnd`/`title`、是否由 MCP 启动、UIA Root 是否可用、`manifestLevel`。默认复用已运行实例。不在 profile 中保存本机绝对路径。
+- 引用：`${app.pid}`（命名）、`${0.pid}`（旧数字引用，保持兼容）、`${pack.id}`、`${inputs.x}`。
+- Step id 规则 `^[A-Za-z][A-Za-z0-9_-]{0,63}$`，必须唯一；保留名 `vars/env/steps/results/run/pack/inputs`。
+- exports 在步骤完成后立即校验：路径存在、中间节点非 null、类型正确、**敏感字段名禁止**（password/token/credential/secret/authorization/cookie）。错误码 `EXPORT_PATH_NOT_FOUND` / `EXPORT_VALUE_NULL` / `EXPORT_SENSITIVE_VALUE_BLOCKED` 等。
+- 限制：每步最多 32 个 exports、路径 ≤256 字符、嵌套深度 ≤16、单字符串 ≤64 KiB。
 
-> **`profile_launch` 自带旧管理员构建检测**：对标记 `requiresAsInvoker` 的 profile（如 VaporView），`profile_launch` 在 spawn 前读取可执行文件内嵌的 Win32 manifest（`RT_MANIFEST`），若为 `requireAdministrator` / `highestAvailable` 直接返回 `VAPORVIEW_OLD_ELEVATED_BUILD`（不 spawn、不触发 UAC），提示重建最新 asInvoker 版本。manifest 无法读取时返回 `manifestLevel:"unknown"`（结构化警告，不阻断启动）。该检测不再只存在于 smoke test。
+## expect / retry / finally
 
-#### ui_catalog（枚举可操作控件）
+**步骤成功 = 工具执行成功 AND 后置条件匹配。** 仅 InvokePattern 未报错不算完成。
 
-```json
-{ "tool": "ui_catalog", "arguments": { "pid": 12345, "includeProcessPopups": true } }
+```jsonc
+{ "id": "openDialog", "tool": "profile_action",
+  "args": { "profile": "example-app", "pid": "${app.pid}", "control": "settingsButton", "action": "invoke" },
+  "expect": { "profileControl": "settingsDialog", "condition": "exists", "timeoutMs": 5000 },
+  "retry": { "maxAttempts": 3, "delayMs": 200, "onlyCodes": ["ELEMENT_NOT_AVAILABLE", "POPUP_NOT_READY"] } }
 ```
 
-返回当前页面所有可操作控件，每个带 `recommendedSelector`（**已经过唯一性验证**，可直接传给 `ui_action`）、`selectorVerified`（重新解析是否只匹配 1 个）、`selectorMatchCount`、`supportedActions`、`patterns` 和 `selectorConfidence`（`stable` / `conditionally-stable` / `fragile` / `unsupported`）。目标匹配已知 profile 时自动附加 `profileControl` 标签。让 AI Agent 不理解完整 UIA 树即可枚举可操作控件。
+- 条件：`exists/notExists/visible/hidden/enabled/disabled/valueEquals/valueContains/toggleStateEquals/selected/notSelected/expanded/collapsed/countEquals`。
+- 超时错误：`STEP_POSTCONDITION_TIMEOUT`。
+- `actions.json` 的 `defaultExpect` 在调用方未提供 expect 时自动生效；显式 expect 优先；`expect:false` 关闭（返回 warning）。
+- 默认可重试：`ELEMENT_NOT_AVAILABLE / UIA_ROOT_UNAVAILABLE / TARGET_WINDOW_NOT_READY / POPUP_NOT_READY / PROVIDER_BUSY`。**不可重试**（除非 `onlyCodes` 显式列出）：`ELEMENT_AMBIGUOUS / WINDOW_AMBIGUOUS / INVALID_SELECTOR / INVALID_PARAMS / PATTERN_NOT_SUPPORTED / PASSWORD_VALUE_PROTECTED / TOOL_OUTPUT_SCHEMA_MISMATCH`。非幂等动作不自动重试；`validate_steps` 对非幂等 + retry 报 `UNSAFE_RETRY`。
+- finally：主流程成功或失败都执行；失败单独记录、不覆盖主错误；`ignoreCodes` 容忍指定错误码。
+- 状态恢复：`captureBefore` 在操作前读取控件值（密码字段不捕获），`restore: "always" | "never" | "onFailure"` 在 finally 恢复并验证，恢复失败必须报告。
 
-> **`recommendedSelector` 已验证唯一**：catalog 生成 selector 后用同一棵 UIA 树（与 resolver 同 scope，已做跨 root 去重）验证匹配数。`stable` = 唯一 AutomationId，重新解析只匹配 1，不依赖 index/语言；`conditionally-stable` = AutomationId+Name 或 Name+ControlType 唯一（Name 本地化敏感）；`fragile` = 需要 index 或本地化 Name；`unsupported` = 无法生成唯一 selector。树被截断（`truncated:true`）时 `selectorVerified=false`（无法保证）。
+## 续接失败的 run
 
-#### profile_action 复合动作
+`run_steps` / `profile_run_steps` / `run_workflow` 都返回 `runId`。失败后：
 
-除基本 UIA 动作外，支持复合动作：`selectByName` / `selectByIndex`（下拉框/列表，自动处理同 PID popup，**带键盘降级与值验证**）、`getSelection`、`openMenu`（打开标题菜单并枚举真实 Button 菜单项）、`openSubmenu`（打开分组子菜单）。复合动作读取 before 状态、执行、验证 after 状态，不只报告 Pattern 未抛异常。基本动作新增：`appendText` / `clear` / `selectAll` / `getValue` / `setChecked`（幂等）/ `increment` / `decrement`（带 min/max 边界检查）。
-
-> **`openMenu` 不再只查 `MenuItem`**：VaporView 标题菜单项是真实 `QToolButton`（`Button` + `InvokePattern`），`openMenu` 枚举 `titleMenu*SectionAction` 按钮并验证 popup 真实打开（popup root 增加或菜单项出现），不使用 `itemCount >= 0` 这类永真断言。
->
-> **菜单命令 `invoke` 的非阻塞触发**：`About`/`CheckUpdates` 等命令会打开**模态 `QDialog`**（`dialog.exec()` 阻塞调用线程），`InvokePattern.Invoke()` 会阻塞直到对话框关闭。因此对 `titleMenu*` 命令控件，`profile_action` 的 `invoke` 改用**非阻塞的 focus + Enter 键**触发（投递 `WM_KEYDOWN`，不移动鼠标），由调用方随后 `ui_get`/`ui_wait` 验证对话框出现。
-
-### 标题栏菜单操作
-
-VaporView 标题栏菜单是自定义 Qt 浮动面板（`titleApplicationPanel`，`Qt::Tool` 顶层窗口），其行是真实 `QToolButton`。分组行通过**键盘 Right** 打开子菜单（非 InvokePattern，其 QAction handler 为空）；命令行通过 Enter/InvokePattern 触发。
-
-```json
-// 1. 打开标题菜单（枚举分组行）
-{ "tool": "profile_action", "arguments": {
-    "profile": "vaporview", "pid": 12345,
-    "control": "titleBarMenuButton", "action": "openMenu" } }
-
-// 2. 打开 Help 分组子菜单（focus + Right 键，枚举命令行）
-{ "tool": "profile_action", "arguments": {
-    "profile": "vaporview", "pid": 12345,
-    "control": "titleMenuHelpSection", "action": "openSubmenu" } }
-
-// 3. 执行 About（非阻塞 focus + Enter，随后验证 aboutDialog 出现）
-{ "tool": "profile_action", "arguments": {
-    "profile": "vaporview", "pid": 12345,
-    "control": "titleMenuAbout", "action": "invoke" } }
-
-// 4. 验证 About 对话框出现，再关闭
-{ "tool": "ui_get", "arguments": {
-    "pid": 12345, "selector": { "automationId": "aboutDialog$", "match": "regex" },
-    "includeProcessPopups": true } }
-{ "tool": "profile_action", "arguments": {
-    "profile": "vaporview", "pid": 12345,
-    "control": "aboutDialogOkButton", "action": "invoke" } }
+```jsonc
+{ "runId": "run_abc123", "continueFrom": "openSettings" }
 ```
 
-`openMenu` / `openSubmenu` 返回结构含 `popupOpened`、`popupRoots` 和 `items`（每个含 `automationId`/`name`/`controlType`/`enabled`/`checked`/`hasSubmenu`/`supportedActions`/`recommendedSelector`）。菜单打开成功由 popup root 增加或菜单 command 元素出现证明。
+续接前检查：run 未过期（内存保留 10 分钟，最多 20 个）→ Pack 版本未变（`RUN_PACK_VERSION_CHANGED`）→ 进程仍存在（`RUN_PROCESS_EXITED`）→ HWND 仍有效（`RUN_WINDOW_RECREATED`）→ 必要前置状态仍存在。续接从失败步骤重放，已完成步骤的结果复用（不重复执行）。
 
-### ComboBox 选择（含键盘降级）
+## 输出 Schema 与 structuredContent
 
-Qt `QComboBox` 弹出项**不作为标准 UIA `ListItem` 暴露**（弹出层是 `QAbstractItemView`，无 ListItem 子节点），因此 `selectByName`/`selectByIndex` 先尝试 `ExpandCollapse` + `ListItem` 选择，失败则走**键盘降级**：`focus` → `Alt+Down` 展开 → `Home` → `Down × index` → `Enter`，全部通过 `PostMessage` 投递（不移动鼠标）。操作后**读取 ValuePattern 当前值并验证变化**，仅"按键已发送"不算成功。
+每个工具在 `src/contracts.ts` 有统一 `ToolContract`：`description`、`inputSchema`、`outputSchema`、`pipeSafeFields`、`annotations`（readOnly / destructive / idempotent / retrySafe / needsExpect）。
 
-```json
-// 按索引选择（AI8 温度采样率）
-{ "tool": "profile_action", "arguments": {
-    "profile": "vaporview", "pid": 12345,
-    "control": "ai8TemperatureRateCombo", "action": "selectByIndex", "index": 0 } }
-```
+稳定公共输出字段：`schemaVersion / success / pid / hwnd / title / found / count / element / elements / value / matched / timedOut / code / message / details`。
 
-`selectByIndex` 返回 `beforeValue` / `afterValue` / `valueChanged`（`success === valueChanged`）。设备页 port/baud/source/rate combo 都有稳定 `device<Device><Field>Combo` AutomationId（runtime-verified，唯一），不再使用全页 ComboBox 序号。
+- 工具成功结果同时返回 `content`（JSON 文本，保持兼容）与 `structuredContent`（机器可读对象）。
+- 管道中每个步骤的结果都会用该工具的 `outputSchema` 做运行时校验，不符合返回 `TOOL_OUTPUT_SCHEMA_MISMATCH`，**无效结果不会流入后续步骤**。
 
-> **VaporView 不再需要管理员权限**：最新 `VaporView.exe` 使用 `asInvoker` / `uiAccess=false` manifest，普通权限的 MCP server 可直接读取其 UIA 树。若传入旧版 `requireAdministrator` 构建，smoke test 会返回 `VAPORVIEW_OLD_ELEVATED_BUILD` 并提示重建/安装最新版。**MCP server 不需要以管理员运行**。
+## 安全限制
 
-### VAPORVIEW_EXE 配置
+- 每条管道 ≤50 步、finally ≤20 步、每步 ≤32 exports、引用深度 ≤16、单步结果 ≤1 MiB、整条结果 ≤5 MiB、默认总超时 120s、最大重试 5 次、最多 20 个 run、TTL 10 分钟。
+- 最多加载 64 个 Pack；每个 Pack ≤1000 controls、≤200 workflows。
+- 禁止：`eval` / `Function` 构造器 / 任意脚本 / 任意 PowerShell / JSONPath 脚本表达式 / 从 Pack 读取环境变量值 / 访问 Pack 外文件 / 从 Pack 发起网络请求 / 跨 run 未授权引用 / 密码写入日志。
+- 禁止：`SetCursorPos`、真实鼠标 SendInput、固定坐标点击、OCR 坐标点击、图像模板点击。降级链全部使用窗口消息或键盘输入，`physicalCursorMoved` 恒为 false。
 
-VaporView smoke test 通过环境变量获取路径，不在源码中硬编码：
+## 私有 Pack 与公共仓库
 
-```powershell
-# 使用最新普通权限 VaporView.exe（asInvoker manifest）
-$env:VAPORVIEW_EXE = "X:\Project\GPS\VaporView\build\Release\VaporView.exe"
-$env:VAPORVIEW_SMOKE_STRICT = "1"
-npm run smoke:uia-vaporview
-npm run smoke:uia-vaporview-coverage
-```
-
-未设置 `VAPORVIEW_EXE` 时：普通模式输出 `SKIPPED`，strict 模式 FAIL。EXE 不存在 FAIL。旧管理员构建 FAIL（`VAPORVIEW_OLD_ELEVATED_BUILD`）。UIA Root 不可用 FAIL。报告写入系统临时目录，不提交 Git。
-
-### Qt 控件的 UIA 限制（真实限制，已实机确认）
-
-VaporView 等 Qt 应用的部分控件是自绘的（`QPainter` paintEvent），UIA 无法访问其内部视觉元素。以下限制不谎称已适配：
-
-- **标题栏菜单项已可访问**：最新 VaporView 将菜单行改为真实 `QToolButton`（`ControlType.Button` + `InvokePattern`），不再是自绘 `titleApplicationMenuItem` 行。`openMenu` 枚举真实 Button 菜单项（`titleMenu*SectionAction`），`openSubmenu` 打开分组子菜单，`invoke` 触发命令。关闭菜单用 `send_key` Escape（投递消息，不移动鼠标）。
-- **QComboBox 弹出项不暴露为 ListItem**：Qt combo 弹出层是 `QAbstractItemView`，弹出项不作为标准 UIA `ListItem` 出现。`selectByName`/`selectByIndex` 因此走**键盘降级**（focus + Alt+Down + Home + Down×index + Enter）并读取 ValuePattern 值验证，详见上文 [ComboBox 选择](#combobox-选择含键盘降级)。Qt combo 仍暴露 `ExpandCollapsePattern`（可展开/收起用于探测）和 `ValuePattern`（读当前值）。
-- **设备页 ComboBox 有稳定 AutomationId**：port/baud/source/rate combo 运行时暴露 `device<Device><Field>Combo`（如 `deviceAi8TemperatureRateCombo`），**唯一**且 runtime-verified，不再使用 Qt 默认 `QComboBox`。仅有波特率等少数 combo 用默认 `QComboBox`（无 objectName），需用 ancestor 限定。
-- 自绘的非交互 `Custom`/`Image`/`Text` 控件无标准 UIA Pattern，**不属于"必须可点击"的范围**；启用且可聚焦的可通过键盘降级（Focus + Enter/Space 投递消息），其余标记 `unsupported`。不谎称这些控件已逐个实机操作成功。
-- **Pattern 暴露 ≠ 实机操作验证**：`ui_catalog` 的 `patternExposed` 只表示控件暴露了某 Pattern；是否真正操作成功由 strict smoke 的动作抽样验证（`action-smoke-verified`）。覆盖率报告区分 `pattern-exposed` / `action-smoke-verified` / `profile-runtime-verified`，不混成一个"100% 已操作"。
-
-### 无鼠标操作机制
-
-所有 UIA 动作优先级：**1. UIA Pattern** > **2. 键盘访问**（`SetFocus` + 投递 `WM_KEYDOWN`/`WM_KEYUP`，不调用 `SetCursorPos` 或真实鼠标 `SendInput`）> **3. 原生命令**（`BM_CLICK`/`WM_COMMAND`/`WM_SETTEXT`/`EM_REPLACESEL`，Qt 控件无 HWND 基本不适用）> **4. 动态窗口消息点击**（仅当 `allowMessageClickFallback:true`，坐标来自控件当前 UIA BoundingRectangle，转换为所属 Root HWND 客户区坐标，投递 `WM_LBUTTONDOWN`/`WM_LBUTTONUP`）。
-
-**物理鼠标永远不移动**：动态消息点击投递的是窗口消息，不是物理鼠标点击。smoke test 前后用 `GetCursorPos` 读取光标坐标，断言 `before == after`（已验证 `1110,950 == 1110,950`）。
-
-### 权限级别说明
-
-UIA 跨进程访问受 **UIPI（User Interface Privilege Isolation）** 限制：
-
-- 最新 VaporView 使用 `asInvoker`，与普通权限 MCP 一致，可正常读取 UIA 树。
-- 若目标应用以管理员身份运行而 MCP server 是普通用户，UIA 读取会失败（返回 `UIA_ROOT_UNAVAILABLE`）。
-- **不要为了读取 UIA 而用管理员权限运行 MCP server**；应让目标应用使用 `asInvoker` 构建。VaporView 旧版 `requireAdministrator` 构建会被检测为 `VAPORVIEW_OLD_ELEVATED_BUILD`。
-
-### popup / tooltip 独立 HWND 说明
-
-Qt 的下拉菜单、tooltip、弹出对话框通常是**独立顶层 HWND**（`Qt::Popup` / `Qt::Tool`），不在主窗口的子窗口树里：
-
-- `includeProcessPopups: true`（默认）会枚举同 PID 的所有顶层窗口，每个作为独立 UIA Root 搜索。
-- VaporView 主窗口 PID 还会暴露 2 个 `_q_titlebar` 辅助窗口和 IME/observer 窗口；窗口解析按 owner/title/工具窗口样式打分，自动选中真正的 `VaporView` 主窗口（不要求调用方传 hwnd）。
-- QComboBox 弹出层是临时 `Qt::Popup` 顶层窗口，生命周期短。
-
-### 调试控件树的方法
-
-1. 先用 `ui_inspect_tree`（`automationIdOnly: true` 可只看有 AutomationId 的控件）了解结构。
-2. 用 Windows 自带的 **Accessibility Insights for Windows** 或 **Inspect.exe** 交叉验证。
-3. **不要高频调用 `ui_inspect_tree`**——每次都会遍历控件树，对大型 Qt 应用可能耗时几百毫秒到几秒。先 inspect 一次，记录稳定的 AutomationId，后续用 `ui_get` / `ui_query` 精确查询。
-4. 不要把 `RuntimeId` 当作稳定 selector——它可能随 UI 重建变化。
-
-### UIA smoke test 命令
-
-```powershell
-# 通用 UIA smoke test（用系统自带 WordPad/记事本，验证 inspect/query/setValue/invoke/wait 全流程）
-npm run smoke:uia-notepad
-
-# VaporView UIA strict smoke test（需设置 VAPORVIEW_EXE，指向最新 asInvoker 构建）
-$env:VAPORVIEW_EXE = "<path-to-asInvoker-VaporView.exe>"
-$env:VAPORVIEW_SMOKE_STRICT = "1"
-npm run smoke:uia-vaporview
-# 覆盖率报告（按控件类别统计可操作数，输出到系统临时目录）
-npm run smoke:uia-vaporview-coverage
-```
-
-`smoke:uia-notepad` 验证：启动 -> inspect_tree -> 找到 Document 控件 -> ValuePattern 写入文字 -> 读回值 -> InvokePattern 点击 Close -> ui_wait notExists -> 物理鼠标未移动 -> 前台窗口未被永久改变。
-
-`smoke:uia-vaporview`（strict）验证 19 项：`profile_launch`（含 manifest 自检）-> `ui_catalog` + verified selector -> 主窗口解析 -> **三路一致性**（profile_resolve == ui_query == ui_catalog，覆盖 titleBarMenuButton/logSidePanelToggle/logSearchButton/sidebarHome/titleMenuAbout/aboutDialogOkButton/ai8RateCombo）-> 日志侧栏按钮 toggle + **真实状态验证**（presence 变化）+ 恢复 -> **搜索弹窗生命周期**（invoke logSearchButton -> logSearchMenu 出现 -> 断言嵌套 QLineEdit `logSearchEdit` 未暴露 -> Escape 关闭）-> **日志过滤菜单枚举**（invoke logFilterButton -> 枚举 关注/全部/调试/自动跟随 4 行 -> 断言 auto-follow 无 TogglePattern（勾选态仅绘制）-> Escape 关闭）-> **标题菜单全链路**（openMenu -> openSubmenu(Help) -> invoke(About) -> aboutDialog 出现 -> invoke(OK) -> 对话框消失 -> 菜单关闭）-> **ComboBox selectByIndex + 值变化验证 + 恢复 + popup 关闭** -> 侧栏切换 + toggleState 验证 + 恢复 -> **物理鼠标未移动** -> 菜单/对话框 popup 全部关闭。无 `itemCount >= 0` 永真断言；只打印 warning 后继续视为 FAIL；对 UIA 未暴露的控件（如 `logSearchEdit`）断言其缺失而非伪造 setValue。全部 PASS 才算通过。
-
-## 示例调用
-
-启动 Notepad：
-
-```json
-{
-  "exePath": "C:\\Windows\\System32\\notepad.exe",
-  "waitForWindow": true,
-  "timeoutMs": 10000
-}
-```
-
-截取窗口：
-
-```json
-{
-  "hwnd": "123456",
-  "focus": true
-}
-```
-
-截图时保留已打开的菜单或浮层：
-
-```json
-{
-  "hwnd": "123456",
-  "focus": false
-}
-```
-
-截取被遮挡/最小化的窗口（PrintWindow）：
-
-```json
-{
-  "hwnd": "123456",
-  "captureMethod": "print"
-}
-```
-
-截取窗口内左上角区域：
-
-```json
-{
-  "hwnd": "123456",
-  "region": { "x": 0, "y": 0, "width": 300, "height": 200 }
-}
-```
-
-截取屏幕区域：
-
-```json
-{
-  "region": { "x": 0, "y": 0, "width": 800, "height": 600 }
-}
-```
-
-点击窗口内按钮：
-
-```json
-{
-  "titleContains": "VaporView",
-  "x": 115,
-  "y": 50,
-  "button": "left",
-  "delayMs": 300
-}
-```
-
-`x` / `y` 是目标窗口左上角起算的物理像素坐标。`click_window` 会根据命中区域投递客户区或非客户区鼠标消息，不移动主机物理鼠标。常见流程是先 `capture_window` 看图，再估算要点击的窗口内坐标，调用 `click_window`，最后再次 `capture_window`。
-
-点击原生菜单项（支持中文）：
-
-```json
-{
-  "titleContains": "Notepad3",
-  "path": ["帮助(&H)", "关于(&A)..."]
-}
-```
-
-`path` 匹配会忽略 `&` 助记符、大小写和菜单文本中的快捷键后缀，例如 `帮助(&H)` 可以用 `帮助` 匹配。
-
-悬停窗口内菜单项：
-
-```json
-{
-  "titleContains": "VaporView",
-  "x": 150,
-  "y": 260,
-  "delayMs": 300
-}
-```
+- `local-app-packs/`、`private-app-packs/`、`runtime-app-pack-cache/`、`outputs/` 已被 `.gitignore` 忽略。
+- **私有 Pack 不得提交到公共仓库**：本机绝对路径、控件清单、工作流细节属于私有时，不要放入公共 README 或测试。
+- 本仓库的实机验证使用本地 Qt 应用 App Pack（通过环境变量提供可执行文件路径），其配置不包含在公共仓库中。公共测试脚本只读取 `SCREENSHOT_MCP_TEST_PACK` / `SCREENSHOT_MCP_TEST_EXE` / `SCREENSHOT_MCP_APP_PACK_DIRS` 环境变量，不写死任何私有应用名。
 
 ## 测试
 
 ```powershell
-npm test
+npm test                          # 单元测试（App Pack / pipeline / contracts / workflows / runs / piping / schemas / UIA）
+npm run smoke:app-pack            # App Pack + 管道 e2e（公共示例 Pack）
+npm run smoke:run-steps           # run_steps 顺序/管道/停链语义
+npm run smoke:continue-run        # runId / continue_run e2e
+npm run smoke:first-use-pipeline  # 首次使用基准（fresh-session，默认 20 次迭代）
+npm run smoke:uia-notepad         # 通用 UIA smoke（系统编辑器）
+npm run smoke:private-app-pack    # 私有 Pack 驱动（读 SCREENSHOT_MCP_TEST_PACK 等环境变量）
+# 以及既有 smoke：notepad / type-text / menu-click / no-cursor-click / print-capture /
+# p1-fixes / perf / no-activate / clipboard / window-state / wait-for-window
 ```
 
-Windows 桌面 smoke test 会打开并关闭 Notepad：
+热重载：默认启用（`SCREENSHOTTOOL_HOT_RELOAD=0` 关闭）。修改 `src/` 或 `scripts/win-capture.ps1` 后无需重启。
 
-```powershell
-npm run smoke:notepad
-```
+## 限制（真实，已实机确认）
 
-验证 noActivate 模式不抢焦点：
-
-```powershell
-npm run smoke:no-activate
-```
-
-验证无光标点击不会移动主机物理鼠标：
-
-```powershell
-npm run smoke:no-cursor-click
-```
-
-UI Automation smoke test（用系统自带 WordPad/记事本验证 UIA 全流程）：
-
-```powershell
-npm run smoke:uia-notepad
-```
-
-VaporView UIA smoke test（需设置 `VAPORVIEW_EXE`，未设置则输出 SKIPPED）：
-
-```powershell
-$env:VAPORVIEW_EXE = "T:\VaporView\VaporView.exe"
-npm run smoke:uia-vaporview
-```
-
-用 MCP Inspector 手动验收：
-
-```powershell
-npm run build
-npm run inspect
-```
-
-## 限制
-
-- ⚠️ **不要尝试用 MCP 实现鼠标拖拽、拖动滑块、缩放、手势操作**——`click_window` 只发送按下+抬起消息，不支持连续移动。如果需要拖拽或任意复杂的鼠标操作，**直接请求人类用户手动完成**，你的描述清晰告诉用户需要做什么就好。
-- ⚠️ **不要依赖 `move_mouse_window` 触发 tooltip、hover 效果、右键菜单等 UI 状态变化**——它只投递一个假的消息，不移动真实光标。Qt/Electron 等现代框架读取系统鼠标位置，不会响应假消息。需要此类交互时，**直接请求人类用户操作**。
-- ⚠️ **截图很慢（1-5s），能不用就不用**——优先用 `list_windows` / `get_window_state` 或读应用日志替代。
-- 只支持 Windows 桌面会话；需要 Node 20+。
-- 不做 OCR、图像比对。
-- `type_text` 的 `noActivate` 模式通过 `PostMessage(WM_CHAR)` 投递，少数自绘编辑控件可能不响应 `WM_CHAR`。
-- `exePath` 要求绝对 `.exe` 路径。
-- `args` 必须是字符串数组，不接受拼接后的命令行。
-- 截图使用物理像素坐标；helper 会尝试启用 DPI aware，减少高 DPI 缩放偏差。
-- 服务器进程持有一个长驻 PowerShell helper 进程，命中第一次启动后，后续每次工具调用约几十毫秒；helper 异常退出时会按需重启。
-- **请求模型**：长驻 worker 是串行的——`list_windows`、点击、输入、剪贴板、窗口状态查询、`launch_app` 内部的 `wait-and-suppress` 等共享一个 stdin，worker 处理完前一个请求才会响应下一个。`capture_window`、`capture_screen_region`、`wait_for_window` 走独立 PS 进程，不阻塞其他工具。长时间操作（如超长 `type_text`，或 `launch_app noActivate` 的持续压制阶段）仍会占用共享 worker；相关 schema 和超时保护会限制单次请求的边界。
-- **后台模式的极限**：`noActivate` 发现窗口后会持续压制至少 8 秒，且不短于本次 `timeoutMs`（默认约 10 秒）。如果目标应用在这段时间后才主动调用 `SetForegroundWindow`（极少见，多见于延迟加载插件或开机自启注册），窗口仍可能抢到前台。这是应用行为，工具侧已做到了合理覆盖。
-
-### 截图模式与遮挡 / tooltip 的关键限制（Qt、Electron 类应用特别注意）
-
-下面几条是 Win32 API 层面的硬限制，反复换参数也不会改变结果。**遇到这些场景时，应该在程序里换验证方式，而不是反复截图。**
-
-- **`capture_window` 的 `screen` 模式按屏幕可见像素拷贝（`Graphics.CopyFromScreen`）**：它根本不看 hwnd，只看那块屏幕矩形当时显示了什么。如果目标窗口被遮挡、不在前台、或多显示器坐标偏移，就会抓到遮挡物。这是物理限制，工具层无法绕过。
-- **`capture_window` 的 `print` 模式（`PrintWindow`）只绘制目标 hwnd 及其子窗口的客户区**：抓不到**独立顶层窗口**——典型例子是 Qt 的 `Qt::ToolTip`、`Qt::Popup` 弹窗、Electron 的子窗口、独立的下拉菜单。这些是带 `WS_EX_TOOLWINDOW` 的独立 hwnd，不在主窗口的子窗口树里，`EnumChildWindows` 也找不到。
-- **`move_mouse_window` 用 `PostMessage(WM_MOUSEMOVE)` 投递窗口消息，但 Qt/Electron 的 tooltip 由 `QCursor::pos()` + hover 定时器驱动**：窗口消息不更新系统鼠标位置，所以 Qt 看到鼠标"还在别处"，不会启动 hover 计时器，**不会出现 tooltip**。这个工具对 Qt/Electron 的 hover 触发**基本无效**。
-- **`capture_screen_region` 同 `screen` 模式**：按屏幕可见像素截取，受多显示器坐标、DPI、前台遮挡影响。如果目标区域被别的窗口盖住，截到的就是遮挡物。
-
-**结论**：本工具适合抓**稳定的窗口内容**。对于「hover 触发 + 独立顶层 tooltip + 多显示器/遮挡」这类组合场景（典型如 Qt 应用），更可靠的验证方式是：
-1. 在目标程序里临时加测试入口，强制显示 tooltip/弹窗后再截图；
-2. 用真实鼠标 + 可交互录屏；
-3. 让目标程序把要验证的 UI 状态写到日志/文件，工具读文件而非看图。
+- `click_window` / `move_mouse_window` 只投递窗口消息：不支持拖拽、手势、真实 hover。Qt/Electron 应用读取系统光标位置，假消息不会触发 tooltip/右键菜单——需要时请请求人类操作。
+- PrintWindow 无法捕获独立顶层弹窗（Qt ToolTip、菜单面板、Electron 子窗口）；`captureMethod:"screen"` 捕获的是屏幕可见内容，可能被遮挡。
+- UIA 依赖目标应用的无障碍实现：无 ValuePattern 的编辑控件不能 setValue；自定义绘制的菜单/ComboBox 只能走声明在 Pack 中的降级路径；某些控件如实标记 `unsupported`（如 popup 内未暴露的 QLineEdit）。
+- 前台被游戏/全屏程序占用时，光标与焦点相关断言可能假失败。

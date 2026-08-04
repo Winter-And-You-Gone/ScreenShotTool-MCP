@@ -6,6 +6,7 @@ import {
   normalizeControlType,
   validateRegex
 } from "./uia/selectors.js";
+import { packExpectSchema } from "./app-packs/schemas.js";
 
 const positiveInt = z.number().int().positive();
 const nonNegativeInt = z.number().int().nonnegative();
@@ -400,7 +401,7 @@ export const profileActionSchema = z.object({
     "focus", "legacyDefaultAction", "click",
     "appendText", "clear", "selectAll", "getValue", "setChecked",
     "increment", "decrement",
-    "selectByName", "selectByIndex", "getSelection", "openMenu", "openSubmenu"
+    "selectByName", "selectByIndex", "getSelection", "openMenu", "openSubmenu", "ensureSelected"
   ]),
   ...windowSelectorFields,
   value: z.string().max(uiaValueMaxLen).optional(),
@@ -467,26 +468,177 @@ export type UiCatalogInput = z.infer<typeof uiCatalogSchema>;
 
 export type UiElementSelectorInput = import("./uia/types.js").UiElementSelector;
 
-// Tools that may appear as a step inside run_steps. run_steps itself is
-// intentionally excluded to prevent unbounded nesting.
+// Tools that may appear as a step inside a pipeline (run_steps /
+// profile_run_steps / run_workflow). Pipeline-orchestration tools and
+// validate_steps are intentionally excluded (no nesting).
 export const chainableToolNames = [
   "launch_app", "list_windows", "capture_window", "capture_screen_region",
   "click_window", "click_menu_item", "move_mouse_window", "close_app",
   "type_text", "send_key", "read_clipboard", "write_clipboard",
   "get_window_state", "wait_for_window",
   "ui_inspect_tree", "ui_query", "ui_get", "ui_action", "ui_wait", "ui_catalog",
-  "profile_list", "profile_resolve", "profile_action", "profile_launch"
+  "profile_list", "profile_resolve", "profile_action", "profile_launch",
+  "app_pack_list", "app_pack_describe", "app_pack_validate", "app_pack_reload", "app_pack_probe",
+  "workflow_catalog"
 ] as const;
 
+const stepIdSchema = z.string().regex(/^[A-Za-z][A-Za-z0-9_-]{0,63}$/, "step id must match ^[A-Za-z][A-Za-z0-9_-]{0,63}$");
+const exportsSchema = z.record(z.string().min(1).max(64), z.string().min(1).max(256)).refine((v) => Object.keys(v).length <= 32, "at most 32 exports per step");
+const retrySchema = z.object({
+  maxAttempts: z.number().int().min(1).max(5).optional().default(3),
+  delayMs: z.number().int().min(0).max(60000).optional().default(200),
+  backoffMultiplier: z.number().min(1).max(10).optional().default(1.5),
+  onlyCodes: z.array(z.string().min(1).max(64)).max(16).optional()
+}).strict();
+const captureBeforeSchema = z.object({
+  saveAs: z.string().regex(/^[A-Za-z][A-Za-z0-9_-]{0,63}$/),
+  read: z.object({
+    tool: z.string().min(1).max(64).optional().default("ui_get"),
+    args: z.record(z.string(), z.unknown()).optional().default({})
+  }).strict().optional()
+}).strict();
+
 const runStepsStepSchema = z.object({
+  id: stepIdSchema.optional(),
   tool: z.enum(chainableToolNames),
-  args: z.record(z.string(), z.unknown()).optional().default({})
+  args: z.record(z.string(), z.unknown()).optional().default({}),
+  exports: exportsSchema.optional(),
+  expect: z.union([packExpectSchema, z.literal(false)]).optional(),
+  retry: retrySchema.optional(),
+  captureBefore: captureBeforeSchema.optional(),
+  ignoreCodes: z.array(z.string().min(1).max(64)).max(16).optional()
 }).strict();
 
 export const runStepsSchema = z.object({
-  steps: z.array(runStepsStepSchema).min(1).max(20)
+  steps: z.array(runStepsStepSchema).min(1).max(50),
+  finally: z.array(runStepsStepSchema).max(20).optional(),
+  captureBefore: z.array(captureBeforeSchema).max(32).optional(),
+  restore: z.enum(["always", "never", "onFailure"]).optional().default("never"),
+  maxTotalMs: z.number().int().min(1000).max(600_000).optional().default(120_000)
 }).strict();
 export type RunStepsInput = z.infer<typeof runStepsSchema>;
+export type RunStepsStepInput = z.infer<typeof runStepsStepSchema>;
+
+// ── App Pack tools ──
+
+export const appPackListSchema = z.object({}).strict();
+export const appPackDescribeSchema = z.object({
+  pack: z.string().min(1).max(128)
+}).strict();
+export const appPackValidateSchema = z.object({
+  pack: z.string().min(1).max(128).optional(),
+  packPath: z.string().min(1).max(1024).optional()
+}).strict().refine(
+  (v) => v.pack !== undefined || v.packPath !== undefined,
+  "Provide 'pack' (a loaded pack id) or 'packPath' (a local pack directory)."
+);
+export const appPackReloadSchema = z.object({}).strict();
+export const appPackProbeSchema = z.object({
+  pid: z.number().int().positive(),
+  includeProcessPopups: z.boolean().optional().default(true),
+  writeDraftToTemp: z.boolean().optional().default(false)
+}).strict();
+
+// ── Pipeline / workflow tools ──
+
+export const validateStepsSchema = z.object({
+  steps: z.array(runStepsStepSchema).min(1).max(50),
+  pack: z.string().min(1).max(128).optional(),
+  finally: z.array(runStepsStepSchema).max(20).optional()
+}).strict();
+
+const profileRunStepSchema = z.object({
+  id: stepIdSchema.optional(),
+  // Logical control + action form (the server injects profile/pid).
+  control: z.string().min(1).max(256),
+  action: z.string().min(1).max(64),
+  value: z.string().max(4000).optional(),
+  index: z.number().int().min(0).optional(),
+  rangeValue: z.number().optional(),
+  allowCoordinateFallback: z.boolean().optional(),
+  allowMessageClickFallback: z.boolean().optional(),
+  forceCoordinateClick: z.boolean().optional(),
+  exports: exportsSchema.optional(),
+  expect: z.union([packExpectSchema, z.literal(false)]).optional(),
+  retry: retrySchema.optional()
+}).strict();
+
+export const profileRunStepsSchema = z.object({
+  profile: z.string().min(1).max(128),
+  launch: z.object({
+    exePath: z.string().min(1).max(1024).optional(),
+    args: z.array(z.string().max(1024)).max(64).optional(),
+    reuseIfRunning: z.boolean().optional().default(true),
+    waitForWindow: z.boolean().optional(),
+    noActivate: z.boolean().optional(),
+    timeoutMs: z.number().int().min(100).max(120000).optional()
+  }).strict().optional(),
+  steps: z.array(profileRunStepSchema).min(1).max(50),
+  finally: z.array(profileRunStepSchema).max(20).optional(),
+  restore: z.enum(["always", "never", "onFailure"]).optional().default("never"),
+  captureBefore: z.array(captureBeforeSchema).max(32).optional(),
+  maxTotalMs: z.number().int().min(1000).max(600_000).optional().default(120_000)
+}).strict();
+
+export const workflowCatalogSchema = z.object({
+  pack: z.string().min(1).max(128)
+}).strict();
+
+export const runWorkflowSchema = z.object({
+  pack: z.string().min(1).max(128),
+  workflow: z.string().min(1).max(128),
+  inputs: z.record(z.string(), z.unknown()).optional().default({})
+}).strict();
+
+export const continueRunSchema = z.object({
+  runId: z.string().regex(/^run_[A-Za-z0-9_-]{1,64}$/, "runId must match ^run_[A-Za-z0-9_-]{1,64}$"),
+  continueFrom: z.union([stepIdSchema, z.number().int().min(0)])
+}).strict();
+
+export type AppPackListInput = z.infer<typeof appPackListSchema>;
+export type AppPackDescribeInput = z.infer<typeof appPackDescribeSchema>;
+export type AppPackValidateInput = z.infer<typeof appPackValidateSchema>;
+export type AppPackProbeInput = z.infer<typeof appPackProbeSchema>;
+export type ValidateStepsInput = z.infer<typeof validateStepsSchema>;
+export type ProfileRunStepsInput = z.infer<typeof profileRunStepsSchema>;
+export type WorkflowCatalogInput = z.infer<typeof workflowCatalogSchema>;
+export type RunWorkflowInput = z.infer<typeof runWorkflowSchema>;
+export type ContinueRunInput = z.infer<typeof continueRunSchema>;
+
+// Tool name -> Zod input schema. Used by validate_steps for static argument
+// checking and by pipeline dispatch.
+export const toolZodSchemas: Record<string, z.ZodTypeAny> = {
+  launch_app: launchAppSchema,
+  list_windows: listWindowsSchema,
+  capture_window: captureWindowSchema,
+  capture_screen_region: captureScreenRegionSchema,
+  click_window: clickWindowSchema,
+  click_menu_item: clickMenuItemSchema,
+  move_mouse_window: moveMouseWindowSchema,
+  close_app: closeAppSchema,
+  type_text: typeTextSchema,
+  send_key: sendKeySchema,
+  read_clipboard: readClipboardSchema,
+  write_clipboard: writeClipboardSchema,
+  get_window_state: getWindowStateSchema,
+  wait_for_window: waitForWindowSchema,
+  ui_inspect_tree: uiInspectTreeSchema,
+  ui_query: uiQuerySchema,
+  ui_get: uiGetSchema,
+  ui_action: uiActionSchema,
+  ui_wait: uiWaitSchema,
+  ui_catalog: uiCatalogSchema,
+  profile_list: profileListSchema,
+  profile_resolve: profileResolveSchema,
+  profile_action: profileActionSchema,
+  profile_launch: profileLaunchSchema,
+  app_pack_list: appPackListSchema,
+  app_pack_describe: appPackDescribeSchema,
+  app_pack_validate: appPackValidateSchema,
+  app_pack_reload: appPackReloadSchema,
+  app_pack_probe: appPackProbeSchema,
+  workflow_catalog: workflowCatalogSchema
+};
 
 const hwndSchemaProperty = {
   anyOf: [
@@ -863,7 +1015,7 @@ export const toolInputSchemas = {
     properties: {
       profile: { type: "string", minLength: 1 },
       control: { type: "string", minLength: 1 },
-      action: { type: "string", enum: ["invoke", "toggle", "select", "addToSelection", "removeFromSelection", "expand", "collapse", "setValue", "setRangeValue", "scrollIntoView", "focus", "legacyDefaultAction", "click", "appendText", "clear", "selectAll", "getValue", "setChecked", "increment", "decrement", "selectByName", "selectByIndex", "getSelection", "openMenu", "openSubmenu"], description: "Primitive UIA actions plus composite actions: selectByName/selectByIndex/getSelection (combobox/list), openMenu (title menu), openSubmenu (title-menu section). Composite actions handle same-PID popups automatically and verify before/after state. Menu commands that open a modal dialog use a non-blocking focus+Enter trigger." },
+      action: { type: "string", enum: ["invoke", "toggle", "select", "addToSelection", "removeFromSelection", "expand", "collapse", "setValue", "setRangeValue", "scrollIntoView", "focus", "legacyDefaultAction", "click", "appendText", "clear", "selectAll", "getValue", "setChecked", "increment", "decrement", "selectByName", "selectByIndex", "getSelection", "openMenu", "openSubmenu", "ensureSelected"], description: "Primitive UIA actions plus composite actions: selectByName/selectByIndex/getSelection (combobox/list), openMenu (title menu), openSubmenu (title-menu section), ensureSelected (idempotent checkable-nav selection). Composite actions handle same-PID popups automatically and verify before/after state. Menu commands that open a modal dialog use a non-blocking focus+Enter trigger." },
       value: { type: "string", maxLength: 4000, description: "Text for setValue/appendText; \"true\"/\"false\" for setChecked; item name for selectByName." },
       index: { type: "integer", minimum: 0, description: "0-based index for selectByIndex." },
       rangeValue: { type: "number" },
@@ -886,7 +1038,7 @@ export const toolInputSchemas = {
   profile_launch: {
     type: "object",
     properties: {
-      profile: { type: "string", minLength: 1, description: "Profile id, e.g. \"vaporview\"." },
+      profile: { type: "string", minLength: 1, description: "App Pack id, e.g. \"notepad\" (from app_pack_list)." },
       exePath: { type: "string", description: "Optional explicit path to the executable. Overrides all other resolution." },
       args: { type: "array", items: { type: "string" }, description: "Process arguments." },
       waitForWindow: { type: "boolean", default: true },
@@ -921,27 +1073,206 @@ export const toolInputSchemas = {
       steps: {
         type: "array",
         minItems: 1,
-        maxItems: 20,
+        maxItems: 50,
         items: {
           type: "object",
           properties: {
+            id: { type: "string", pattern: "^[A-Za-z][A-Za-z0-9_-]{0,63}$", description: "Optional unique step id. Named references use ${id.path}." },
             tool: {
               type: "string",
               enum: [...chainableToolNames],
-              description: "Name of a tool to execute as a step. run_steps itself cannot be used as a step (no nesting)."
+              description: "Name of a tool to execute as a step. Pipeline tools (run_steps, profile_run_steps, run_workflow, continue_run) cannot be steps."
             },
             args: {
               type: "object",
-              description: "Arguments for the tool, exactly as you would pass them to a direct tools/call. Validated against that tool's own input schema at execution time. Omit for tools that take no arguments (e.g. read_clipboard, profile_list). Values may contain ${N.path} placeholders that are resolved against earlier steps' results before dispatch (e.g. \"${0.pid}\", \"${0.window.hwnd}\", \"${0.0.hwnd}\" for an array index); a whole-value placeholder preserves the referenced type, an embedded one is stringified."
+              description: "Arguments for the tool, exactly as you would pass them to a direct tools/call. Validated against that tool's own input schema at execution time. Values may contain ${id.path} or ${N.path} placeholders resolved against earlier steps' results (e.g. \"${app.pid}\", \"${0.window.hwnd}\"); a whole-value placeholder preserves the referenced type, an embedded one is stringified."
+            },
+            exports: {
+              type: "object",
+              additionalProperties: { type: "string" },
+              maxProperties: 32,
+              description: "Export result fields for later steps / the run result: {name: \"path.in.result\"}. Sensitive field names (password/token/credential/secret/authorization/cookie) are blocked."
+            },
+            expect: {
+              type: "object",
+              properties: {
+                profileControl: { type: "string", description: "Logical control name (from the App Pack) to wait on." },
+                selector: { type: "object", description: "Or a raw UIA selector to wait on." },
+                condition: { type: "string", enum: ["exists", "notExists", "visible", "hidden", "enabled", "disabled", "valueEquals", "valueContains", "toggleStateEquals", "selected", "notSelected", "expanded", "collapsed", "countEquals"] },
+                timeoutMs: { type: "integer", minimum: 100, maximum: 300000, default: 5000 },
+                pollIntervalMs: { type: "integer", minimum: 50, maximum: 10000, default: 150 },
+                expectedValue: { type: "string" },
+                toggleState: { type: "string", enum: ["On", "Off", "Indeterminate"] },
+                expectedCount: { type: "integer", minimum: 0 }
+              },
+              required: ["condition"],
+              description: "Postcondition verified after the tool succeeds. Step success = tool OK AND condition matched. Set to false to disable the pack's defaultExpect. Timeout fails the step with STEP_POSTCONDITION_TIMEOUT."
+            },
+            retry: {
+              type: "object",
+              properties: {
+                maxAttempts: { type: "integer", minimum: 1, maximum: 5, default: 3 },
+                delayMs: { type: "integer", minimum: 0, maximum: 60000, default: 200 },
+                backoffMultiplier: { type: "number", minimum: 1, maximum: 10, default: 1.5 },
+                onlyCodes: { type: "array", items: { type: "string" }, description: "Restrict retries to these error codes. Default retryable: ELEMENT_NOT_AVAILABLE, UIA_ROOT_UNAVAILABLE, TARGET_WINDOW_NOT_READY, POPUP_NOT_READY, PROVIDER_BUSY. Never retried by default: ELEMENT_AMBIGUOUS, WINDOW_AMBIGUOUS, INVALID_SELECTOR, INVALID_PARAMS, PATTERN_NOT_SUPPORTED, PASSWORD_VALUE_PROTECTED, TOOL_OUTPUT_SCHEMA_MISMATCH." }
+              },
+              description: "Retry policy. Non-idempotent actions must not rely on automatic retry (validate_steps flags UNSAFE_RETRY)."
+            },
+            captureBefore: {
+              type: "object",
+              properties: {
+                saveAs: { type: "string", pattern: "^[A-Za-z][A-Za-z0-9_-]{0,63}$" },
+                read: { type: "object", properties: { tool: { type: "string" }, args: { type: "object" } } }
+              },
+              description: "Capture a control's value before this step runs (for state restore). Password fields are never captured."
             }
           },
           required: ["tool"],
           additionalProperties: false
         },
-        description: "Ordered list of tool invocations. Executed sequentially; the chain stops on the first step that errors and all later steps are skipped. A step may reference earlier steps' results via ${N.path} placeholders in its args - a step may only reference steps with a smaller index than its own."
-      }
+        description: "Ordered list of tool invocations. Executed sequentially; the chain stops on the first step that errors and later steps are skipped. A step may reference earlier steps' results via ${id.path} / ${N.path} placeholders - forward references are rejected before any step runs."
+      },
+      finally: {
+        type: "array",
+        maxItems: 20,
+        items: { type: "object" },
+        description: "Steps that run after the main flow succeeds OR fails (cleanup). Failures are recorded separately and do not override the main error. ignoreCodes in args skips listed error codes."
+      },
+      captureBefore: {
+        type: "array",
+        maxItems: 32,
+        items: { type: "object" },
+        description: "Capture control values before the main steps (key -> ui_get args), restored in finally when restore is enabled."
+      },
+      restore: { type: "string", enum: ["always", "never", "onFailure"], default: "never", description: "Restore captured values in finally: always / never / onFailure." },
+      maxTotalMs: { type: "integer", minimum: 1000, maximum: 600000, default: 120000, description: "Overall pipeline time budget." }
     },
     required: ["steps"],
+    additionalProperties: false
+  },
+  // ── App Pack tools ──
+  app_pack_list: {
+    type: "object",
+    properties: {},
+    additionalProperties: false
+  },
+  app_pack_describe: {
+    type: "object",
+    properties: {
+      pack: { type: "string", minLength: 1, description: "Pack id from app_pack_list." }
+    },
+    required: ["pack"],
+    additionalProperties: false
+  },
+  app_pack_validate: {
+    type: "object",
+    properties: {
+      pack: { type: "string", minLength: 1, description: "A loaded pack id to validate." },
+      packPath: { type: "string", description: "A local pack directory to validate without loading (admin/local use)." }
+    },
+    additionalProperties: false,
+    anyOf: [{ required: ["pack"] }, { required: ["packPath"] }]
+  },
+  app_pack_reload: {
+    type: "object",
+    properties: {},
+    additionalProperties: false
+  },
+  app_pack_probe: {
+    type: "object",
+    properties: {
+      pid: { type: "integer", minimum: 1, description: "PID of the running app to probe." },
+      includeProcessPopups: { type: "boolean", default: true },
+      writeDraftToTemp: { type: "boolean", default: false, description: "Also write the draft profile.json/controls.json to a temp directory." }
+    },
+    required: ["pid"],
+    additionalProperties: false
+  },
+  validate_steps: {
+    type: "object",
+    properties: {
+      steps: {
+        type: "array",
+        minItems: 1,
+        maxItems: 50,
+        items: { type: "object", description: "Same step shape as run_steps." }
+      },
+      pack: { type: "string", description: "Optional pack id: enables defaultExpect-aware checks." },
+      finally: { type: "array", maxItems: 20, items: { type: "object" } }
+    },
+    required: ["steps"],
+    additionalProperties: false
+  },
+  profile_run_steps: {
+    type: "object",
+    properties: {
+      profile: { type: "string", minLength: 1, description: "App Pack id (from app_pack_list)." },
+      launch: {
+        type: "object",
+        properties: {
+          exePath: { type: "string" },
+          args: { type: "array", items: { type: "string" } },
+          reuseIfRunning: { type: "boolean", default: true },
+          waitForWindow: { type: "boolean" },
+          noActivate: { type: "boolean" },
+          timeoutMs: { type: "integer", minimum: 100, maximum: 120000 }
+        },
+        description: "Launch options. Omit to attach to a running instance."
+      },
+      steps: {
+        type: "array",
+        minItems: 1,
+        maxItems: 50,
+        items: {
+          type: "object",
+          properties: {
+            id: { type: "string", pattern: "^[A-Za-z][A-Za-z0-9_-]{0,63}$" },
+            control: { type: "string", description: "Logical control name from the pack (app_pack_describe)." },
+            action: { type: "string", description: "Action: invoke/toggle/select/setValue/selectByName/selectByIndex/openMenu/openSubmenu/..." },
+            value: { type: "string" },
+            index: { type: "integer", minimum: 0 },
+            exports: { type: "object", additionalProperties: { type: "string" }, maxProperties: 32 },
+            expect: { type: "object", description: "Postcondition; defaults to the pack's defaultExpect for control+action." },
+            retry: { type: "object" }
+          },
+          required: ["control", "action"],
+          additionalProperties: false
+        },
+        description: "Steps as {control, action, ...}. The server injects profile/pid, resolves selectors from the pack, and applies defaultExpect."
+      },
+      finally: { type: "array", maxItems: 20, items: { type: "object" } },
+      restore: { type: "string", enum: ["always", "never", "onFailure"], default: "never" },
+      captureBefore: { type: "array", maxItems: 32, items: { type: "object" } },
+      maxTotalMs: { type: "integer", minimum: 1000, maximum: 600000, default: 120000 }
+    },
+    required: ["profile", "steps"],
+    additionalProperties: false
+  },
+  workflow_catalog: {
+    type: "object",
+    properties: {
+      pack: { type: "string", minLength: 1, description: "Pack id from app_pack_list." }
+    },
+    required: ["pack"],
+    additionalProperties: false
+  },
+  run_workflow: {
+    type: "object",
+    properties: {
+      pack: { type: "string", minLength: 1, description: "Pack id from app_pack_list." },
+      workflow: { type: "string", minLength: 1, description: "Workflow id from workflow_catalog." },
+      inputs: { type: "object", description: "Workflow inputs validated against the workflow's inputSchema." }
+    },
+    required: ["pack", "workflow"],
+    additionalProperties: false
+  },
+  continue_run: {
+    type: "object",
+    properties: {
+      runId: { type: "string", pattern: "^run_[A-Za-z0-9_-]{1,64}$", description: "runId returned by run_steps / profile_run_steps / run_workflow." },
+      continueFrom: { type: "string", description: "Step id (or numeric index) of the failed step to continue from." }
+    },
+    required: ["runId", "continueFrom"],
     additionalProperties: false
   }
 } as const;

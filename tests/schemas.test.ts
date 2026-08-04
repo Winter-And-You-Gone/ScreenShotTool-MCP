@@ -62,7 +62,7 @@ test("capture_window requires at least one target selector", () => {
 
 test("click_window requires a target and accepts click defaults", () => {
   const parsed = clickWindowSchema.parse({
-    titleContains: "VaporView",
+    titleContains: "ExampleApp",
     x: 10,
     y: 20
   });
@@ -75,7 +75,7 @@ test("click_window requires a target and accepts click defaults", () => {
 
 test("move_mouse_window requires a target and accepts move defaults", () => {
   const parsed = moveMouseWindowSchema.parse({
-    titleContains: "VaporView",
+    titleContains: "ExampleApp",
     x: 10,
     y: 20
   });
@@ -403,10 +403,20 @@ test("run_steps rejects empty, oversized, and misshapen step arrays", () => {
   assert.throws(() => runStepsSchema.parse({ steps: [] }));
   assert.throws(() => runStepsSchema.parse({}));
   assert.throws(() => runStepsSchema.parse({
-    steps: Array.from({ length: 21 }, () => ({ tool: "read_clipboard" }))
+    steps: Array.from({ length: 51 }, () => ({ tool: "read_clipboard" }))
   }));
   // A step without a tool field is invalid.
   assert.throws(() => runStepsSchema.parse({ steps: [{ args: {} }] }));
+  // A step id that is not a valid identifier is rejected.
+  assert.throws(() => runStepsSchema.parse({ steps: [{ tool: "read_clipboard", id: "bad id!" }] }));
+  // Reserved step ids are not enforced by the schema (validated statically),
+  // but the schema accepts named steps with exports/expect.
+  const named = runStepsSchema.parse({
+    steps: [
+      { id: "app", tool: "read_clipboard", exports: { text: "text" } }
+    ]
+  });
+  assert.equal(named.steps[0]!.id, "app");
 });
 
 test("run_steps rejects unknown tool names, including run_steps itself", () => {
@@ -423,7 +433,7 @@ test("run_steps rejects unknown fields on the step object", () => {
 
 test("run_steps JSON schema enum mirrors chainableToolNames and excludes run_steps", () => {
   assert.deepEqual(toolInputSchemas.run_steps.properties.steps.items.properties.tool.enum, [...chainableToolNames]);
-  assert.equal(toolInputSchemas.run_steps.properties.steps.maxItems, 20);
+  assert.equal(toolInputSchemas.run_steps.properties.steps.maxItems, 50);
   assert.equal(toolInputSchemas.run_steps.properties.steps.minItems, 1);
   assert.equal(
     toolInputSchemas.run_steps.properties.steps.items.properties.tool.enum.includes("run_steps"),

@@ -1,0 +1,25 @@
+{
+  "id": "generic-qt",
+  "displayName": "Generic Qt App",
+  "executableNames": [
+    "GenericQtApp.exe"
+  ],
+  "executableEnv": "GENERIC_QT_APP_EXE",
+  "mainWindow": {
+    "title": "^Generic Qt App$",
+    "titleMatch": "regex",
+    "frameworkId": "Qt"
+  },
+  "launch": {
+    "reuseIfRunning": true,
+    "waitForWindow": true,
+    "timeoutMs": 30000
+  },
+  "security": {
+    "requiresAsInvoker": false
+  },
+  "submenuAidPatterns": [
+    "SectionAction$",
+    "LanguageAction$"
+  ]
+}
