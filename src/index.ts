@@ -33,11 +33,11 @@ import {
   type ExecutionContext
 } from "./pipeline.js";
 import {
-  backgroundUnsafeSteps,
+  backgroundUnsafePipelineSteps,
   pipelineNotBackgroundSafeError,
+  resolveContinuationInteraction,
   resolveInteractionMode,
-  type InteractionMode,
-  type InteractionOptions
+  type InteractionMode
 } from "./interaction.js";
 import { validateReferences } from "./piping.js";
 import { getRun, runTtlRemainingMs } from "./runs.js";
@@ -366,6 +366,8 @@ function pipelineExecutionContext(runtime: RuntimeModules, uiaDeps: UiaDeps, pac
     // foregroundDemo cleanup: restore the previous foreground window when the
     // pipeline finishes.
     restoreForeground: (hwnd) => runtime.windows.restoreForegroundWindow(hwnd),
+    // Real foreground reads for the pipeline-level interaction report.
+    getForeground: () => runtime.windows.getForegroundWindowHwnd(),
     expectDeps: {
       getUiElement: (i) => uiaDeps.getUiElement(i),
       queryUi: (i) => uiaDeps.queryUi(i)
@@ -440,13 +442,19 @@ async function profileRunStepsTool(args: unknown, runtime: RuntimeModules, uiaDe
   const mode: InteractionMode = resolveInteractionMode({ explicit: input.interactionMode, packDefault: profile.interaction?.defaultMode });
   const foregroundDemo = input.foregroundDemo;
   if (mode === "background") {
-    // Preflight on the {control, action} steps (profile_action shape).
-    const preflightSteps = input.steps.map((s) => ({
+    // Preflight on the {control, action} steps AND finally (profile_action
+    // shape), before the launch - no launch side effects for a refused run.
+    const toPreflight = (s: ProfileRunStepsInput["steps"][number]) => ({
       ...(s.id ? { id: s.id } : {}),
       tool: "profile_action" as const,
       args: { profile: input.profile, control: s.control, action: s.action }
-    }));
-    const unsafe = backgroundUnsafeSteps(preflightSteps, (id) => packRegistry.getPack(id)?.actions, pack.actions);
+    });
+    const unsafe = backgroundUnsafePipelineSteps(
+      input.steps.map(toPreflight),
+      (input.finally ?? []).map(toPreflight),
+      (id) => packRegistry.getPack(id)?.actions,
+      pack.actions
+    );
     if (unsafe.length > 0) {
       const err = pipelineNotBackgroundSafeError(mode, unsafe);
       throw new McpUiError("PIPELINE_NOT_BACKGROUND_SAFE", err.message, err.details);
@@ -559,10 +567,15 @@ async function runWorkflowTool(args: unknown, runtime: RuntimeModules, uiaDeps: 
   });
   const foregroundDemo = input.foregroundDemo;
 
-  // Background preflight BEFORE the workflow runs (no launch side effects for
-  // a refused workflow).
+  // Background preflight BEFORE the workflow runs (steps AND finally; no
+  // launch side effects for a refused workflow).
   if (mode === "background") {
-    const unsafe = backgroundUnsafeSteps(workflow.steps, (id) => packRegistry.getPack(id)?.actions, pack.actions);
+    const unsafe = backgroundUnsafePipelineSteps(
+      workflow.steps,
+      workflow.finally ?? [],
+      (id) => packRegistry.getPack(id)?.actions,
+      pack.actions
+    );
     if (unsafe.length > 0) {
       const err = pipelineNotBackgroundSafeError(mode, unsafe);
       throw new McpUiError("PIPELINE_NOT_BACKGROUND_SAFE", err.message, err.details);
@@ -638,18 +651,21 @@ async function continueRunTool(args: unknown, runtime: RuntimeModules, uiaDeps: 
     };
   }
 
-  // A continuation keeps the pack's interaction default (the run's own mode
-  // was resolved at run time; re-resolving from the pack keeps background
-  // preflights intact for the remaining steps).
-  const profile = snapshot.packId ? getAppProfile(snapshot.packId) : undefined;
-  const continuationMode: InteractionMode = resolveInteractionMode({ packDefault: profile?.interaction?.defaultMode });
+  // continue_run REUSES the resolved interaction context stored in the run
+  // snapshot - it never re-derives the mode from current pack defaults (which
+  // may have changed since the original run). Legacy snapshots (created
+  // before interaction-context storage) fall back to the pack default and
+  // report RUN_INTERACTION_CONTEXT_MISSING.
+  const packProfile = snapshot.packId ? getAppProfile(snapshot.packId) : undefined;
+  const resolved = resolveContinuationInteraction(snapshot.interaction, packProfile?.interaction?.defaultMode);
 
   const result = await continuePipeline({
     runId: input.runId,
     continueFrom: input.continueFrom,
     ctx: {
       ...pipelineExecutionContext(runtime, uiaDeps, snapshot.packId),
-      interactionMode: continuationMode
+      interactionMode: resolved.mode,
+      ...(resolved.interaction ? { interaction: resolved.interaction } : {})
     },
     checkProcessAlive: async (pid) => {
       try {
@@ -669,6 +685,9 @@ async function continueRunTool(args: unknown, runtime: RuntimeModules, uiaDeps: 
     },
     getPackVersion: (packId) => packRegistry.getPack(packId)?.manifest.version
   });
+  if (resolved.contextMissing) {
+    result.warnings?.push("RUN_INTERACTION_CONTEXT_MISSING: The run snapshot predates interaction-context storage; the interaction mode was re-derived from the current pack default instead of the original run.");
+  }
   return withRunTtl(result);
 }
 

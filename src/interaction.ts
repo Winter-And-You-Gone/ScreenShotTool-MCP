@@ -64,7 +64,13 @@ export type InteractionReport = {
   method?: string;
   foregroundBefore?: string;
   foregroundAfter?: string;
+  // Whether the foreground window at the END differs from the one at the
+  // start of the operation.
   foregroundChanged: boolean;
+  // Whether the foreground changed AT ANY POINT during the run (even when it
+  // was restored afterwards). Optional: reported by the pipeline-level
+  // aggregate report.
+  foregroundChangedDuringRun?: boolean;
   foregroundRestored?: boolean;
   targetActivated: boolean;
   physicalCursorMoved: boolean;
@@ -135,6 +141,9 @@ export function stepBackgroundPolicy(
 export type UnsafeStep = {
   stepId?: string;
   index?: number;
+  // Which pipeline section the step belongs to (steps / finally). Set by the
+  // unified backgroundUnsafePipelineSteps preflight.
+  section?: "steps" | "finally";
   backgroundPolicy: BackgroundPolicy;
   suggestedMode: "foregroundDemo";
   tool: string;
@@ -175,6 +184,20 @@ export function backgroundUnsafeSteps(
   return unsafe;
 }
 
+// Unified background preflight for a whole pipeline: main steps AND finally.
+// The single logic used by run_steps / profile_run_steps / run_workflow /
+// continue_run so no entry point can skip the finally section.
+export function backgroundUnsafePipelineSteps(
+  steps: Array<{ id?: string; tool: string; args?: Record<string, unknown> }>,
+  finallySteps: Array<{ id?: string; tool: string; args?: Record<string, unknown> }>,
+  getActions: (profileId: string) => PackActions | undefined,
+  packActions?: PackActions
+): UnsafeStep[] {
+  const main = backgroundUnsafeSteps(steps, getActions, packActions).map((s) => ({ ...s, section: "steps" as const }));
+  const fin = backgroundUnsafeSteps(finallySteps, getActions, packActions).map((s) => ({ ...s, section: "finally" as const }));
+  return [...main, ...fin];
+}
+
 // ── Structured errors ──
 
 // background mode has no verified background-safe method for this operation.
@@ -206,6 +229,7 @@ export function pipelineNotBackgroundSafeError(
     suggestedMode: "foregroundDemo",
     unsafeSteps: unsafeSteps.map((s) => ({
       ...(s.stepId ? { stepId: s.stepId } : { index: s.index }),
+      ...(s.section ? { section: s.section } : {}),
       backgroundPolicy: s.backgroundPolicy,
       suggestedMode: s.suggestedMode
     }))
@@ -217,8 +241,10 @@ export function pipelineInteractionReport(mode: InteractionMode, opts: {
   foregroundBefore?: string;
   foregroundAfter?: string;
   foregroundChanged: boolean;
+  foregroundChangedDuringRun?: boolean;
   foregroundRestored?: boolean;
   targetActivated: boolean;
+  physicalCursorMoved?: boolean;
 }): InteractionReport {
   return {
     requestedMode: mode,
@@ -226,9 +252,77 @@ export function pipelineInteractionReport(mode: InteractionMode, opts: {
     ...(opts.foregroundBefore ? { foregroundBefore: opts.foregroundBefore } : {}),
     ...(opts.foregroundAfter ? { foregroundAfter: opts.foregroundAfter } : {}),
     foregroundChanged: opts.foregroundChanged,
+    ...(opts.foregroundChangedDuringRun ? { foregroundChangedDuringRun: true } : {}),
     ...(opts.foregroundRestored !== undefined ? { foregroundRestored: opts.foregroundRestored } : {}),
     targetActivated: opts.targetActivated,
-    physicalCursorMoved: false
+    physicalCursorMoved: opts.physicalCursorMoved ?? false
+  };
+}
+
+// Extract the interaction report from a tool result / step result value.
+export function interactionOf(value: unknown): InteractionReport | undefined {
+  if (value && typeof value === "object" && !Array.isArray(value)) {
+    const interaction = (value as { interaction?: unknown }).interaction;
+    if (interaction && typeof interaction === "object" && !Array.isArray(interaction)) {
+      return interaction as InteractionReport;
+    }
+  }
+  return undefined;
+}
+
+// Aggregate interaction impact across step/finally/restore results.
+export function aggregateInteractions(
+  interactions: Array<InteractionReport | undefined>
+): { foregroundChangedDuringRun: boolean; targetActivated: boolean; physicalCursorMoved: boolean } {
+  let foregroundChangedDuringRun = false;
+  let targetActivated = false;
+  let physicalCursorMoved = false;
+  for (const i of interactions) {
+    if (!i) continue;
+    if (i.foregroundChanged === true || i.foregroundChangedDuringRun === true) foregroundChangedDuringRun = true;
+    if (i.targetActivated === true) targetActivated = true;
+    if (i.physicalCursorMoved === true) physicalCursorMoved = true;
+  }
+  return { foregroundChangedDuringRun, targetActivated, physicalCursorMoved };
+}
+
+// ── Stored interaction context (continue_run inheritance) ──
+
+// The RESOLVED interaction context of a run, saved in its snapshot so
+// continue_run reuses it verbatim instead of re-deriving the mode from the
+// CURRENT pack defaults (which may have changed since the original run).
+export type StoredInteractionContext = {
+  requestedMode: InteractionMode;
+  effectiveMode: InteractionMode;
+  foregroundDemo?: {
+    restorePreviousForeground: boolean;
+    stepDelayMs?: number;
+  };
+  allowForegroundFallback: boolean;
+  backgroundPresentation?: string;
+};
+
+// Resolve the interaction context for a continuation from the stored context.
+// Legacy snapshots (created before interaction-context storage) fall back to
+// the current pack default and report contextMissing so the caller can warn.
+export function resolveContinuationInteraction(
+  stored: StoredInteractionContext | undefined,
+  packDefault: InteractionMode | undefined
+): { mode: InteractionMode; interaction?: InteractionOptions; contextMissing: boolean } {
+  if (!stored) {
+    return { mode: resolveInteractionMode({ packDefault }), interaction: undefined, contextMissing: true };
+  }
+  return {
+    mode: stored.requestedMode,
+    ...(stored.foregroundDemo
+      ? {
+          interaction: {
+            restorePreviousForeground: stored.foregroundDemo.restorePreviousForeground,
+            ...(stored.foregroundDemo.stepDelayMs !== undefined ? { stepDelayMs: stored.foregroundDemo.stepDelayMs } : {})
+          }
+        }
+      : {}),
+    contextMissing: false
   };
 }
 

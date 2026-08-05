@@ -274,7 +274,9 @@ $env:SCREENSHOT_MCP_APP_PACK_DIRS = "X:\Private\AppPacks;D:\Team\AppPacks"
   （details：`requestedMode/effectiveMode/foregroundChanged/reason/suggestedMode:"foregroundDemo"`）。
 - 管道（`run_steps` / `profile_run_steps` / `run_workflow`）在 background 模式下包含
   `foregroundRequired` 步骤 → **执行任何步骤之前**返回 `PIPELINE_NOT_BACKGROUND_SAFE`，
-  details 列出 `unsafeSteps: [{stepId, backgroundPolicy, suggestedMode}]`。
+  details 列出 `unsafeSteps: [{stepId, section, backgroundPolicy, suggestedMode}]`。
+  **预检同时覆盖主流程 steps 与 finally**：即使 finally 含强制前台步骤，整条管道也会在
+  启动应用/执行第一步之前被拒绝。`continue_run` 续跑前对剩余主步骤和 finally 使用同一套预检。
   `bestEffort` 步骤允许执行，运行时失败再返回明确错误。禁止执行到中途突然抢前台。
 - 后台截图空白帧 → `BACKGROUND_CAPTURE_UNAVAILABLE`（不自动置顶重试）。
 - 后台启动时若应用自身抢前台，核心尝试恢复原前台窗口并如实报告
@@ -288,12 +290,28 @@ $env:SCREENSHOT_MCP_APP_PACK_DIRS = "X:\Private\AppPacks;D:\Team\AppPacks"
 { "interaction": { "requestedMode": "background", "effectiveMode": "background",
     "backgroundPolicy": "safe", "method": "InvokePattern",
     "foregroundBefore": "0x1A2B3C", "foregroundAfter": "0x1A2B3C",
-    "foregroundChanged": false, "foregroundRestored": true,
+    "foregroundChanged": false, "foregroundChangedDuringRun": true,
+    "foregroundRestored": true,
     "targetActivated": false, "physicalCursorMoved": false } }
 ```
 
+管道顶层报告在**开始时与全部步骤/restore/finally 结束后真实读取前台 HWND**，并汇总所有
+步骤、finally 与恢复动作的 interaction：
+
+- `foregroundChanged` = 结束时前台与开始时不同（最终差异）。
+- `foregroundChangedDuringRun` = 过程中**任何时刻**发生过前台变化——即使最终已恢复也如实
+  保留（不得因恢复成功而隐藏过程变化）。
+- `foregroundRestored` = 最终前台读回与开始时相同（以最终读取为准，不只相信子步骤布尔值）。
+- `targetActivated` / `physicalCursorMoved` = 汇总真实步骤结果。
+- background 管道结束时前台未恢复 → `foregroundChanged:true` / `foregroundRestored:false` +
+  warning `BACKGROUND_FOREGROUND_NOT_RESTORED`（不影响已完成业务步骤的成功语义）。
+
+`continue_run` **继承原运行已解析的交互上下文**（interactionMode / foregroundDemo 选项
+restorePreviousForeground / stepDelayMs / allowForegroundFallback），不根据当前 Pack 默认值
+重新推导；旧格式快照回退为 Pack 默认并返回 `RUN_INTERACTION_CONTEXT_MISSING` warning。
+
 覆盖 `profile_launch` / `profile_action` / `profile_run_steps` / `run_workflow` /
-`capture_window`（截图还报告真实 `captureMethod`）。`workflow_catalog` 与
+`continue_run` / `capture_window`（截图还报告真实 `captureMethod`）。`workflow_catalog` 与
 `app_pack_describe` 公开 `defaultInteractionMode` / `backgroundPolicy` /
 `foregroundRequiredSteps`，模型第一次使用时即可判断哪些 Workflow 可完全后台运行。
 

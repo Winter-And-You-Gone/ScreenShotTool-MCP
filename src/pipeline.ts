@@ -19,12 +19,15 @@ import { extractReferenceHeads, resolvePlaceholdersEx, validateReferences, type 
 import { estimateJsonBytes, isSensitiveFieldName, MAX_PIPELINE_RESULT_BYTES, MAX_STEP_RESULT_BYTES } from "./outputs.js";
 import { createRunId, saveRun, type RunSnapshot, type StepSnapshot } from "./runs.js";
 import {
-  backgroundUnsafeSteps,
+  aggregateInteractions,
+  backgroundUnsafePipelineSteps,
+  interactionOf,
   pipelineInteractionReport,
   pipelineNotBackgroundSafeError,
   type InteractionMode,
   type InteractionOptions,
-  type InteractionReport
+  type InteractionReport,
+  type StoredInteractionContext
 } from "./interaction.js";
 
 // ── Limits (spec section 23) ──
@@ -470,6 +473,10 @@ export type ExecutionContext = {
   // Restores a previous foreground window (foregroundDemo cleanup). Wired by
   // index.ts to the windows module.
   restoreForeground?: (previousForegroundHwnd?: string) => Promise<{ restored: boolean; foregroundHwnd: string; foregroundChanged: boolean }>;
+  // Reads the current foreground window hwnd. Wired by index.ts; absent in
+  // unit tests (the pipeline then reports only what steps themselves
+  // observed).
+  getForeground?: () => Promise<string>;
   inputs?: Record<string, unknown>;
   autoContext?: { profile?: string; pid?: number; hwnd?: string; title?: string };
   expectDeps: ExpectContext;
@@ -994,6 +1001,9 @@ export type RestoreResult = {
   actual?: unknown;
   message?: string;
   valueCaptured?: boolean;
+  // Interaction report of the restore action (for pipeline-level
+  // aggregation).
+  interaction?: unknown;
 };
 
 async function runRestore(
@@ -1071,7 +1081,8 @@ async function restoreOne(entry: CapturedValue, ctx: ExecutionContext): Promise<
         message: `No restore action available for state kind '${entry.state.kind}' (the original state could not be reliably restored).`
       };
     }
-    await ctx.dispatch(restorePlan.restoreArgs.tool, restorePlan.restoreArgs.args);
+    const restoredValue = await ctx.dispatch(restorePlan.restoreArgs.tool, restorePlan.restoreArgs.args);
+    const interaction = interactionOf(restoredValue);
     // Verify by re-reading the control - never a self-fulfilling check.
     const verified = await handler.verify(entry, ctx);
     return {
@@ -1081,6 +1092,7 @@ async function restoreOne(entry: CapturedValue, ctx: ExecutionContext): Promise<
       method: restorePlan.action,
       expected: verified.expected,
       actual: verified.actual,
+      ...(interaction ? { interaction } : {}),
       ...(verified.ok ? {} : { code: "RESTORE_VERIFICATION_FAILED" }),
       message: verified.ok ? undefined : `Restore did not verify: expected ${verified.expected}, read ${verified.actual} (RESTORE_VERIFICATION_FAILED).`
     };
@@ -1104,10 +1116,11 @@ async function restoreSelection(entry: CapturedValue, ctx: ExecutionContext, bas
     const plan = actionForTarget(entry, "selectByName", { value: s.name });
     if (plan.action !== null) {
       try {
-        await ctx.dispatch(plan.restoreArgs.tool, plan.restoreArgs.args);
+        const restoredValue = await ctx.dispatch(plan.restoreArgs.tool, plan.restoreArgs.args);
+        const interaction = interactionOf(restoredValue);
         const v = await handler.verify(entry, ctx);
         if (v.ok) {
-          return { ...base, success: true, verified: true, method: "selectByName", expected: v.expected, actual: v.actual };
+          return { ...base, success: true, verified: true, method: "selectByName", expected: v.expected, actual: v.actual, ...(interaction ? { interaction } : {}) };
         }
       } catch (error) {
         const code = (error as { code?: string }).code;
@@ -1122,14 +1135,16 @@ async function restoreSelection(entry: CapturedValue, ctx: ExecutionContext, bas
     const plan = actionForTarget(entry, "selectByIndex", { index: s.index });
     if (plan.action !== null) {
       try {
-        await ctx.dispatch(plan.restoreArgs.tool, plan.restoreArgs.args);
+        const restoredValue = await ctx.dispatch(plan.restoreArgs.tool, plan.restoreArgs.args);
+        const interaction = interactionOf(restoredValue);
         const v = await handler.verify(entry, ctx);
         if (v.ok) {
-          return { ...base, success: true, verified: true, method: "selectByIndex", expected: v.expected, actual: v.actual };
+          return { ...base, success: true, verified: true, method: "selectByIndex", expected: v.expected, actual: v.actual, ...(interaction ? { interaction } : {}) };
         }
         return {
           ...base, code: "RESTORE_VERIFICATION_FAILED", method: "selectByIndex", verified: false,
           expected: v.expected, actual: v.actual,
+          ...(interaction ? { interaction } : {}),
           message: `Restore did not verify: expected ${v.expected}, read ${v.actual} (RESTORE_VERIFICATION_FAILED).`
         };
       } catch (error) {
@@ -1161,6 +1176,11 @@ export async function runPipeline(input: PipelineInput, ctx: ExecutionContext): 
   const captured = new Map<string, CapturedValue>();
   const completedIds: string[] = [];
 
+  // Pipeline-level foreground snapshot: prefer the pre-launch value captured
+  // by the outer profile_launch (profile_run_steps), else read the real
+  // foreground NOW, before any step runs.
+  const foregroundBefore = ctx.interaction?.foregroundBefore ?? await readPipelineForeground(ctx);
+
   // Structural pre-check before any step runs.
   const refCheck = validateReferences(input.steps.map((s) => ({ id: s.id, tool: s.tool, args: s.args ?? {} })), { pack: ctx.pack ? { id: ctx.pack.id } : undefined, inputs: ctx.inputs });
   if (!refCheck.ok) {
@@ -1169,16 +1189,25 @@ export async function runPipeline(input: PipelineInput, ctx: ExecutionContext): 
 
   // Background preflight: a pipeline that contains foregroundRequired steps
   // (or global keyboard input) is refused BEFORE any step runs - never a
-  // mid-run foreground steal. bestEffort steps are allowed and surface their
-  // own runtime failures.
-  const backgroundPreflight = backgroundUnsafeSteps(input.steps, (profileId) => ctx.resolvePackActions?.(profileId), ctx.pack?.actions);
+  // mid-run foreground steal. Covers BOTH the main steps and the finally
+  // steps. bestEffort steps are allowed and surface their own failures.
+  const backgroundPreflight = backgroundUnsafePipelineSteps(
+    input.steps,
+    input.finally ?? [],
+    (profileId) => ctx.resolvePackActions?.(profileId),
+    ctx.pack?.actions
+  );
   if (ctx.interactionMode === "background" && backgroundPreflight.length > 0) {
     const err = pipelineNotBackgroundSafeError("background", backgroundPreflight);
     return pipelineFailure(
       runId, input, stepResults, exports, 0, undefined,
       { code: "PIPELINE_NOT_BACKGROUND_SAFE", message: err.message, details: err.details },
       [], warnings, undefined,
-      pipelineInteractionReport("background", { foregroundChanged: false, targetActivated: false })
+      pipelineInteractionReport("background", {
+        ...(foregroundBefore ? { foregroundBefore } : {}),
+        foregroundChanged: false,
+        targetActivated: false
+      })
     );
   }
 
@@ -1265,62 +1294,12 @@ export async function runPipeline(input: PipelineInput, ctx: ExecutionContext): 
   const restoreResults = await runRestore(input, success, captured, ctx, byId, byIndex, deadline);
   const finallyResults = await runFinally(input, ctx, pipeCtx, exports, deadline, warnings);
 
-  // foregroundDemo cleanup: restore the previous foreground window the launch
-  // saved (default restorePreviousForeground=true). Best-effort and honest:
-  // a failed restore is reported in the interaction metadata, never hidden.
-  let interaction: InteractionReport | undefined;
-  if (ctx.interactionMode === "foregroundDemo") {
-    const restorePrevious = ctx.interaction?.restorePreviousForeground ?? true;
-    const foregroundBefore = ctx.interaction?.foregroundBefore ?? firstStepForegroundBefore(stepResults);
-    if (restorePrevious && foregroundBefore && ctx.restoreForeground) {
-      try {
-        const restored = await ctx.restoreForeground(foregroundBefore);
-        interaction = pipelineInteractionReport("foregroundDemo", {
-          foregroundBefore,
-          foregroundAfter: restored.foregroundHwnd,
-          foregroundChanged: restored.foregroundChanged,
-          foregroundRestored: restored.restored,
-          targetActivated: true
-        });
-        if (!restored.restored) {
-          warnings.push("foregroundDemo: the previous foreground window could not be restored.");
-        }
-      } catch {
-        interaction = pipelineInteractionReport("foregroundDemo", {
-          foregroundBefore,
-          foregroundChanged: true,
-          foregroundRestored: false,
-          targetActivated: true
-        });
-        warnings.push("foregroundDemo: restoring the previous foreground window failed.");
-      }
-    } else {
-      interaction = pipelineInteractionReport("foregroundDemo", {
-        ...(foregroundBefore ? { foregroundBefore } : {}),
-        foregroundChanged: false,
-        foregroundRestored: restorePrevious ? undefined : true,
-        targetActivated: true
-      });
-    }
-  } else if (ctx.interactionMode === "background") {
-    interaction = pipelineInteractionReport("background", {
-      foregroundChanged: false,
-      targetActivated: false
-    });
-  } else {
-    // auto: reflect what actually happened across the steps.
-    const anyForegroundChanged = stepResults.some((s) => {
-      const r = s.result as { interaction?: InteractionReport } | undefined;
-      return r?.interaction?.foregroundChanged === true;
-    });
-    interaction = pipelineInteractionReport("auto", {
-      foregroundChanged: anyForegroundChanged,
-      targetActivated: stepResults.some((s) => {
-        const r = s.result as { interaction?: InteractionReport } | undefined;
-        return r?.interaction?.targetActivated === true;
-      })
-    });
-  }
+  // Pipeline-level interaction report: re-read the real foreground AFTER
+  // steps + restore + finally all finished, and aggregate what the steps
+  // themselves observed. foregroundChanged = final before/after difference;
+  // foregroundChangedDuringRun = any change during the run (even when
+  // restored); foregroundRestored = the final read equals the start.
+  const interaction = await finalizePipelineInteraction(ctx, stepResults, finallyResults, restoreResults, foregroundBefore, warnings);
 
   // Persist a MINIMAL continuable snapshot: per completed step only the
   // fields later steps reference + pipe-safe fields + that step's exports
@@ -1364,6 +1343,9 @@ export async function runPipeline(input: PipelineInput, ctx: ExecutionContext): 
     inputs: ctx.inputs,
     maxSteps: input.steps.length,
     totalTimeoutMs: maxTotalMs,
+    // Save the RESOLVED interaction context so continue_run reuses it instead
+    // of re-deriving the mode from current pack defaults.
+    interaction: storedInteractionContext(ctx),
     continuable: false,
     continuationReason: null
   };
@@ -1389,6 +1371,104 @@ export async function runPipeline(input: PipelineInput, ctx: ExecutionContext): 
     continuable: saved.continuable,
     continuationReason: saved.continuationReason
   };
+}
+
+// The RESOLVED interaction context of a run, stored in its snapshot for
+// continue_run inheritance. Always stored (mode defaults to auto) so a
+// continuation never guesses from current pack defaults.
+function storedInteractionContext(ctx: ExecutionContext): StoredInteractionContext {
+  const mode: InteractionMode = ctx.interactionMode ?? "auto";
+  return {
+    requestedMode: mode,
+    effectiveMode: mode,
+    ...(mode === "foregroundDemo"
+      ? {
+          foregroundDemo: {
+            restorePreviousForeground: ctx.interaction?.restorePreviousForeground ?? ctx.pack?.profile.interaction?.restorePreviousForeground ?? true,
+            ...(ctx.interaction?.stepDelayMs !== undefined ? { stepDelayMs: ctx.interaction.stepDelayMs } : {})
+          }
+        }
+      : {}),
+    allowForegroundFallback: ctx.pack?.profile.interaction?.allowForegroundFallback ?? false,
+    ...(ctx.pack?.profile.interaction?.backgroundPresentation ? { backgroundPresentation: ctx.pack.profile.interaction.backgroundPresentation } : {})
+  };
+}
+
+// Read the current foreground hwnd (best-effort; undefined when unavailable).
+async function readPipelineForeground(ctx: ExecutionContext): Promise<string | undefined> {
+  if (!ctx.getForeground) return undefined;
+  try {
+    return await ctx.getForeground();
+  } catch {
+    return undefined;
+  }
+}
+
+// Final pipeline-level interaction report. Order:
+//   1. foregroundDemo cleanup (restore the previous foreground window) - the
+//      default restorePreviousForeground=true behavior;
+//   2. re-read the real foreground AFTER everything finished;
+//   3. aggregate what the steps / finally / restore actions themselves
+//      observed (foregroundChangedDuringRun, targetActivated,
+//      physicalCursorMoved);
+//   4. background mode: an un-restored foreground is reported honestly
+//      (foregroundChanged:true / foregroundRestored:false + warning), never
+//      hidden, and never fails already-completed business steps.
+async function finalizePipelineInteraction(
+  ctx: ExecutionContext,
+  stepResults: StepExecutionResult[],
+  finallyResults: StepExecutionResult[],
+  restoreResults: Array<{ interaction?: unknown }>,
+  foregroundBefore: string | undefined,
+  warnings: string[]
+): Promise<InteractionReport> {
+  const mode = ctx.interactionMode ?? "auto";
+
+  // foregroundDemo cleanup: restore the previous foreground window the launch
+  // saved (default restorePreviousForeground=true). Best-effort and honest:
+  // a failed restore is reported in the interaction metadata, never hidden.
+  if (mode === "foregroundDemo") {
+    const restorePrevious = ctx.interaction?.restorePreviousForeground ?? true;
+    const demoBefore = foregroundBefore ?? ctx.interaction?.foregroundBefore ?? firstStepForegroundBefore(stepResults);
+    if (restorePrevious && demoBefore && ctx.restoreForeground) {
+      try {
+        const restored = await ctx.restoreForeground(demoBefore);
+        if (!restored.restored) {
+          warnings.push("foregroundDemo: the previous foreground window could not be restored.");
+        }
+      } catch {
+        warnings.push("foregroundDemo: restoring the previous foreground window failed.");
+      }
+    }
+  }
+
+  // The final truth is the re-read hwnd, not child-step booleans.
+  const foregroundAfter = await readPipelineForeground(ctx);
+  const foregroundKnown = foregroundBefore !== undefined && foregroundAfter !== undefined;
+  const foregroundChanged = foregroundKnown && foregroundBefore !== foregroundAfter;
+  const foregroundRestored = foregroundKnown && foregroundBefore === foregroundAfter;
+
+  const aggregate = aggregateInteractions([
+    ...stepResults.map((s) => interactionOf(s.result)),
+    ...finallyResults.map((s) => interactionOf(s.result)),
+    ...restoreResults.map((r) => interactionOf(r.interaction))
+  ]);
+
+  if (mode === "background" && foregroundChanged) {
+    warnings.push(
+      `BACKGROUND_FOREGROUND_NOT_RESTORED: The pipeline ended with a different foreground window than it started with (foregroundBefore=${foregroundBefore ?? "?"}, foregroundAfter=${foregroundAfter ?? "?"}).`
+    );
+  }
+
+  return pipelineInteractionReport(mode, {
+    ...(foregroundBefore ? { foregroundBefore } : {}),
+    ...(foregroundAfter ? { foregroundAfter } : {}),
+    foregroundChanged,
+    ...(aggregate.foregroundChangedDuringRun ? { foregroundChangedDuringRun: true } : {}),
+    ...(foregroundKnown ? { foregroundRestored } : {}),
+    targetActivated: aggregate.targetActivated,
+    ...(aggregate.physicalCursorMoved ? { physicalCursorMoved: true } : {})
+  });
 }
 
 // The previous foreground window saved by the first launch step of a
@@ -1893,10 +1973,16 @@ export async function continuePipeline(opts: ContinueOptions): Promise<PipelineR
     return fail(runId, "RUN_STATE_STALE", `Continuation index ${fromIndex} is out of range (0..${input.steps.length - 1}).`);
   }
 
-  // Background preflight on the REMAINING steps (same rule as runPipeline):
-  // a background continuation never resumes into a foregroundRequired step.
+  // Background preflight on the REMAINING main steps AND the finally steps
+  // (same rule as runPipeline, using the stored interaction mode): a
+  // background continuation never resumes into a foregroundRequired step.
   if (opts.ctx.interactionMode === "background") {
-    const unsafe = backgroundUnsafeSteps(input.steps.slice(fromIndex), (profileId) => opts.ctx.resolvePackActions?.(profileId), opts.ctx.pack?.actions);
+    const unsafe = backgroundUnsafePipelineSteps(
+      input.steps.slice(fromIndex),
+      input.finally ?? [],
+      (profileId) => opts.ctx.resolvePackActions?.(profileId),
+      opts.ctx.pack?.actions
+    );
     if (unsafe.length > 0) {
       const err = pipelineNotBackgroundSafeError("background", unsafe);
       return {
@@ -1908,6 +1994,10 @@ export async function continuePipeline(opts: ContinueOptions): Promise<PipelineR
       };
     }
   }
+
+  // Pipeline-level foreground snapshot for the continuation segment.
+  const foregroundBefore = opts.ctx.interaction?.foregroundBefore ?? await readPipelineForeground(opts.ctx);
+  const warnings: string[] = [];
 
   // Re-execute from the continuation point, reusing stored results for the
   // completed prefix. The stored results act as the pipe context, so steps
@@ -1940,13 +2030,18 @@ export async function continuePipeline(opts: ContinueOptions): Promise<PipelineR
 
   for (let i = fromIndex; i < input.steps.length; i++) {
     const step = input.steps[i]!;
-    const exec = await executeStep(step, i, opts.ctx, pipeCtx, Date.now() + (snapshot.totalTimeoutMs ?? DEFAULT_MAX_TOTAL_MS), new Map(), []);
+    const exec = await executeStep(step, i, opts.ctx, pipeCtx, Date.now() + (snapshot.totalTimeoutMs ?? DEFAULT_MAX_TOTAL_MS), new Map(), warnings);
     stepResults.push(exec);
     if (exec.success) {
       results.push(exec.result);
       if (step.id) {
         byId.set(step.id, exec.result);
         completedIds.push(step.id);
+      }
+      // foregroundDemo: keep the demo pacing on the continued steps too.
+      const stepDelayMs = opts.ctx.interactionMode === "foregroundDemo" ? (opts.ctx.interaction?.stepDelayMs ?? 0) : 0;
+      if (stepDelayMs > 0) {
+        await sleep(stepDelayMs);
       }
       const exportOutcome = applyExports(step, exec.result!, exports);
       stepExportValues.push(exportOutcome.values);
@@ -2003,6 +2098,29 @@ export async function continuePipeline(opts: ContinueOptions): Promise<PipelineR
   const saved = saveRun(fresh);
 
   const success = stoppedAtIndex === null;
+
+  // Pipeline-level interaction report for the continuation segment: re-read
+  // the real foreground at the end, aggregate the continued steps AND the
+  // completed prefix projections (which carry their interaction reports).
+  const interaction = await finalizePipelineInteraction(
+    opts.ctx,
+    stepResults,
+    [],
+    [],
+    foregroundBefore,
+    warnings
+  );
+  const prefixInteractions = snapshot.steps
+    .slice(0, fromIndex)
+    .map((s) => interactionOf(s.pipeProjection))
+    .filter((i): i is InteractionReport => i !== undefined);
+  if (prefixInteractions.length > 0) {
+    const prefixAggregate = aggregateInteractions(prefixInteractions);
+    if (prefixAggregate.foregroundChangedDuringRun) interaction.foregroundChangedDuringRun = true;
+    if (prefixAggregate.targetActivated) interaction.targetActivated = true;
+    if (prefixAggregate.physicalCursorMoved) interaction.physicalCursorMoved = true;
+  }
+
   return {
     schemaVersion: 1,
     success,
@@ -2019,7 +2137,8 @@ export async function continuePipeline(opts: ContinueOptions): Promise<PipelineR
     ...(stopError ? { error: stopError } : {}),
     finallyResults: [],
     restoreResults: [],
-    warnings: [],
+    warnings,
+    ...(interaction ? { interaction } : {}),
     continuable: saved.continuable,
     continuationReason: saved.continuationReason
   };

@@ -238,12 +238,13 @@ const interactionShape = obj(
     foregroundBefore: str(),
     foregroundAfter: str(),
     foregroundChanged: bool(),
+    foregroundChangedDuringRun: bool(),
     foregroundRestored: bool(),
     targetActivated: bool(),
     physicalCursorMoved: bool()
   },
   ["requestedMode", "effectiveMode", "foregroundChanged", "targetActivated", "physicalCursorMoved"],
-  "Interaction-impact report: mode resolution, foreground changes, activation and physical-cursor movement for this call."
+  "Interaction-impact report: mode resolution, foreground changes (final state and during-run changes), activation and physical-cursor movement for this call."
 );
 
 // capture_window carries the interaction report (capture_screen_region does
@@ -799,7 +800,8 @@ const continueRunOutput = obj(
     completedSteps: arr(str()),
     exports: any(),
     steps: arr(stepResult),
-    error: errorShape
+    error: errorShape,
+    interaction: interactionShape
   },
   ["schemaVersion", "success", "runId", "status"]
 );
@@ -1117,11 +1119,11 @@ export const contracts: Record<string, ToolContract> = {
   },
   continue_run: {
     name: "continue_run",
-    description: "Continue a failed pipeline from a saved run snapshot (runId + continueFrom). Checks: run not expired, pack version unchanged, process alive, hwnd valid, snapshot continuable. Returns: success, runId, status, continuedFrom, stoppedAt, completedSteps, exports, steps[], error.",
+    description: "Continue a failed pipeline from a saved run snapshot (runId + continueFrom). Checks: run not expired, pack version unchanged, process alive, hwnd valid, snapshot continuable. Reuses the ORIGINAL run's resolved interaction mode and foregroundDemo options (never re-derived from current pack defaults). Returns: success, runId, status, continuedFrom, stoppedAt, completedSteps, exports, steps[], error, interaction.",
     inputSchema: toolInputSchemas.continue_run as unknown as JsonSchema,
     outputSchema: continueRunOutput,
     schemaVersion: 1,
-    pipeSafeFields: ["success", "runId", "status", "exports"],
+    pipeSafeFields: ["success", "runId", "status", "exports", "interaction"],
     annotations: { idempotent: false, retrySafe: false }
   },
   tool_contract_list: {

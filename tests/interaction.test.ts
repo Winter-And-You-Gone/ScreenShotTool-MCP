@@ -14,6 +14,7 @@ import { loadPackFromDir } from "../src/app-packs/loader.js";
 import { runPipeline, type ExecutionContext } from "../src/pipeline.js";
 import {
   backgroundUnsafeSteps,
+  backgroundUnsafePipelineSteps,
   captureInteractionReport,
   effectiveModeFor,
   foregroundRequiredError,
@@ -234,4 +235,126 @@ test("global keyboard input steps are flagged in background preflight", () => {
   assert.equal(unsafe.length, 1);
   assert.equal(unsafe[0]!.stepId, "keys");
   assert.match(unsafe[0]!.reason, /global keyboard input/);
+});
+
+test("pipeline interaction aggregates step foreground changes (changed during run, restored at end)", async () => {
+  // The step reports foregroundChanged=true (and activated the target), but
+  // the final foreground re-read equals the start: the pipeline report must
+  // express BOTH facts - final unchanged AND changed-during-run.
+  const reads = ["A", "A"];
+  let readIndex = 0;
+  const result = await runPipeline(
+    {
+      steps: [
+        { id: "a", tool: "profile_action", args: { profile: "fixture", control: "sampleButton", action: "invoke" } }
+      ]
+    },
+    {
+      dispatch: async () => ({
+        profile: "fixture",
+        control: "sampleButton",
+        result: { success: true },
+        interaction: { requestedMode: "background", effectiveMode: "background", foregroundChanged: true, targetActivated: true, physicalCursorMoved: false }
+      }),
+      pack: { id: "fixture", actions: FOREGROUND_REQUIRED_ACTIONS, profile: PROFILE, version: "1" },
+      interactionMode: "background",
+      expectDeps: emptyExpectDeps,
+      getForeground: async () => reads[Math.min(readIndex++, reads.length - 1)]!
+    }
+  );
+  assert.equal(result.success, true);
+  const report = result.interaction!;
+  assert.equal(report.foregroundBefore, "A");
+  assert.equal(report.foregroundAfter, "A");
+  assert.equal(report.foregroundChanged, false, "final foreground equals the start");
+  assert.equal(report.foregroundChangedDuringRun, true, "a step changed the foreground during the run - never hidden by the restore");
+  assert.equal(report.foregroundRestored, true, "the final read restored the start window");
+  assert.equal(report.targetActivated, true, "step activation is aggregated");
+  assert.equal(report.physicalCursorMoved, false);
+});
+
+test("pipeline interaction reports an un-restored foreground honestly", async () => {
+  // The final re-read differs from the start: background mode reports
+  // foregroundChanged=true / foregroundRestored=false + a warning, WITHOUT
+  // failing the already-completed business steps.
+  const reads = ["A", "B"];
+  let readIndex = 0;
+  const result = await runPipeline(
+    { steps: [{ id: "a", tool: "read_clipboard" }] },
+    {
+      dispatch: async () => ({ available: true, text: "x", length: 1, timestamp: "t" }),
+      pack: { id: "fixture", actions: FOREGROUND_REQUIRED_ACTIONS, profile: PROFILE, version: "1" },
+      interactionMode: "background",
+      expectDeps: emptyExpectDeps,
+      getForeground: async () => reads[Math.min(readIndex++, reads.length - 1)]!
+    }
+  );
+  assert.equal(result.success, true, "business steps are not failed by a foreground side effect");
+  const report = result.interaction!;
+  assert.equal(report.foregroundChanged, true);
+  assert.equal(report.foregroundRestored, false);
+  assert.ok(result.warnings.some((w) => w.startsWith("BACKGROUND_FOREGROUND_NOT_RESTORED")), `expected warning, got: ${JSON.stringify(result.warnings)}`);
+});
+
+test("background preflight refuses a foregroundRequired FINALLY step before the main flow executes", async () => {
+  let dispatched = 0;
+  const result = await runPipeline(
+    {
+      steps: [
+        { id: "main", tool: "profile_action", args: { profile: "fixture", control: "sampleButton", action: "invoke" } }
+      ],
+      finally: [
+        { id: "cleanupDialog", tool: "profile_action", args: { profile: "fixture", control: "sampleCombo", action: "selectByName" } }
+      ]
+    },
+    {
+      dispatch: async () => { dispatched++; return { ok: true }; },
+      pack: { id: "fixture", actions: FOREGROUND_REQUIRED_ACTIONS, profile: PROFILE, version: "1" },
+      interactionMode: "background",
+      expectDeps: emptyExpectDeps
+    }
+  );
+  assert.equal(result.success, false);
+  assert.equal(result.error?.code, "PIPELINE_NOT_BACKGROUND_SAFE");
+  const details = result.error?.details as { unsafeSteps?: Array<{ stepId?: string; section?: string; backgroundPolicy: string }> };
+  assert.equal(details?.unsafeSteps?.length, 1);
+  assert.equal(details?.unsafeSteps?.[0]?.stepId, "cleanupDialog");
+  assert.equal(details?.unsafeSteps?.[0]?.section, "finally");
+  assert.equal(details?.unsafeSteps?.[0]?.backgroundPolicy, "foregroundRequired");
+  assert.equal(dispatched, 0, "the main flow must not execute when finally is unsafe");
+  assert.equal(result.steps.length, 0);
+
+  // The unified helper marks sections explicitly.
+  const flagged = backgroundUnsafePipelineSteps(
+    [{ id: "main", tool: "profile_action", args: { profile: "fixture", control: "sampleButton", action: "invoke" } }],
+    [{ id: "cleanupDialog", tool: "profile_action", args: { profile: "fixture", control: "sampleCombo", action: "selectByName" } }],
+    () => FOREGROUND_REQUIRED_ACTIONS,
+    FOREGROUND_REQUIRED_ACTIONS
+  );
+  assert.equal(flagged.length, 1);
+  assert.equal(flagged[0]!.section, "finally");
+});
+
+test("background pipeline with background-safe finally runs to completion", async () => {
+  const result = await runPipeline(
+    {
+      steps: [
+        { id: "main", tool: "profile_action", args: { profile: "fixture", control: "sampleButton", action: "invoke" } }
+      ],
+      finally: [
+        { id: "cleanup", tool: "profile_action", args: { profile: "fixture", control: "sampleButton", action: "invoke" } }
+      ]
+    },
+    {
+      dispatch: async () => ({ profile: "fixture", control: "sampleButton", result: { success: true } }),
+      pack: { id: "fixture", actions: FOREGROUND_REQUIRED_ACTIONS, profile: PROFILE, version: "1" },
+      interactionMode: "background",
+      expectDeps: emptyExpectDeps
+    }
+  );
+  assert.equal(result.success, true);
+  assert.equal(result.steps.length, 1);
+  assert.equal(result.finallyResults.length, 1);
+  assert.equal(result.finallyResults[0]!.success, true);
+  assert.equal(result.interaction?.requestedMode, "background");
 });

@@ -13,6 +13,7 @@
 // NEVER presented as resumable with silently dropped state.
 
 import { randomUUID } from "node:crypto";
+import type { StoredInteractionContext } from "./interaction.js";
 
 export const RUN_TTL_MS = 10 * 60 * 1000;
 export const MAX_RUNS = 20;
@@ -61,6 +62,9 @@ export type RunSnapshot = {
   inputs?: Record<string, unknown>;
   maxSteps: number;
   totalTimeoutMs: number;
+  // The RESOLVED interaction context of the original run. continue_run reuses
+  // it verbatim (never re-derives the mode from current pack defaults).
+  interaction?: StoredInteractionContext;
   // Continuability: false when the snapshot had to be truncated beyond what
   // can honestly be resumed.
   continuable: boolean;

@@ -10,6 +10,7 @@ import { getContract } from "../src/contracts.js";
 import type { PackActions, PackDefaultExpect } from "../src/app-packs/types.js";
 import type { AppProfile } from "../src/profiles/types.js";
 import { clearAllRuns, getRun, saveRun, type RunSnapshot } from "../src/runs.js";
+import { resolveContinuationInteraction, type StoredInteractionContext } from "../src/interaction.js";
 import { McpUiError } from "../src/uia/results.js";
 
 // ── mocks ──
@@ -1280,4 +1281,69 @@ test("page restore verification re-queries: target page must no longer be select
   assert.equal(restore.success, false);
   assert.equal(restore.code, "RESTORE_VERIFICATION_FAILED");
   assert.match(String(restore.actual), /still selected|Settings/, "verification must observe the still-selected target page");
+});
+
+// ── continue_run interaction-context inheritance ──
+
+test("continue_run inherits the stored background interaction mode (not the current pack default)", async () => {
+  clearAllRuns();
+  const snapshot = makeSnapshot({
+    interaction: { requestedMode: "background", effectiveMode: "background", allowForegroundFallback: false },
+    input: {
+      steps: [
+        { id: "launch", tool: "profile_launch", args: {} },
+        { id: "act", tool: "profile_action", args: { control: "combo", action: "selectByName" } }
+      ]
+    }
+  });
+  saveRun(snapshot);
+
+  // The stored mode must win over a CURRENT pack default of auto.
+  const resolved = resolveContinuationInteraction(snapshot.interaction, "auto");
+  assert.equal(resolved.mode, "background");
+  assert.equal(resolved.contextMissing, false);
+
+  // The continuation actually runs under that mode: a remaining
+  // foregroundRequired step is refused up front (proof the mode was NOT
+  // dropped to auto, which would dispatch it and fail with "must not dispatch").
+  const ctx = makeCtx({
+    tools: { profile_action: () => { throw new Error("must not dispatch"); } },
+    actions: fakeActions([
+      { control: "combo", action: "selectByName", backgroundPolicy: "foregroundRequired", idempotent: false }
+    ])
+  });
+  const result = await continuePipeline({
+    runId: "run_test",
+    continueFrom: "act",
+    ctx: { ...ctx, interactionMode: resolved.mode },
+    checkProcessAlive: async () => true,
+    checkHwndValid: async () => true,
+    getPackVersion: () => "1.0.0"
+  });
+  assert.equal(result.success, false);
+  assert.equal(result.error?.code, "PIPELINE_NOT_BACKGROUND_SAFE");
+  const details = result.error?.details as { unsafeSteps?: Array<{ stepId?: string; section?: string }> };
+  assert.equal(details?.unsafeSteps?.[0]?.stepId, "act");
+});
+
+test("continue_run inherits the stored foregroundDemo options verbatim", () => {
+  const stored: StoredInteractionContext = {
+    requestedMode: "foregroundDemo",
+    effectiveMode: "foregroundDemo",
+    foregroundDemo: { restorePreviousForeground: false, stepDelayMs: 250 },
+    allowForegroundFallback: false
+  };
+  // The stored demo mode + options win over a CURRENT pack default of
+  // background - no re-derivation.
+  const resolved = resolveContinuationInteraction(stored, "background");
+  assert.equal(resolved.mode, "foregroundDemo");
+  assert.deepEqual(resolved.interaction, { restorePreviousForeground: false, stepDelayMs: 250 });
+  assert.equal(resolved.contextMissing, false);
+
+  // A run whose snapshot predates interaction-context storage falls back to
+  // the pack default and flags the missing context.
+  const legacy = resolveContinuationInteraction(undefined, "background");
+  assert.equal(legacy.mode, "background");
+  assert.equal(legacy.interaction, undefined);
+  assert.equal(legacy.contextMissing, true);
 });
