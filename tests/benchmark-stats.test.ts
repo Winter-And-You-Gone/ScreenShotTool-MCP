@@ -11,7 +11,7 @@ import { computeBenchmarkStats, type BenchmarkReport } from "./smoke-first-use-p
 type IterationStats = {
   workflowFirstAttempt: boolean;
   workflowEventually: boolean;
-  continueRecovery: boolean;
+  continueRecoverySuccesses: number;
   continueAttempts: number;
   pipelineFirstAttempt: boolean;
   pipelineEventually: boolean;
@@ -26,7 +26,7 @@ function iter(overrides: Partial<IterationStats> = {}): IterationStats {
   return {
     workflowFirstAttempt: true,
     workflowEventually: true,
-    continueRecovery: false,
+    continueRecoverySuccesses: 0,
     continueAttempts: 0,
     pipelineFirstAttempt: true,
     pipelineEventually: true,
@@ -50,8 +50,8 @@ test("20 iterations, 0 continues -> continueRecoverySuccessRate is null (not 0)"
 
 test("20 iterations, 2 continues, 2 successes -> rate 1.0", () => {
   const all = [
-    iter({ continueAttempts: 1, continueRecovery: true }),
-    iter({ continueAttempts: 1, continueRecovery: true }),
+    iter({ continueAttempts: 1, continueRecoverySuccesses: 1 }),
+    iter({ continueAttempts: 1, continueRecoverySuccesses: 1 }),
     ...Array.from({ length: 18 }, () => iter())
   ];
   const report = computeBenchmarkStats(all);
@@ -62,7 +62,7 @@ test("20 iterations, 2 continues, 2 successes -> rate 1.0", () => {
 
 test("20 iterations, 4 continues, 1 success -> rate 0.25", () => {
   const all = [
-    iter({ continueAttempts: 1, continueRecovery: true }),
+    iter({ continueAttempts: 1, continueRecoverySuccesses: 1 }),
     iter({ continueAttempts: 1 }),
     iter({ continueAttempts: 1 }),
     iter({ continueAttempts: 1 }),
@@ -77,7 +77,7 @@ test("20 iterations, 4 continues, 1 success -> rate 0.25", () => {
 test("a continue success never changes the first-attempt count", () => {
   const all = [
     // First attempt FAILED; continue succeeded. firstAttempt must stay false.
-    iter({ workflowFirstAttempt: false, workflowEventually: true, continueAttempts: 1, continueRecovery: true }),
+    iter({ workflowFirstAttempt: false, workflowEventually: true, continueAttempts: 1, continueRecoverySuccesses: 1 }),
     iter(),
     iter()
   ];
@@ -91,7 +91,7 @@ test("failed continues still count as attempts", () => {
   const all = [
     iter({ continueAttempts: 1 }), // continue ran, failed
     iter({ continueAttempts: 1 }), // continue ran, failed
-    iter({ continueAttempts: 1, continueRecovery: true }) // continue ran, succeeded
+    iter({ continueAttempts: 1, continueRecoverySuccesses: 1 }) // continue ran, succeeded
   ];
   const report = computeBenchmarkStats(all);
   assert.equal(report.continueAttempts, 3);
@@ -136,4 +136,32 @@ test("report shape stays stable (README documents these fields)", () => {
   ]) {
     assert.ok(keys.includes(expected), `missing report field: ${expected}`);
   }
+});
+
+test("counts multiple successful continues in ONE iteration (boundary)", () => {
+  // A single iteration may run continue_run twice (workflow recovery AND
+  // pipeline recovery). Each successful call counts individually - the old
+  // boolean could only record one success per iteration.
+  const report = computeBenchmarkStats([
+    iter({ continueAttempts: 2, continueRecoverySuccesses: 2 })
+  ]);
+  assert.equal(report.continueAttempts, 2);
+  assert.equal(report.continueRecoverySuccessCount, 2);
+  assert.equal(report.continueRecoverySuccessRate, 1);
+});
+
+test("2 attempts, 1 success -> rate 0.5", () => {
+  const report = computeBenchmarkStats([
+    iter({ continueAttempts: 2, continueRecoverySuccesses: 1 })
+  ]);
+  assert.equal(report.continueRecoverySuccessCount, 1);
+  assert.equal(report.continueRecoverySuccessRate, 0.5);
+});
+
+test("2 attempts, 0 successes -> rate 0 (attempts happened)", () => {
+  const report = computeBenchmarkStats([
+    iter({ continueAttempts: 2, continueRecoverySuccesses: 0 })
+  ]);
+  assert.equal(report.continueRecoverySuccessCount, 0);
+  assert.equal(report.continueRecoverySuccessRate, 0);
 });

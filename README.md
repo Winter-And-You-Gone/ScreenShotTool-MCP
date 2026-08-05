@@ -298,7 +298,7 @@ npm run smoke:private-app-pack    # 私有 Pack 驱动（读 SCREENSHOT_MCP_TEST
 
 - `smoke:first-use-pipeline` 是 **fresh-process pipeline stability benchmark**（固定工作流的进程级稳定性）与 **contract-driven first-use simulation**（公开契约驱动的首次使用模拟）：每次迭代启动全新服务器进程，仅通过 `tools/list`、`app_pack_describe`、`workflow_catalog` 等公开能力驱动固定工作流。它**不是**真实大模型自主生成管道的测试。
 - 统计严格区分：`workflowFirstAttemptSuccessRate` / `pipelineFirstAttemptSuccessRate`（首次尝试，不含 continue 恢复）、`*EventuallySuccessRate`（最终成功，允许一次 continue_run 恢复）、`continueRecoverySuccessRate`、`cleanupSuccessRate`（finally 独立）、`infrastructureFailureCount`（服务器/传输失败，不计为工作流失败）。
-- `continueRecoverySuccessRate` 的分母是 **`continueAttempts`（实际 continue_run 调用次数）**，不是迭代次数；0 次尝试时返回 `null`（绝不用 0 伪装成"恢复全部失败"）。continue 成功从不改变 firstAttempt 统计。
+- `continueRecoverySuccessRate` 的分母是 **`continueAttempts`（实际 continue_run 调用次数）**，不是迭代次数；`continueRecoverySuccessCount` 表示**成功的 continue_run 调用次数**（同一 iteration 内多次 continue 各自独立计数），而非发生过恢复成功的 iteration 数量；0 次尝试时返回 `null`（绝不用 0 伪装成"恢复全部失败"）。continue 成功从不改变 firstAttempt 统计。
 - 环境前提：键盘类步骤（type_text / send_key）依赖前台焦点。残留的编辑器实例（多个同进程名窗口）或前台全屏程序会抢占焦点并拉低 first-attempt 成功率（实测：清理残留实例后 20/20）。
 - 真实不同模型的自主生成成功率需要单独评测：仅凭公开工具契约构造合法管道由 `smoke:public-contract-pipeline` 证明——该测试不导入任何 `src/` 实现，只通过 MCP 客户端读取契约并构造、校验、执行管道。
 

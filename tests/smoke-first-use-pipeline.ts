@@ -12,8 +12,9 @@
 // Metrics are tracked STRICTLY SEPARATELY (spec):
 //   workflowFirstAttemptSuccess - first run_workflow call succeeded
 //   workflowEventuallySuccess   - succeeded after at most one continue_run
-//   continueRecoverySuccess     - a failed first attempt recovered via
-//                                 continue_run (NEVER counts as first attempt)
+//   continueRecoverySuccesses   - number of successful continue_run calls
+//                                 (NEVER count as first attempts; multiple
+//                                 continues per iteration count individually)
 //   pipelineFirstAttemptSuccess - generic pipeline succeeded on first run
 //   pipelineEventuallySuccess   - ...or after one continue_run
 //   cleanupSuccessRate          - finally steps (independent)
@@ -30,7 +31,10 @@ const PACK = process.env.SCREENSHOT_MCP_TEST_PACK ?? "notepad";
 type IterationStats = {
   workflowFirstAttempt: boolean;
   workflowEventually: boolean;
-  continueRecovery: boolean;
+  // Count of SUCCESSFUL continue_run calls in this iteration (a single
+  // iteration may run continue_run more than once - e.g. workflow recovery
+  // AND pipeline recovery). Each success counts individually.
+  continueRecoverySuccesses: number;
   continueAttempts: number;
   pipelineFirstAttempt: boolean;
   pipelineEventually: boolean;
@@ -45,7 +49,7 @@ async function oneIteration(iteration: number): Promise<IterationStats> {
   const stats: IterationStats = {
     workflowFirstAttempt: false,
     workflowEventually: false,
-    continueRecovery: false,
+    continueRecoverySuccesses: 0,
     continueAttempts: 0,
     pipelineFirstAttempt: false,
     pipelineEventually: false,
@@ -113,7 +117,7 @@ async function oneIteration(iteration: number): Promise<IterationStats> {
           success: boolean; error?: { code?: string };
         };
         stats.toolCalls += 1;
-        stats.continueRecovery = cont.success === true;
+        if (cont.success === true) stats.continueRecoverySuccesses += 1;
         stats.workflowEventually = cont.success === true;
       }
     }
@@ -148,7 +152,7 @@ async function oneIteration(iteration: number): Promise<IterationStats> {
       stats.continueAttempts += 1;
       const cont = (await callTool(client, "continue_run", { runId: run.runId, continueFrom: 0 })) as { success: boolean };
       stats.toolCalls += 1;
-      stats.continueRecovery = stats.continueRecovery || cont.success === true;
+      if (cont.success === true) stats.continueRecoverySuccesses += 1;
       stats.pipelineEventually = cont.success === true;
     }
 
@@ -201,7 +205,7 @@ export function computeBenchmarkStats(all: IterationStats[]): BenchmarkReport {
   const rate = (k: keyof IterationStats) => count(k) / n;
   const avg = (k: keyof IterationStats) => all.reduce((a, s) => a + (s[k] as number), 0) / n;
   const continueAttempts = all.reduce((a, s) => a + s.continueAttempts, 0);
-  const continueRecoverySuccessCount = count("continueRecovery");
+  const continueRecoverySuccessCount = all.reduce((a, s) => a + s.continueRecoverySuccesses, 0);
   return {
     iterations: n,
     workflowFirstAttemptSuccessCount: count("workflowFirstAttempt"),
