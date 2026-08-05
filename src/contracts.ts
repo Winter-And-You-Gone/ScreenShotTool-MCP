@@ -389,6 +389,13 @@ const queryOutput = obj(
   ["found", "count", "elements", "truncated", "visitedNodes", "elapsedMs"]
 );
 
+// Nullable element fields: UIA providers report null for unsupported
+// patterns (e.g. value/toggleState/selected on a plain Pane), so the schema
+// must allow null on every optional state field.
+const nullableStr = (): JsonSchema => ({ anyOf: [{ type: "string" }, { type: "null" }] });
+const nullableInt = (): JsonSchema => ({ anyOf: [{ type: "integer" }, { type: "null" }] });
+const nullableBool = (): JsonSchema => ({ anyOf: [{ type: "boolean" }, { type: "null" }] });
+
 const getOutput = obj(
   {
     found: bool(),
@@ -397,13 +404,13 @@ const getOutput = obj(
         {
           type: "object",
           properties: {
-            value: str(),
-            selected: bool(),
+            value: nullableStr(),
+            selected: nullableBool(),
             // Real pre-action selection state when the provider exposes it
             // (never derived from action arguments).
-            selectedName: str(),
-            selectedIndex: int(),
-            toggleState: en(["On", "Off", "Indeterminate"]),
+            selectedName: nullableStr(),
+            selectedIndex: nullableInt(),
+            toggleState: { anyOf: [en(["On", "Off", "Indeterminate"]), { type: "null" }] },
             isPassword: bool(),
             valueProtected: bool()
           }

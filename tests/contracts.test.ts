@@ -100,6 +100,20 @@ test("launch_profile output schema matches the real result shape", () => {
   assert.equal(bad.ok, false, "profile is required");
 });
 
+test("ui_get outputSchema tolerates null element state fields (unsupported patterns)", () => {
+  // Providers report null for unsupported patterns (e.g. value/toggleState
+  // on a plain Pane); the output schema must accept them.
+  const schema = contracts.ui_get!.outputSchema;
+  const ok = validateAgainstSchema(
+    { found: true, element: { automationId: "pane", value: null, toggleState: null, selected: null, selectedName: null, selectedIndex: null, isPassword: false, valueProtected: false }, elapsedMs: 1 },
+    schema
+  );
+  assert.equal(ok.ok, true, `null element state must validate: ${JSON.stringify(ok)}`);
+  // element itself may be null (found:false).
+  const notFound = validateAgainstSchema({ found: false, element: null, elapsedMs: 1 }, schema);
+  assert.equal(notFound.ok, true);
+});
+
 test("getContract returns undefined for unknown tools", () => {
   assert.equal(getContract("not_a_tool"), undefined);
   assert.equal(getContract("run_steps")?.name, "run_steps");
