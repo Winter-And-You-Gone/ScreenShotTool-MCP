@@ -68,6 +68,13 @@ export type UiElementState = {
   toggleState: "On" | "Off" | "Indeterminate" | null;
   // Selection-item-pattern state (null when unsupported)
   selected: boolean | null;
+  // Best-effort original selection info. Providers rarely expose an index
+  // directly; when present it is the REAL position among the provider's
+  // items (0-based), NOT derived from any action argument. selectedName is
+  // the selected item's display text (equals `value` on ValuePattern
+  // controls). Both are optional because support varies per provider.
+  selectedName?: string | null;
+  selectedIndex?: number | null;
   // Expand-collapse-pattern state (null when unsupported)
   expandCollapseState: "Expanded" | "Collapsed" | "LeafNode" | "PartiallyExpanded" | null;
 };

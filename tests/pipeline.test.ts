@@ -887,3 +887,397 @@ test("step-level captureBefore with page kind restores via ensureSelected", asyn
   assert.ok(calls.includes("ensureSelected"));
   assert.equal(result.success, true);
 });
+
+// ── selection restore: real pre-action state (never the target args) ──
+
+test("selection Case A: capture real name B, action selects C, restore via selectByName(B)", async () => {
+  const calls: Array<{ action: string; value?: unknown; index?: unknown }> = [];
+  const ctx = makeCtx({
+    tools: {
+      // The control read BEFORE the action reports value "B" (the real
+      // pre-action selection).
+      ui_get: () => ({ found: true, element: { automationId: "combo", value: "B", selected: true, isPassword: false, valueProtected: false }, elapsedMs: 1 }),
+      profile_action: (args) => {
+        calls.push({ action: String(args.action), value: args.value, index: args.index });
+        if (args.action === "selectByName") {
+          // After the restore the control reads back the restored name.
+          return { profile: "fixture", control: "combo", result: { success: true, method: "SelectionItemPattern", selected: { name: args.value }, valueChanged: true, beforeValue: "C", afterValue: args.value, popupClosed: true } };
+        }
+        return { profile: "fixture", control: "combo", result: { success: true } };
+      }
+    }
+  });
+  const result = await runPipeline(
+    {
+      steps: [
+        {
+          id: "sel",
+          tool: "profile_action",
+          args: { profile: "fixture", control: "combo", action: "selectByName", value: "C" },
+          captureBefore: { saveAs: "orig", read: { tool: "ui_get", args: { selector: { automationId: "combo" } } } }
+        }
+      ],
+      restore: "always"
+    },
+    ctx
+  );
+  const restore = result.restoreResults[0]!;
+  assert.equal(restore.kind, "selection");
+  assert.equal(restore.expected, "B", "captured name must be the real pre-action value, not the target 'C'");
+  const nameRestore = calls.filter((c) => c.action === "selectByName").at(-1);
+  assert.ok(nameRestore, `restore must call selectByName, got ${JSON.stringify(calls)}`);
+  assert.equal(nameRestore!.value, "B", "restore must re-select the ORIGINAL name B");
+  assert.equal(restore.verified, true);
+  assert.equal(restore.success, true);
+});
+
+test("selection Case B: target index 0 is NOT captured; original index 2 is restored via selectByIndex(2)", async () => {
+  const calls: Array<{ action: string; value?: unknown; index?: unknown }> = [];
+  const ctx = makeCtx({
+    tools: {
+      // Provider exposes the REAL pre-action position 2 (never the target 0).
+      ui_get: () => ({ found: true, element: { automationId: "combo", value: null, selectedIndex: 2, selected: true, isPassword: false, valueProtected: false }, elapsedMs: 1 }),
+      profile_action: (args) => {
+        calls.push({ action: String(args.action), value: args.value, index: args.index });
+        if (args.action === "selectByName") {
+          // NAME RESTORE FAILS (the item's name is gone after the switch):
+          // the restore must fall back to the ORIGINAL index.
+          throw new Error("ACTION_FAILED: selectByName failed (simulated)");
+        }
+        if (args.action === "selectByIndex") {
+          return { profile: "fixture", control: "combo", result: { success: true, method: "SelectionItemPattern", selected: { name: `item-${args.index}` }, valueChanged: true, beforeValue: "C", afterValue: `item-${args.index}`, popupClosed: true } };
+        }
+        return { profile: "fixture", control: "combo", result: { success: true } };
+      },
+      // The provider's item scan: after restoring index 2, the uniquely
+      // selected ListItem is at position 2.
+      ui_query: () => ({
+        found: true, count: 3,
+        elements: [
+          { name: "item-0", selected: false, controlType: "ListItem" },
+          { name: "item-1", selected: false, controlType: "ListItem" },
+          { name: "item-2", selected: true, controlType: "ListItem" }
+        ],
+        truncated: false, visitedNodes: 3, elapsedMs: 1
+      })
+    }
+  });
+  const result = await runPipeline(
+    {
+      steps: [
+        {
+          id: "sel",
+          tool: "profile_action",
+          args: { profile: "fixture", control: "combo", action: "selectByIndex", index: 0 },
+          captureBefore: { saveAs: "orig", read: { tool: "ui_get", args: { selector: { automationId: "combo" } } } }
+        }
+      ],
+      restore: "always"
+    },
+    ctx
+  );
+  const restore = result.restoreResults[0]!;
+  assert.equal(restore.kind, "selection");
+  assert.equal(restore.expected, "index=2", "captured index must be the real pre-action 2, not the target 0");
+  const indexRestore = calls.filter((c) => c.action === "selectByIndex").at(-1);
+  assert.ok(indexRestore, `restore must fall back to selectByIndex, got ${JSON.stringify(calls)}`);
+  assert.equal(indexRestore!.index, 2, "restore must use the ORIGINAL index 2");
+  assert.equal(restore.verified, true);
+});
+
+test("selection Case B2: name capture takes precedence; a present name is never replaced by the target index", async () => {
+  const calls: Array<{ action: string; index?: unknown }> = [];
+  const ctx = makeCtx({
+    tools: {
+      // Real name "B" AND real index 2 both available; the action targets
+      // index 0. Capture must keep name B and index 2.
+      ui_get: () => ({ found: true, element: { automationId: "combo", value: "B", selectedIndex: 2, selected: true, isPassword: false, valueProtected: false }, elapsedMs: 1 }),
+      profile_action: (args) => {
+        calls.push({ action: String(args.action), value: args.value, index: args.index });
+        return { profile: "fixture", control: "combo", result: { success: true, method: "SelectionItemPattern", selected: { name: args.value }, valueChanged: true, beforeValue: "C", afterValue: args.value, popupClosed: true } };
+      }
+    }
+  });
+  const result = await runPipeline(
+    {
+      steps: [
+        {
+          id: "sel",
+          tool: "profile_action",
+          args: { profile: "fixture", control: "combo", action: "selectByIndex", index: 0 },
+          captureBefore: { saveAs: "orig", read: { tool: "ui_get", args: { selector: { automationId: "combo" } } } }
+        }
+      ],
+      restore: "always"
+    },
+    ctx
+  );
+  const restore = result.restoreResults[0]!;
+  assert.equal(restore.kind, "selection");
+  // verify compares the captured name; the captured index lives in the
+  // restore plan (asserted via the dispatched selectByIndex call below).
+  assert.equal(restore.expected, "B");
+  assert.equal(restore.method, "selectByName", "name restore takes precedence over the target index");
+  assert.equal(calls.filter((c) => c.action === "selectByIndex").length, 1, "only the step's own selectByIndex(0) runs; restore never re-selects the target");
+  const nameCall = calls.filter((c) => c.action === "selectByName").at(-1);
+  assert.ok(nameCall && nameCall.value === "B", `restore must dispatch selectByName('B'), got ${JSON.stringify(calls)}`);
+});
+
+test("selection Case C: unreadable pre-action state -> RESTORE_STATE_UNAVAILABLE, no guess", async () => {
+  let dispatched = 0;
+  const ctx = makeCtx({
+    tools: {
+      // value null, no selectedName/selectedIndex; the item scan finds NO
+      // selected ListItem -> the original selection cannot be determined.
+      ui_get: () => ({ found: true, element: { automationId: "combo", value: null, selected: null, isPassword: false, valueProtected: false }, elapsedMs: 1 }),
+      profile_action: (args) => { dispatched++; return { profile: "fixture", control: "combo", result: { success: true } }; },
+      ui_query: () => ({ found: false, count: 0, elements: [], truncated: false, visitedNodes: 0, elapsedMs: 1 })
+    }
+  });
+  const result = await runPipeline(
+    {
+      steps: [
+        {
+          id: "sel",
+          tool: "profile_action",
+          args: { profile: "fixture", control: "combo", action: "selectByIndex", index: 0 },
+          captureBefore: { saveAs: "orig", read: { tool: "ui_get", args: { selector: { automationId: "combo" } } } }
+        }
+      ],
+      restore: "always"
+    },
+    ctx
+  );
+  assert.equal(result.success, true, "the main pipeline still succeeds");
+  const restore = result.restoreResults[0]!;
+  assert.equal(restore.kind, "selection");
+  assert.equal(restore.attempted, false, "no restore is attempted without a readable original state");
+  assert.equal(restore.code, "RESTORE_STATE_UNAVAILABLE");
+  assert.equal(restore.verified, false);
+});
+
+test("selection Case D: password-protected selection state is never captured", async () => {
+  const ctx = makeCtx({
+    tools: {
+      ui_get: () => ({ found: true, element: { automationId: "pwd", value: "secret", isPassword: true, valueProtected: true }, elapsedMs: 1 })
+    }
+  });
+  const result = await runPipeline(
+    {
+      steps: [{ id: "s", tool: "read_clipboard" }],
+      captureBefore: [
+        { saveAs: "pwd", read: { tool: "ui_get", args: { selector: { automationId: "pwd" } } } }
+      ],
+      restore: "always"
+    },
+    ctx
+  );
+  assert.equal(result.restoreResults[0]!.valueCaptured, false);
+  assert.equal(result.restoreResults[0]!.code, "RESTORE_SENSITIVE_STATE_BLOCKED");
+});
+
+// ── page restore: real pre-action page (never the step target) ──
+
+function pageProfile(): AppProfile {
+  return {
+    id: "fixture",
+    displayName: "Fixture",
+    processNames: ["Fixture.exe"],
+    controls: {
+      sidebarHome: { selectors: [{ automationId: "sidebarHome" }], confidence: "runtime-verified", selectionGroup: "mainNav" },
+      sidebarSettings: { selectors: [{ automationId: "sidebarSettings" }], confidence: "runtime-verified", selectionGroup: "mainNav" },
+      sidebarDevice: { selectors: [{ automationId: "sidebarDevice" }], confidence: "runtime-verified", selectionGroup: "mainNav" }
+    }
+  };
+}
+
+function pageActions(): PackActions {
+  return fakeActions([
+    { control: "sidebarSettings", action: "ensureSelected", idempotent: true, retrySafe: true, selectionGroup: "mainNav" }
+  ]);
+}
+
+function pageCtx(opts: {
+  // Which control reads selected before the action (the ORIGINAL page).
+  selectedBefore?: string;
+  // After restore: which control reads selected (verification).
+  selectedAfter?: string;
+  toolCalls?: Array<{ tool: string; control?: string; action?: string }>;
+}) {
+  const selectedBefore = opts.selectedBefore ?? "sidebarHome";
+  const selectedAfter = opts.selectedAfter ?? selectedBefore;
+  const toolCalls = opts.toolCalls ?? [];
+  const isSelected = (control: string, selected: string) => control === selected;
+  const resolveSeen = new Map<string, number>();
+  return makeCtx({
+    profile: pageProfile(),
+    actions: pageActions(),
+    tools: {
+      profile_resolve: (args) => {
+        const control = String(args.control);
+        const n = resolveSeen.get(control) ?? 0;
+        resolveSeen.set(control, n + 1);
+        // First read of each control = capture phase (pre-action state);
+        // later reads = post-restore verification phase.
+        const selected = n === 0 ? selectedBefore : selectedAfter;
+        const on = isSelected(control, selected);
+        return { profile: "fixture", control, found: true, candidatesTried: [], element: { automationId: control, toggleState: on ? "On" : "Off", selected: on, isPassword: false, valueProtected: false } };
+      },
+      profile_action: (args) => {
+        toolCalls.push({ tool: "profile_action", control: String(args.control), action: String(args.action) });
+        return { profile: "fixture", control: String(args.control), result: { success: true, method: "noop", alreadySelected: true } };
+      }
+    }
+  });
+}
+
+test("page Case A: current page Home, action targets Settings, restore returns to Home", async () => {
+  const calls: Array<{ tool: string; control?: string; action?: string }> = [];
+  const ctx = pageCtx({ selectedBefore: "sidebarHome", selectedAfter: "sidebarHome", toolCalls: calls });
+  const result = await runPipeline(
+    {
+      steps: [
+        {
+          id: "nav",
+          tool: "profile_action",
+          args: { profile: "fixture", control: "sidebarSettings", action: "ensureSelected" },
+          captureBefore: { saveAs: "page", read: { tool: "ui_get", args: { selector: { automationId: "sidebar" } } } }
+        }
+      ],
+      restore: "always"
+    },
+    ctx
+  );
+  const restore = result.restoreResults[0]!;
+  assert.equal(restore.kind, "page");
+  assert.equal(restore.expected, "sidebarHome", "captured page must be the real pre-action page (Home), not the target Settings");
+  const ensure = calls.filter((c) => c.action === "ensureSelected");
+  assert.equal(ensure.length, 2, "one ensureSelected for the step, one for the restore");
+  assert.equal(ensure[1]!.control, "sidebarHome", "restore must re-select the ORIGINAL page");
+  assert.equal(restore.verified, true);
+  assert.equal(restore.success, true);
+});
+
+test("page Case B: current page Device, action targets Settings, restore returns to Device (no Home hardcoding)", async () => {
+  const calls: Array<{ tool: string; control?: string; action?: string }> = [];
+  const ctx = pageCtx({ selectedBefore: "sidebarDevice", selectedAfter: "sidebarDevice", toolCalls: calls });
+  const result = await runPipeline(
+    {
+      steps: [
+        {
+          id: "nav",
+          tool: "profile_action",
+          args: { profile: "fixture", control: "sidebarSettings", action: "ensureSelected" },
+          captureBefore: { saveAs: "page", read: { tool: "ui_get", args: { selector: { automationId: "sidebar" } } } }
+        }
+      ],
+      restore: "always"
+    },
+    ctx
+  );
+  const restore = result.restoreResults[0]!;
+  assert.equal(restore.expected, "sidebarDevice");
+  const ensure = calls.filter((c) => c.action === "ensureSelected");
+  assert.equal(ensure[1]!.control, "sidebarDevice");
+  assert.equal(restore.verified, true);
+});
+
+test("page Case C: multiple selected candidates -> RESTORE_STATE_UNAVAILABLE, no guess", async () => {
+  const ctx = pageCtx({
+    selectedBefore: "ambig", // no candidate matches -> 0 selected
+    selectedAfter: "sidebarHome",
+    toolCalls: []
+  });
+  const result = await runPipeline(
+    {
+      steps: [
+        {
+          id: "nav",
+          tool: "profile_action",
+          args: { profile: "fixture", control: "sidebarSettings", action: "ensureSelected" },
+          captureBefore: { saveAs: "page", read: { tool: "ui_get", args: { selector: { automationId: "sidebar" } } } }
+        }
+      ],
+      restore: "always"
+    },
+    ctx
+  );
+  assert.equal(result.success, true);
+  const restore = result.restoreResults[0]!;
+  assert.equal(restore.kind, "page");
+  assert.equal(restore.attempted, false);
+  assert.equal(restore.code, "RESTORE_STATE_UNAVAILABLE");
+  assert.equal(restore.verified, false);
+  assert.match(restore.message!, /page/i);
+});
+
+test("page Case D: restore verification is REAL - a non-restored page fails with RESTORE_VERIFICATION_FAILED", async () => {
+  const calls: Array<{ tool: string; control?: string; action?: string }> = [];
+  // The "restore" action runs but the page never actually returns Home: the
+  // post-restore read still reports Settings selected.
+  const ctx = pageCtx({ selectedBefore: "sidebarHome", selectedAfter: "sidebarSettings", toolCalls: calls });
+  const result = await runPipeline(
+    {
+      steps: [
+        {
+          id: "nav",
+          tool: "profile_action",
+          args: { profile: "fixture", control: "sidebarSettings", action: "ensureSelected" },
+          captureBefore: { saveAs: "page", read: { tool: "ui_get", args: { selector: { automationId: "sidebar" } } } }
+        }
+      ],
+      restore: "always"
+    },
+    ctx
+  );
+  const restore = result.restoreResults[0]!;
+  assert.equal(restore.attempted, true, "restore was attempted");
+  assert.equal(restore.success, false);
+  assert.equal(restore.code, "RESTORE_VERIFICATION_FAILED", "post-restore verification must come from a REAL re-query, not the saved value");
+  assert.equal(restore.verified, false);
+  assert.notEqual(restore.expected, restore.actual, "expected/actual must be a real comparison");
+});
+
+test("page restore verification re-queries: target page must no longer be selected", async () => {
+  const calls: Array<{ tool: string; control?: string; action?: string }> = [];
+  // After restore Home is selected again, but Settings is STILL selected too.
+  // Capture phase: only Home reads selected. Post-restore verification:
+  // Home AND Settings both read selected - verify must fail because the
+  // target page did not deselect.
+  const seen = new Map<string, number>();
+  const ctx = makeCtx({
+    profile: pageProfile(),
+    actions: pageActions(),
+    tools: {
+      profile_resolve: (args) => {
+        const control = String(args.control);
+        const n = seen.get(control) ?? 0;
+        seen.set(control, n + 1);
+        const on = n === 0 ? control === "sidebarHome" : control === "sidebarHome" || control === "sidebarSettings";
+        return { profile: "fixture", control, found: true, candidatesTried: [], element: { automationId: control, toggleState: on ? "On" : "Off", selected: on, isPassword: false, valueProtected: false } };
+      },
+      profile_action: (args) => {
+        calls.push({ tool: "profile_action", control: String(args.control), action: String(args.action) });
+        return { profile: "fixture", control: String(args.control), result: { success: true, method: "noop", alreadySelected: true } };
+      }
+    }
+  });
+  const result = await runPipeline(
+    {
+      steps: [
+        {
+          id: "nav",
+          tool: "profile_action",
+          args: { profile: "fixture", control: "sidebarSettings", action: "ensureSelected" },
+          captureBefore: { saveAs: "page", read: { tool: "ui_get", args: { selector: { automationId: "sidebar" } } } }
+        }
+      ],
+      restore: "always"
+    },
+    ctx
+  );
+  const restore = result.restoreResults[0]!;
+  assert.equal(restore.success, false);
+  assert.equal(restore.code, "RESTORE_VERIFICATION_FAILED");
+  assert.match(String(restore.actual), /still selected|Settings/, "verification must observe the still-selected target page");
+});

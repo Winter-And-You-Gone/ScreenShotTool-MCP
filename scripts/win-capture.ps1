@@ -3566,6 +3566,9 @@ function Invoke-UiAction {
     switch ($action) {
       "invoke" {
         if (Try-UiaPattern $live "Invoke" { param($p) $p.Invoke() }) { $method = "InvokePattern" }
+        # CheckBox-style controls expose TogglePattern without InvokePattern;
+        # for them invoke means toggle (standard UIA semantics).
+        elseif (Try-UiaPattern $live "Toggle" { param($p) $p.Toggle() }) { $method = "TogglePattern(invoke)" }
         elseif (Invoke-KeyboardFallback $live $targetHwnd "Enter") { $method = "Keyboard.Enter"; $fallbackUsed = $true }
         elseif ($allowFallback -and (Invoke-CoordinateClick -Element $live -TargetHwnd $targetHwnd -AllowFallback $true)) { $method = "coordinate_click_fallback"; $fallbackUsed = $true }
         else { Throw-UiaError "PATTERN_NOT_SUPPORTED" "Element does not support InvokePattern and no keyboard/click fallback is available." ([ordered]@{ selector = $Target.selector; patterns = $stateBefore.patterns; stage = "invoke" }) }

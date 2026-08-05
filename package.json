@@ -31,7 +31,8 @@
     "smoke:first-use-pipeline": "tsx tests/smoke-first-use-pipeline.ts",
     "smoke:private-app-pack": "tsx tests/smoke-private-pack.ts",
     "smoke:workflow": "tsx tests/smoke-workflow.ts",
-    "smoke:public-contract-pipeline": "tsx tests/smoke-public-contract-pipeline.ts"
+    "smoke:public-contract-pipeline": "tsx tests/smoke-public-contract-pipeline.ts",
+    "smoke:page-fixture": "tsx tests/smoke-page-fixture.ts"
   },
   "engines": {
     "node": ">=20"

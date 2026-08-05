@@ -168,19 +168,41 @@ function firstFailedStep(wf: { steps: Array<{ success: boolean; error?: { code?:
   return idx >= 0 ? idx : undefined;
 }
 
-async function main() {
-  const all: IterationStats[] = [];
-  for (let i = 0; i < ITERATIONS; i++) {
-    all.push(await oneIteration(i));
-    process.stderr.write(`iteration ${i + 1}/${ITERATIONS} done\n`);
-  }
+// ── statistics (pure, unit-testable) ──
+//
+// continueRecoverySuccessRate = continueRecoverySuccessCount /
+// continueAttempts (the REAL number of continue_run calls), and is `null`
+// when no continue was attempted - never 0, which would read as "all
+// recoveries failed".
+export type BenchmarkReport = {
+  iterations: number;
+  workflowFirstAttemptSuccessCount: number;
+  workflowFirstAttemptSuccessRate: number;
+  workflowEventuallySuccessCount: number;
+  workflowEventuallySuccessRate: number;
+  pipelineFirstAttemptSuccessCount: number;
+  pipelineFirstAttemptSuccessRate: number;
+  pipelineEventuallySuccessCount: number;
+  pipelineEventuallySuccessRate: number;
+  continueAttempts: number;
+  continueRecoverySuccessCount: number;
+  continueRecoverySuccessRate: number | null;
+  cleanupSuccessCount: number;
+  cleanupSuccessRate: number;
+  validationFailureRate: number;
+  infrastructureFailureCount: number;
+  averageToolCalls: number;
+  averagePipelineSteps: number;
+};
 
+export function computeBenchmarkStats(all: IterationStats[]): BenchmarkReport {
   const n = all.length;
   const count = (k: keyof IterationStats) => all.filter((s) => s[k]).length;
   const rate = (k: keyof IterationStats) => count(k) / n;
   const avg = (k: keyof IterationStats) => all.reduce((a, s) => a + (s[k] as number), 0) / n;
-
-  const report = {
+  const continueAttempts = all.reduce((a, s) => a + s.continueAttempts, 0);
+  const continueRecoverySuccessCount = count("continueRecovery");
+  return {
     iterations: n,
     workflowFirstAttemptSuccessCount: count("workflowFirstAttempt"),
     workflowFirstAttemptSuccessRate: +rate("workflowFirstAttempt").toFixed(3),
@@ -190,15 +212,27 @@ async function main() {
     pipelineFirstAttemptSuccessRate: +rate("pipelineFirstAttempt").toFixed(3),
     pipelineEventuallySuccessCount: count("pipelineEventually"),
     pipelineEventuallySuccessRate: +rate("pipelineEventually").toFixed(3),
-    continueAttempts: all.reduce((a, s) => a + s.continueAttempts, 0),
-    continueRecoverySuccessCount: count("continueRecovery"),
-    continueRecoverySuccessRate: +rate("continueRecovery").toFixed(3),
+    continueAttempts,
+    continueRecoverySuccessCount,
+    // denominator = actual continue attempts; null when none happened.
+    continueRecoverySuccessRate: continueAttempts === 0 ? null : +(continueRecoverySuccessCount / continueAttempts).toFixed(3),
+    cleanupSuccessCount: count("cleanup"),
     cleanupSuccessRate: +rate("cleanup").toFixed(3),
     validationFailureRate: +rate("validationRejected").toFixed(3),
     infrastructureFailureCount: count("infrastructureFailure"),
     averageToolCalls: +avg("toolCalls").toFixed(1),
     averagePipelineSteps: +avg("pipelineSteps").toFixed(1)
   };
+}
+
+async function main() {
+  const all: IterationStats[] = [];
+  for (let i = 0; i < ITERATIONS; i++) {
+    all.push(await oneIteration(i));
+    process.stderr.write(`iteration ${i + 1}/${ITERATIONS} done\n`);
+  }
+
+  const report = computeBenchmarkStats(all);
   console.log(JSON.stringify(report, null, 2));
 
   // Targets use the TRUE first-attempt rates only. A continue_run recovery
@@ -211,6 +245,7 @@ async function main() {
   console.log(`targets (first attempt only): verified workflow >= ${wfTarget}% (${(report.workflowFirstAttemptSuccessRate * 100).toFixed(1)}%) -> ${wfOk ? "MET" : "NOT MET"}`);
   console.log(`targets (first attempt only): generic pipeline >= ${genTarget}% (${(report.pipelineFirstAttemptSuccessRate * 100).toFixed(1)}%) -> ${genOk ? "MET" : "NOT MET"}`);
   console.log(`infrastructure failures: ${report.infrastructureFailureCount} -> ${noInfra ? "OK" : "FAIL"}`);
+  console.log(`continue attempts: ${report.continueAttempts}, continue recovery rate: ${report.continueRecoverySuccessRate === null ? "null (no attempts)" : report.continueRecoverySuccessRate}`);
 
   if (!wfOk || !genOk || !noInfra) {
     console.error("first-use benchmark did not meet its targets; see the breakdown above.");
@@ -219,7 +254,13 @@ async function main() {
   console.log("smoke-first-use-pipeline: PASS");
 }
 
-main().catch((err) => {
-  console.error(err);
-  process.exit(1);
-});
+// Only run the benchmark when this file is executed directly (unit tests
+// import computeBenchmarkStats without spawning servers).
+const isDirectRun = process.argv[1] !== undefined
+  && import.meta.url === new URL(`file://${process.argv[1].replace(/\\/g, "/")}`).href;
+if (isDirectRun) {
+  main().catch((err) => {
+    console.error(err);
+    process.exit(1);
+  });
+}

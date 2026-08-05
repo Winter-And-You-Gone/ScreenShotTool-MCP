@@ -66,6 +66,10 @@ export type PackControlEntry = {
   confidence?: SelectorConfidence | "stable" | "conditionally-stable" | "fragile";
   description?: string;
   notes?: string;
+  // Page-navigation group: controls in the same group are mutually exclusive
+  // pages (e.g. sidebar nav). Used by state capture/restore to find the
+  // ACTUALLY selected page before a navigation action.
+  selectionGroup?: string;
   // Menu-routing hints for composite actions. All optional; when absent the
   // core falls back to generic behavior. This is how app-specific menu
   // structure is expressed WITHOUT core code changes.
@@ -130,6 +134,9 @@ export type PackActionContract = {
   preferredMethod?: string;
   fallbackPolicy?: "default" | "disabled";
   maxAttempts?: number;
+  // Page-navigation group this control belongs to (optional; must match the
+  // controls' own selectionGroup when both are declared).
+  selectionGroup?: string;
 };
 
 export type PackActions = {

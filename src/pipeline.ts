@@ -13,6 +13,7 @@ import type { ToolContract } from "./contracts.js";
 import { getContract } from "./contracts.js";
 import type { PackActions, PackDefaultExpect, PackWorkflowStep } from "./app-packs/types.js";
 import type { AppProfile } from "./profiles/types.js";
+import { normalizeControlEntry } from "./profiles/types.js";
 import { evaluateExpect, type ExpectContext, type ExpectResult } from "./expect.js";
 import { extractReferenceHeads, resolvePlaceholdersEx, validateReferences, type PipeContext } from "./piping.js";
 import { estimateJsonBytes, isSensitiveFieldName, MAX_PIPELINE_RESULT_BYTES, MAX_STEP_RESULT_BYTES } from "./outputs.js";
@@ -443,6 +444,10 @@ function isStepIdempotent(ctx: StaticValidationContext, step: PipelineStepInput)
 export type ExecutionContext = {
   dispatch: StepDispatcher;
   pack?: { id: string; actions: PackActions; profile: AppProfile; version?: string };
+  // Resolve an App Profile by id from the server's pack registry. Needed by
+  // page/selection capture for run_steps pipelines that carry a profile in
+  // their step args but no pack context.
+  resolveProfile?: (profileId: string) => AppProfile | undefined;
   inputs?: Record<string, unknown>;
   autoContext?: { profile?: string; pid?: number; hwnd?: string; title?: string };
   expectDeps: ExpectContext;
@@ -460,15 +465,29 @@ export type ExecutionContext = {
 export type CapturedState =
   | { kind: "value"; value: string }
   | { kind: "toggle"; checked: boolean }
+  // Real PRE-ACTION selection state. name = the actually selected item's
+  // display text at capture time; index = its real 0-based position among the
+  // provider's items when reliably readable. NEVER derived from the step's
+  // target arguments (step.args.value / step.args.index are the DESTINATION).
   | { kind: "selection"; name?: string; index?: number }
   | { kind: "range"; value: number }
   | { kind: "expanded"; expanded: boolean }
   | { kind: "visibility"; visible: boolean }
-  | { kind: "page"; control: string };
+  // Real PRE-ACTION page: the logical control that was actually selected
+  // (toggleState On / selected true) before the navigation step. Never the
+  // step's target control.
+  | { kind: "page"; profile?: string; control?: string };
 
 export type CapturedValue = {
   key: string;
-  state: CapturedState;
+  stepId?: string;
+  // null when the pre-action state could not be determined (captureFailed).
+  state: CapturedState | null;
+  // The intended state kind when state is null (capture failed).
+  kind?: CapturedState["kind"];
+  // True when the state could not be read before the action; restore then
+  // reports RESTORE_STATE_UNAVAILABLE instead of guessing.
+  captureFailed?: boolean;
   protected: boolean;
   readTool: string;
   readArgs: Record<string, unknown>;
@@ -491,6 +510,366 @@ function captureKindForAction(action: string | undefined): CapturedState["kind"]
   }
 }
 
+// The UIA element fields the state handlers rely on.
+type ElementLike = {
+  isPassword?: boolean;
+  valueProtected?: boolean;
+  value?: string | null;
+  selectedName?: string | null;
+  selectedIndex?: number | null;
+  toggleState?: string | null;
+  selected?: boolean | null;
+  rangeValue?: number | null;
+  expandCollapseState?: string | null;
+  offscreen?: boolean;
+};
+
+type CaptureContext = {
+  element?: ElementLike;
+  readArgs: Record<string, unknown>;
+  ctx: ExecutionContext;
+  step?: PipelineStepInput;
+};
+
+type RestorePlan = { action: string; restoreArgs: { tool: string; args: Record<string, unknown> } } | { action: null };
+
+type StateHandler = {
+  capture(c: CaptureContext): Promise<CapturedState | undefined>;
+  restoreAction(entry: CapturedValue): RestorePlan;
+  verify(entry: CapturedValue, ctx: ExecutionContext): Promise<{ ok: boolean; expected: string; actual: string }>;
+};
+
+// Extract window-context fields from a read/capture args object.
+function windowFields(args: Record<string, unknown>): { hwnd?: string | number; pid?: number; processName?: string; titleContains?: string } {
+  return {
+    ...(args.hwnd !== undefined ? { hwnd: args.hwnd as string | number } : {}),
+    ...(args.pid !== undefined ? { pid: args.pid as number } : {}),
+    ...(args.processName !== undefined ? { processName: args.processName as string } : {}),
+    ...(args.titleContains !== undefined ? { titleContains: args.titleContains as string } : {})
+  };
+}
+
+// Scan the control's popup for the uniquely selected ListItem. This is a
+// REAL read of the provider's current selection (name + position), never a
+// guess from action arguments.
+async function scanSelectedListItem(ctx: ExecutionContext, readArgs: Record<string, unknown>): Promise<{ name?: string; index?: number } | undefined> {
+  try {
+    const q = await ctx.dispatch("ui_query", {
+      ...windowFields(readArgs),
+      selector: { controlType: "ListItem" },
+      includeProcessPopups: true,
+      maxDepth: 15,
+      maxResults: 200,
+      timeoutMs: 8000
+    });
+    const elements = (q as { elements?: Array<{ selected?: boolean | null; name?: string }> }).elements ?? [];
+    const selected = elements.filter((e) => e.selected === true);
+    if (selected.length === 1) {
+      const pos = elements.indexOf(selected[0]!);
+      return { name: selected[0]!.name, index: pos >= 0 ? pos : undefined };
+    }
+    return undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+// Read whether a logical control is currently selected (toggle On / selected
+// true). Returns undefined when the state cannot be determined. The window
+// context (hwnd/pid) from the step is forwarded so resolve targets the right
+// window even when the app exposes several top-level windows.
+async function isControlSelected(ctx: ExecutionContext, control: string, window?: { hwnd?: string | number; pid?: number }, profile?: AppProfile): Promise<boolean | undefined> {
+  const resolved = profile ?? ctx.pack?.profile;
+  if (!resolved) return undefined;
+  try {
+    const r = await ctx.dispatch("profile_resolve", {
+      profile: resolved.id,
+      control,
+      ...(window?.hwnd !== undefined ? { hwnd: window.hwnd } : {}),
+      ...(window?.pid !== undefined ? { pid: window.pid } : {}),
+      includeProcessPopups: true,
+      maxDepth: 15,
+      maxNodes: 2000,
+      timeoutMs: 8000
+    });
+    const element = (r as { element?: ElementLike }).element;
+    if (!element) return undefined;
+    if (element.toggleState !== null && element.toggleState !== undefined) return element.toggleState === "On";
+    if (element.selected !== null && element.selected !== undefined) return element.selected === true;
+    return undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+// Determine the ACTUAL pre-action selected page: the unique control in the
+// step's selectionGroup whose state reads selected. 0 or >1 candidates ->
+// undefined (RESTORE_STATE_UNAVAILABLE), never a guess.
+async function captureOriginalPage(ctx: ExecutionContext, step: PipelineStepInput): Promise<{ kind: "page"; profile?: string; control?: string } | undefined> {
+  const stepProfileId = step.args?.profile as string | undefined;
+  const profile = ctx.pack?.profile ?? (stepProfileId && ctx.resolveProfile ? ctx.resolveProfile(stepProfileId) : undefined);
+  if (!profile) return undefined;
+  const stepControl = step.args?.control as string | undefined;
+  if (!stepControl) return undefined;
+  // Page group: the step's own control declares selectionGroup, or the pack
+  // action contract for (control, action) declares one.
+  let group: string | undefined;
+  const ownEntry = normalizeControlEntry(profile.controls[stepControl]);
+  if (ownEntry?.selectionGroup) group = ownEntry.selectionGroup;
+  if (!group && ctx.pack) {
+    const action = step.args?.action as string | undefined;
+    const contract = ctx.pack.actions.contracts.find((c) => c.control === stepControl && c.action === action);
+    group = contract?.selectionGroup;
+  }
+  if (!group) return undefined;
+
+  // Candidates: every profile control in the same group (including the step
+  // target - before the action it may or may not be the selected page).
+  const candidates = Object.entries(profile.controls)
+    .filter(([name, raw]) => {
+      if (name === stepControl && !ownEntry?.selectionGroup) return false; // target without a group decl is not a candidate
+      const entry = normalizeControlEntry(raw);
+      return entry?.selectionGroup === group;
+    })
+    .map(([name]) => name);
+  if (candidates.length < 2) return undefined;
+
+  const selectedPages: string[] = [];
+  const window = {
+    ...(step.args?.hwnd !== undefined ? { hwnd: step.args.hwnd as string | number } : {}),
+    ...(step.args?.pid !== undefined ? { pid: step.args.pid as number } : {})
+  };
+  for (const control of candidates) {
+    const selected = await isControlSelected(ctx, control, window, profile);
+    if (selected === true) selectedPages.push(control);
+  }
+  if (selectedPages.length !== 1) return undefined; // 0 or ambiguous
+  return { kind: "page", profile: profile.id, control: selectedPages[0]! };
+}
+
+// ── per-kind state handlers ──
+
+const STATE_HANDLERS: Record<CapturedState["kind"], StateHandler> = {
+  value: {
+    capture: ({ element }) => {
+      if (element && typeof element.value === "string") return Promise.resolve({ kind: "value", value: element.value });
+      return Promise.resolve(undefined);
+    },
+    restoreAction: (entry) => {
+      const s = entry.state as { kind: "value"; value: string };
+      return actionForTarget(entry, "setValue", { value: s.value });
+    },
+    verify: async (entry, ctx) => {
+      const s = entry.state as { kind: "value"; value: string };
+      const element = await readElement(entry, ctx);
+      if (!element) return { ok: false, expected: s.value, actual: "element not found" };
+      return { ok: element.value === s.value, expected: s.value, actual: String(element.value) };
+    }
+  },
+  toggle: {
+    capture: ({ element }) => {
+      if (element && element.toggleState !== null && element.toggleState !== undefined) {
+        return Promise.resolve({ kind: "toggle", checked: element.toggleState === "On" });
+      }
+      return Promise.resolve(undefined);
+    },
+    restoreAction: (entry) => {
+      const s = entry.state as { kind: "toggle"; checked: boolean };
+      return actionForTarget(entry, "setChecked", { value: s.checked ? "true" : "false" });
+    },
+    verify: async (entry, ctx) => {
+      const s = entry.state as { kind: "toggle"; checked: boolean };
+      const element = await readElement(entry, ctx);
+      if (!element) return { ok: false, expected: String(s.checked), actual: "element not found" };
+      return { ok: (element.toggleState === "On") === s.checked, expected: String(s.checked), actual: String(element.toggleState) };
+    }
+  },
+  selection: {
+    capture: async ({ element, readArgs, ctx }) => {
+      if (!element) return undefined;
+      // Real pre-action selection: from the read element first...
+      const name = typeof element.value === "string" && element.value.length > 0
+        ? element.value
+        : (element.selectedName ?? undefined);
+      let index = element.selectedIndex ?? undefined;
+      // ...then, when parts are missing, from a real scan of the provider's
+      // items (the uniquely selected ListItem's position). NEVER from
+      // step.args.value / step.args.index.
+      if (name === undefined || index === undefined) {
+        const scan = await scanSelectedListItem(ctx, readArgs);
+        if (scan) {
+          if (name === undefined && scan.name !== undefined) {
+            const merged: { kind: "selection"; name?: string; index?: number } = { kind: "selection", name: scan.name };
+            if (index !== undefined) merged.index = index;
+            else if (scan.index !== undefined) merged.index = scan.index;
+            return merged;
+          }
+          if (index === undefined && scan.index !== undefined) index = scan.index;
+        }
+      }
+      if (name === undefined && index === undefined) return undefined;
+      return { kind: "selection", ...(name !== undefined ? { name } : {}), ...(index !== undefined ? { index } : {}) };
+    },
+    restoreAction: (entry) => {
+      const s = entry.state as { kind: "selection"; name?: string; index?: number };
+      // Restore order: reliable name first, then the ORIGINAL index.
+      if (s.name !== undefined) return actionForTarget(entry, "selectByName", { value: s.name });
+      if (s.index !== undefined) return actionForTarget(entry, "selectByIndex", { index: s.index });
+      return { action: null };
+    },
+    verify: async (entry, ctx) => {
+      const s = entry.state as { kind: "selection"; name?: string; index?: number };
+      const element = await readElement(entry, ctx);
+      if (!element) return { ok: false, expected: s.name ?? `index=${s.index}`, actual: "element not found" };
+      // Name verification first; when the name is not readable back but an
+      // ORIGINAL index was captured, verify the index via a real item scan.
+      if (s.name !== undefined) {
+        const readName = element.value ?? element.selectedName ?? null;
+        if (readName === s.name) return { ok: true, expected: s.name, actual: String(readName) };
+        if (s.index !== undefined) {
+          const scan = await scanSelectedListItem(ctx, entry.readArgs);
+          if (scan && scan.index === s.index) return { ok: true, expected: `index=${s.index}`, actual: `index=${scan.index} name=${scan.name ?? "?"}` };
+        }
+        return { ok: false, expected: s.name, actual: String(readName) };
+      }
+      if (s.index !== undefined) {
+        const scan = await scanSelectedListItem(ctx, entry.readArgs);
+        if (!scan || scan.index === undefined) return { ok: false, expected: `index=${s.index}`, actual: "no uniquely selected item readable" };
+        return { ok: scan.index === s.index, expected: `index=${s.index}`, actual: `index=${scan.index} name=${scan.name ?? "?"}` };
+      }
+      return { ok: false, expected: "selection", actual: "no name/index captured" };
+    }
+  },
+  range: {
+    capture: ({ element }) => {
+      if (element && typeof element.rangeValue === "number") return Promise.resolve({ kind: "range", value: element.rangeValue });
+      return Promise.resolve(undefined);
+    },
+    restoreAction: (entry) => {
+      const s = entry.state as { kind: "range"; value: number };
+      return actionForTarget(entry, "setRangeValue", { rangeValue: s.value });
+    },
+    verify: async (entry, ctx) => {
+      const s = entry.state as { kind: "range"; value: number };
+      const element = await readElement(entry, ctx);
+      if (!element) return { ok: false, expected: String(s.value), actual: "element not found" };
+      return { ok: element.rangeValue === s.value, expected: String(s.value), actual: String(element.rangeValue) };
+    }
+  },
+  expanded: {
+    capture: ({ element }) => {
+      if (element && element.expandCollapseState !== null && element.expandCollapseState !== undefined) {
+        return Promise.resolve({ kind: "expanded", expanded: element.expandCollapseState === "Expanded" });
+      }
+      return Promise.resolve(undefined);
+    },
+    restoreAction: (entry) => {
+      const s = entry.state as { kind: "expanded"; expanded: boolean };
+      return actionForTarget(entry, s.expanded ? "expand" : "collapse");
+    },
+    verify: async (entry, ctx) => {
+      const s = entry.state as { kind: "expanded"; expanded: boolean };
+      const element = await readElement(entry, ctx);
+      if (!element) return { ok: false, expected: String(s.expanded), actual: "element not found" };
+      return { ok: (element.expandCollapseState === "Expanded") === s.expanded, expected: String(s.expanded), actual: String(element.expandCollapseState) };
+    }
+  },
+  visibility: {
+    capture: ({ element }) => {
+      if (element && element.offscreen !== undefined) return Promise.resolve({ kind: "visibility", visible: !element.offscreen });
+      return Promise.resolve(undefined);
+    },
+    restoreAction: () => ({ action: null }),
+    verify: async (entry, ctx) => {
+      const s = entry.state as { kind: "visibility"; visible: boolean };
+      const element = await readElement(entry, ctx);
+      if (!element) return { ok: false, expected: String(s.visible), actual: "element not found" };
+      return { ok: !element.offscreen === s.visible, expected: String(s.visible), actual: String(!element.offscreen) };
+    }
+  },
+  page: {
+    capture: async ({ ctx, step }) => {
+      if (!step) return undefined;
+      return captureOriginalPage(ctx, step);
+    },
+    restoreAction: (entry) => {
+      const s = entry.state as { kind: "page"; profile?: string; control?: string };
+      if (!s.control) return { action: null };
+      // Restore the ORIGINAL page control (never the step's target).
+      const profile = s.profile ?? (entry.stepArgs?.profile as string | undefined);
+      if (!profile) return { action: null };
+      return {
+        action: "ensureSelected",
+        restoreArgs: {
+          tool: "profile_action",
+          args: {
+            profile, control: s.control, action: "ensureSelected",
+            ...(entry.stepArgs?.hwnd !== undefined ? { hwnd: entry.stepArgs.hwnd } : {}),
+            ...(entry.stepArgs?.pid !== undefined ? { pid: entry.stepArgs.pid } : {})
+          }
+        }
+      };
+    },
+    verify: async (entry, ctx) => {
+      const s = entry.state as { kind: "page"; profile?: string; control?: string };
+      if (!s.control) return { ok: false, expected: "original page", actual: "no captured control" };
+      const window = {
+        ...(entry.stepArgs?.hwnd !== undefined ? { hwnd: entry.stepArgs.hwnd as string | number } : {}),
+        ...(entry.stepArgs?.pid !== undefined ? { pid: entry.stepArgs.pid as number } : {})
+      };
+      const verifyProfile = ctx.pack?.profile ?? (s.profile && ctx.resolveProfile ? ctx.resolveProfile(s.profile) : undefined);
+      // REAL re-query: the original control must read selected again...
+      const origSelected = await isControlSelected(ctx, s.control, window, verifyProfile);
+      if (origSelected !== true) {
+        return { ok: false, expected: `${s.control} selected=true`, actual: `${s.control} selected=${String(origSelected)}` };
+      }
+      // ...and the step's target page (if different) must no longer be selected.
+      const targetControl = entry.stepArgs?.control as string | undefined;
+      if (targetControl && targetControl !== s.control) {
+        const targetSelected = await isControlSelected(ctx, targetControl, window, verifyProfile);
+        if (targetSelected === true) {
+          return { ok: false, expected: `${targetControl} not selected`, actual: `${targetControl} still selected` };
+        }
+      }
+      return { ok: true, expected: s.control, actual: `${s.control} selected=true` };
+    }
+  }
+};
+
+// Build the reverse-action plan for value/toggle/range/expanded/selection on
+// the same target the capture came from (step tool + args, or ui_get args).
+function actionForTarget(entry: CapturedValue, action: string, extra: Record<string, unknown> = {}): RestorePlan {
+  const stepTool = entry.stepTool;
+  const stepArgs = entry.stepArgs;
+  if (stepTool === "profile_action" && stepArgs) {
+    return { action, restoreArgs: { tool: "profile_action", args: { ...stepArgs, action, ...extra } } };
+  }
+  if (stepTool === "ui_action" && stepArgs) {
+    return { action, restoreArgs: { tool: "ui_action", args: { ...stepArgs, action, ...extra } } };
+  }
+  if (entry.readTool === "ui_get") {
+    return { action, restoreArgs: { tool: "ui_action", args: { ...entry.readArgs, action, ...extra } } };
+  }
+  return { action: null };
+}
+
+// Re-read the captured control's element.
+async function readElement(entry: CapturedValue, ctx: ExecutionContext): Promise<ElementLike | null | undefined> {
+  const readTool = entry.readTool ?? "ui_get";
+  try {
+    const result = await ctx.dispatch(readTool, entry.readArgs);
+    const element = (result as { element?: ElementLike }).element;
+    if (element?.isPassword || element?.valueProtected) {
+      const err = new Error("RESTORE_SENSITIVE_STATE_BLOCKED") as Error & { code?: string };
+      err.code = "RESTORE_SENSITIVE_STATE_BLOCKED";
+      throw err;
+    }
+    return element;
+  } catch (error) {
+    throw error;
+  }
+}
+
 // Read a control's state before an action (for later restore). Password
 // fields are never captured (valueProtected).
 async function captureValue(
@@ -510,68 +889,67 @@ async function captureValue(
   } catch {
     return undefined;
   }
+  const readArgs = (read.args ?? {}) as Record<string, unknown>;
 
-  // Page selection: the target control IS the state (selected page); no read
-  // needed when the step itself names it.
+  // Page selection is captured from the profile's page group BEFORE the
+  // action runs - never from the step's target control.
   if (step && captureKindForAction(step.args?.action as string | undefined) === "page") {
-    const control = step.args?.control as string | undefined;
-    if (control) {
+    const state = await STATE_HANDLERS.page.capture({ readArgs, ctx, step });
+    if (!state) {
       return {
-        key: entry.saveAs,
-        state: { kind: "page", control },
-        protected: false,
-        readTool,
-        readArgs: (read.args ?? {}) as Record<string, unknown>,
-        stepTool: step.tool,
-        stepArgs: step.args as Record<string, unknown>
+        key: entry.saveAs, stepId: step.id, kind: "page", state: null, captureFailed: true,
+        protected: false, readTool, readArgs, stepTool: step.tool, stepArgs: step.args as Record<string, unknown>
       };
     }
+    return {
+      key: entry.saveAs,
+      stepId: step.id,
+      state,
+      protected: false,
+      readTool,
+      readArgs,
+      stepTool: step.tool,
+      stepArgs: step.args as Record<string, unknown>
+    };
   }
 
   try {
     const result = await ctx.dispatch(readTool, args);
-    const element = (result as { element?: { isPassword?: boolean; valueProtected?: boolean; value?: string | null; toggleState?: string | null; rangeValue?: number | null; expandCollapseState?: string | null; offscreen?: boolean } }).element;
+    const element = (result as { element?: ElementLike }).element;
     if (!element) return undefined;
     if (element.isPassword || element.valueProtected) {
-      return { key: entry.saveAs, state: { kind: "value", value: "" }, protected: true, readTool, readArgs: (read.args ?? {}) as Record<string, unknown> };
+      return { key: entry.saveAs, stepId: step?.id, state: { kind: "value", value: "" }, protected: true, readTool, readArgs };
     }
 
     const kind = step ? captureKindForAction(step.args?.action as string | undefined) : "auto";
     let state: CapturedState | undefined;
-    switch (kind) {
-      case "value":
-        if (typeof element.value === "string") state = { kind: "value", value: element.value };
-        break;
-      case "toggle":
-        if (element.toggleState !== null && element.toggleState !== undefined) state = { kind: "toggle", checked: element.toggleState === "On" };
-        break;
-      case "selection": {
-        const index = typeof step?.args?.index === "number" ? step.args.index : undefined;
-        state = { kind: "selection", ...(typeof element.value === "string" && element.value.length > 0 ? { name: element.value } : {}), ...(index !== undefined ? { index } : {}) };
-        break;
+    if (kind === "auto") {
+      // auto: prefer the most specific state the control exposes.
+      const autoOrder: CapturedState["kind"][] = ["toggle", "range", "expanded", "value"];
+      for (const k of autoOrder) {
+        const candidate = await STATE_HANDLERS[k].capture({ element, readArgs, ctx, step });
+        if (candidate) {
+          state = candidate;
+          break;
+        }
       }
-      case "range":
-        if (typeof element.rangeValue === "number") state = { kind: "range", value: element.rangeValue };
-        break;
-      case "expanded":
-        if (element.expandCollapseState !== null && element.expandCollapseState !== undefined) state = { kind: "expanded", expanded: element.expandCollapseState === "Expanded" };
-        break;
-      default: {
-        // auto: prefer the most specific state the control exposes.
-        if (element.toggleState !== null && element.toggleState !== undefined) state = { kind: "toggle", checked: element.toggleState === "On" };
-        else if (typeof element.rangeValue === "number") state = { kind: "range", value: element.rangeValue };
-        else if (element.expandCollapseState !== null && element.expandCollapseState !== undefined) state = { kind: "expanded", expanded: element.expandCollapseState === "Expanded" };
-        else if (typeof element.value === "string") state = { kind: "value", value: element.value };
-        break;
-      }
+    } else {
+      state = await STATE_HANDLERS[kind].capture({ element, readArgs, ctx, step });
     }
-    if (!state) return undefined;
+    if (!state) {
+      return {
+        key: entry.saveAs, stepId: step?.id, kind: kind === "auto" ? undefined : kind,
+        state: null, captureFailed: true, protected: false, readTool, readArgs,
+        ...(step ? { stepTool: step.tool, stepArgs: step.args as Record<string, unknown> } : {})
+      };
+    }
     return {
       key: entry.saveAs,
+      stepId: step?.id,
       state,
       protected: false,
       readTool,
-      readArgs: (read.args ?? {}) as Record<string, unknown>,
+      readArgs,
       ...(step ? { stepTool: step.tool, stepArgs: step.args as Record<string, unknown> } : {})
     };
   } catch {
@@ -581,11 +959,17 @@ async function captureValue(
 
 export type RestoreResult = {
   key: string;
+  stepId?: string;
+  kind: string;
   attempted: boolean;
   success: boolean;
-  kind?: string;
+  verified: boolean;
+  // RESTORE_STATE_UNAVAILABLE | RESTORE_VERIFICATION_FAILED |
+  // RESTORE_SENSITIVE_STATE_BLOCKED
+  code?: string;
   method?: string;
-  verified?: boolean;
+  expected?: unknown;
+  actual?: unknown;
   message?: string;
   valueCaptured?: boolean;
 };
@@ -603,13 +987,24 @@ async function runRestore(
   if (mode === "never" || (mode === "onFailure" && success)) return [];
   const results: RestoreResult[] = [];
   for (const entry of captured.values()) {
+    const entryKind = entry.state?.kind ?? entry.kind ?? "unknown";
     if (Date.now() > deadline) {
-      results.push({ key: entry.key, attempted: false, success: false, message: "Restore skipped: pipeline time budget exceeded.", valueCaptured: !entry.protected });
+      results.push({ key: entry.key, stepId: entry.stepId, kind: entryKind, attempted: false, success: false, verified: false, message: "Restore skipped: pipeline time budget exceeded.", valueCaptured: !entry.protected });
+      continue;
+    }
+    if (entry.captureFailed || entry.state === null) {
+      results.push({
+        key: entry.key, stepId: entry.stepId, kind: entryKind, attempted: false, success: false, verified: false,
+        code: "RESTORE_STATE_UNAVAILABLE",
+        message: `The original ${entryKind} state could not be reliably determined before the action; no restore was attempted and no guess was made (RESTORE_STATE_UNAVAILABLE).`,
+        valueCaptured: false
+      });
       continue;
     }
     if (entry.protected) {
       results.push({
-        key: entry.key, attempted: false, success: false,
+        key: entry.key, stepId: entry.stepId, kind: entryKind, attempted: false, success: false, verified: false,
+        code: "RESTORE_SENSITIVE_STATE_BLOCKED",
         message: "State not captured (password-protected); capture, restore, export and error echo are blocked.",
         valueCaptured: false
       });
@@ -624,115 +1019,110 @@ async function runRestore(
 // Restore one captured state with the matching reverse action, then VERIFY by
 // re-reading the control.
 async function restoreOne(entry: CapturedValue, ctx: ExecutionContext): Promise<RestoreResult> {
-  const base: RestoreResult = { key: entry.key, attempted: true, success: false, valueCaptured: true, kind: entry.state.kind };
+  // Capture-failed entries never reach restoreOne (runRestore reports
+  // RESTORE_STATE_UNAVAILABLE), but stay safe against null state anyway.
+  if (entry.state === null) {
+    return {
+      key: entry.key, stepId: entry.stepId, kind: entry.kind ?? "unknown",
+      attempted: false, success: false, verified: false, code: "RESTORE_STATE_UNAVAILABLE",
+      message: "The original state could not be determined; no restore was attempted (RESTORE_STATE_UNAVAILABLE).",
+      valueCaptured: false
+    };
+  }
+  const base: RestoreResult = {
+    key: entry.key, stepId: entry.stepId, kind: entry.state.kind,
+    attempted: true, success: false, verified: false, valueCaptured: true
+  };
   try {
-    const restorePlan = restoreActionFor(entry);
+    // Selection restore is multi-stage (spec 4.3): try the captured NAME
+    // first; when that fails, fall back to the ORIGINAL captured index.
+    if (entry.state.kind === "selection") {
+      return await restoreSelection(entry, ctx, base);
+    }
+
+    const handler = STATE_HANDLERS[entry.state.kind];
+    const restorePlan = handler.restoreAction(entry);
     if (restorePlan.action === null) {
-      return { ...base, message: `No restore action available for state kind '${entry.state.kind}' captured with '${entry.readTool}' (RESTORE_STATE_UNAVAILABLE).` };
+      return {
+        ...base,
+        code: "RESTORE_STATE_UNAVAILABLE",
+        message: `No restore action available for state kind '${entry.state.kind}' (the original state could not be reliably restored).`
+      };
     }
     await ctx.dispatch(restorePlan.restoreArgs.tool, restorePlan.restoreArgs.args);
-    // Verify by re-reading the same control.
-    const verified = await verifyRestore(entry, ctx);
+    // Verify by re-reading the control - never a self-fulfilling check.
+    const verified = await handler.verify(entry, ctx);
     return {
       ...base,
       success: verified.ok,
-      method: restorePlan.action,
       verified: verified.ok,
+      method: restorePlan.action,
+      expected: verified.expected,
+      actual: verified.actual,
+      ...(verified.ok ? {} : { code: "RESTORE_VERIFICATION_FAILED" }),
       message: verified.ok ? undefined : `Restore did not verify: expected ${verified.expected}, read ${verified.actual} (RESTORE_VERIFICATION_FAILED).`
     };
   } catch (error) {
     const code = (error as { code?: string }).code;
     const message = error instanceof Error ? error.message : String(error);
     if (code === "RESTORE_SENSITIVE_STATE_BLOCKED") {
-      return { ...base, success: false, message: "Password-protected state is never captured or restored (RESTORE_SENSITIVE_STATE_BLOCKED).", valueCaptured: false };
+      return { ...base, code: "RESTORE_SENSITIVE_STATE_BLOCKED", success: false, message: "Password-protected state is never captured or restored (RESTORE_SENSITIVE_STATE_BLOCKED).", valueCaptured: false };
     }
     return { ...base, message: `Restore failed: ${code ?? ""} ${message}`.trim() };
   }
 }
 
-// Build the reverse action for a captured state. Step-level captures restore
-// through the step's own tool with the same target; pipeline-level captures
-// restore through ui_action on the captured selector.
-function restoreActionFor(entry: CapturedValue): { action: string; restoreArgs: { tool: string; args: Record<string, unknown> } } | { action: null } {
-  const stepTool = entry.stepTool;
-  const stepArgs = entry.stepArgs;
-  const s = entry.state;
+// Multi-stage selection restore: name first, then the ORIGINAL index.
+async function restoreSelection(entry: CapturedValue, ctx: ExecutionContext, base: RestoreResult): Promise<RestoreResult> {
+  const s = entry.state as { kind: "selection"; name?: string; index?: number };
+  const handler = STATE_HANDLERS.selection;
 
-  if (s.kind === "page" && stepTool === "profile_action" && stepArgs) {
-    return { action: "ensureSelected", restoreArgs: { tool: "profile_action", args: { ...stepArgs, action: "ensureSelected" } } };
-  }
-
-  if (stepTool === "profile_action" && stepArgs) {
-    const target = (a: string, extra: Record<string, unknown> = {}) => ({ action: a, restoreArgs: { tool: "profile_action", args: { ...stepArgs, action: a, ...extra } } });
-    switch (s.kind) {
-      case "value": return target("setValue", { value: s.value });
-      case "toggle": return target("setChecked", { value: s.checked ? "true" : "false" });
-      case "selection":
-        if (s.name !== undefined) return target("selectByName", { value: s.name });
-        if (s.index !== undefined) return target("selectByIndex", { index: s.index });
-        return { action: null };
-      case "range": return target("setRangeValue", { rangeValue: s.value });
-      case "expanded": return target(s.expanded ? "expand" : "collapse");
-      default: return { action: null };
+  // Stage 1: reliable name -> selectByName -> verify the name.
+  if (s.name !== undefined) {
+    const plan = actionForTarget(entry, "selectByName", { value: s.name });
+    if (plan.action !== null) {
+      try {
+        await ctx.dispatch(plan.restoreArgs.tool, plan.restoreArgs.args);
+        const v = await handler.verify(entry, ctx);
+        if (v.ok) {
+          return { ...base, success: true, verified: true, method: "selectByName", expected: v.expected, actual: v.actual };
+        }
+      } catch (error) {
+        const code = (error as { code?: string }).code;
+        if (code === "RESTORE_SENSITIVE_STATE_BLOCKED") throw error;
+      }
+      // name stage failed -> fall through to the original index.
     }
   }
 
-  if (stepTool === "ui_action" && stepArgs) {
-    const target = (a: string, extra: Record<string, unknown> = {}) => ({ action: a, restoreArgs: { tool: "ui_action", args: { ...stepArgs, action: a, ...extra } } });
-    switch (s.kind) {
-      case "value": return target("setValue", { value: s.value });
-      case "toggle": return target("setChecked", { value: s.checked ? "true" : "false" });
-      case "range": return target("setRangeValue", { rangeValue: s.value });
-      case "expanded": return target(s.expanded ? "expand" : "collapse");
-      default: return { action: null };
+  // Stage 2: reliable ORIGINAL index -> selectByIndex(originalIndex).
+  if (s.index !== undefined) {
+    const plan = actionForTarget(entry, "selectByIndex", { index: s.index });
+    if (plan.action !== null) {
+      try {
+        await ctx.dispatch(plan.restoreArgs.tool, plan.restoreArgs.args);
+        const v = await handler.verify(entry, ctx);
+        if (v.ok) {
+          return { ...base, success: true, verified: true, method: "selectByIndex", expected: v.expected, actual: v.actual };
+        }
+        return {
+          ...base, code: "RESTORE_VERIFICATION_FAILED", method: "selectByIndex", verified: false,
+          expected: v.expected, actual: v.actual,
+          message: `Restore did not verify: expected ${v.expected}, read ${v.actual} (RESTORE_VERIFICATION_FAILED).`
+        };
+      } catch (error) {
+        const code = (error as { code?: string }).code;
+        if (code === "RESTORE_SENSITIVE_STATE_BLOCKED") throw error;
+        return { ...base, code: "RESTORE_VERIFICATION_FAILED", message: `Index restore failed: ${error instanceof Error ? error.message : String(error)} (RESTORE_VERIFICATION_FAILED).` };
+      }
     }
   }
 
-  // Pipeline-level capture (read via ui_get with a selector): restore via
-  // ui_action on the same selector.
-  if (entry.readTool === "ui_get") {
-    const selectorArgs = { ...entry.readArgs };
-    const target = (a: string, extra: Record<string, unknown> = {}) => ({ action: a, restoreArgs: { tool: "ui_action", args: { ...selectorArgs, action: a, ...extra } } });
-    switch (s.kind) {
-      case "value": return target("setValue", { value: s.value });
-      case "toggle": return target("setChecked", { value: s.checked ? "true" : "false" });
-      case "range": return target("setRangeValue", { rangeValue: s.value });
-      case "expanded": return target(s.expanded ? "expand" : "collapse");
-      // selection cannot be restored by name through ui_action
-      default: return { action: null };
-    }
-  }
-  return { action: null };
-}
-
-// Re-read the control and compare the captured state's field.
-async function verifyRestore(entry: CapturedValue, ctx: ExecutionContext): Promise<{ ok: boolean; expected: string; actual: string }> {
-  const s = entry.state;
-  const readTool = entry.readTool ?? "ui_get";
-  const readArgs = entry.readArgs;
-  let result: unknown;
-  try {
-    result = await ctx.dispatch(readTool, readArgs);
-  } catch (error) {
-    const code = (error as { code?: string }).code;
-    if (code === "RESTORE_SENSITIVE_STATE_BLOCKED") throw error;
-    return { ok: false, expected: String(s.kind), actual: `read failed: ${error instanceof Error ? error.message : String(error)}` };
-  }
-  const element = (result as { element?: { isPassword?: boolean; valueProtected?: boolean; value?: string | null; toggleState?: string | null; rangeValue?: number | null; expandCollapseState?: string | null; offscreen?: boolean } }).element;
-  if (!element) return { ok: false, expected: String(s.kind), actual: "element not found" };
-  if (element.isPassword || element.valueProtected) {
-    throw new Error("RESTORE_SENSITIVE_STATE_BLOCKED");
-  }
-  switch (s.kind) {
-    case "value": return { ok: element.value === s.value, expected: String(s.value), actual: String(element.value) };
-    case "toggle": return { ok: (element.toggleState === "On") === s.checked, expected: String(s.checked), actual: String(element.toggleState) };
-    case "range": return { ok: element.rangeValue === s.value, expected: String(s.value), actual: String(element.rangeValue) };
-    case "expanded": return { ok: (element.expandCollapseState === "Expanded") === s.expanded, expected: String(s.expanded), actual: String(element.expandCollapseState) };
-    case "visibility": return { ok: !element.offscreen === s.visible, expected: String(s.visible), actual: String(!element.offscreen) };
-    case "selection": return { ok: s.name === undefined || element.value === s.name, expected: s.name ?? String(s.index), actual: String(element.value) };
-    case "page": return { ok: true, expected: s.control, actual: s.control };
-    default: return { ok: false, expected: "unknown", actual: "unknown state kind" };
-  }
+  return {
+    ...base,
+    code: "RESTORE_STATE_UNAVAILABLE",
+    message: "No reliable original name or index was captured for selection restore; no guess was made (RESTORE_STATE_UNAVAILABLE)."
+  };
 }
 
 export async function runPipeline(input: PipelineInput, ctx: ExecutionContext): Promise<PipelineResult> {
@@ -758,10 +1148,11 @@ export async function runPipeline(input: PipelineInput, ctx: ExecutionContext): 
   let stoppedAtIndex: number | null = null;
   let stopError: { code?: string; message: string; details?: unknown } | undefined;
 
-  // Pipeline-level captureBefore: read values before the main steps.
+  // Pipeline-level captureBefore: read values before the main steps. Failed
+  // captures are recorded too (restore reports RESTORE_STATE_UNAVAILABLE).
   for (const entry of input.captureBefore ?? []) {
     const capturedValue = await captureValue(entry, ctx, byId, byIndex);
-    if (capturedValue) captured.set(entry.saveAs, capturedValue);
+    captured.set(entry.saveAs, capturedValue ?? { key: entry.saveAs, state: null, kind: "value", captureFailed: true, protected: false, readTool: "ui_get", readArgs: {} });
   }
 
   const pipeCtx: PipeContext = {
@@ -780,9 +1171,20 @@ export async function runPipeline(input: PipelineInput, ctx: ExecutionContext): 
     const step = input.steps[i]!;
 
     // Step-level captureBefore: read the control's state before acting.
+    // Failed captures are recorded too (RESTORE_STATE_UNAVAILABLE).
     if (step.captureBefore?.saveAs) {
       const capturedValue = await captureValue(step.captureBefore, ctx, byId, byIndex, step);
-      if (capturedValue) captured.set(step.captureBefore.saveAs, capturedValue);
+      if (capturedValue) {
+        captured.set(step.captureBefore.saveAs, capturedValue);
+      } else {
+        const intendedKind = captureKindForAction(step.args?.action as string | undefined);
+        captured.set(step.captureBefore.saveAs, {
+          key: step.captureBefore.saveAs, stepId: step.id,
+          kind: intendedKind === "auto" ? undefined : intendedKind,
+          state: null, captureFailed: true, protected: false, readTool: "ui_get", readArgs: {},
+          stepTool: step.tool, stepArgs: step.args as Record<string, unknown>
+        });
+      }
     }
 
     const exec = await executeStep(step, i, ctx, pipeCtx, deadline, captured, warnings);

@@ -240,7 +240,10 @@ $env:SCREENSHOT_MCP_APP_PACK_DIRS = "X:\Private\AppPacks;D:\Team\AppPacks"
 - `actions.json` 的 `defaultExpect` 在调用方未提供 expect 时自动生效；显式 expect 优先；`expect:false` 关闭（返回 warning）。
 - 默认可重试：`ELEMENT_NOT_AVAILABLE / UIA_ROOT_UNAVAILABLE / TARGET_WINDOW_NOT_READY / POPUP_NOT_READY / PROVIDER_BUSY`。**不可重试**（除非 `onlyCodes` 显式列出）：`ELEMENT_AMBIGUOUS / WINDOW_AMBIGUOUS / INVALID_SELECTOR / INVALID_PARAMS / PATTERN_NOT_SUPPORTED / PASSWORD_VALUE_PROTECTED / TOOL_OUTPUT_SCHEMA_MISMATCH`。非幂等动作不自动重试；`validate_steps` 对非幂等 + retry 报 `UNSAFE_RETRY`。
 - finally：主流程成功或失败都执行；失败单独记录、不覆盖主错误；`ignoreCodes` 容忍指定错误码。
-- 状态恢复：`captureBefore` 在操作前读取控件的**类型化状态**（value / toggle / selection / range / expanded / visibility / page），`restore: "always" | "never" | "onFailure"` 在 finally 用匹配的反向动作恢复（setValue / setChecked / selectByName / setRangeValue / expand|collapse / ensureSelected），恢复后重新读取验证。密码控件禁止捕获/恢复/导出（`RESTORE_SENSITIVE_STATE_BLOCKED`）；无法可靠读取的状态不执行猜测式恢复（`RESTORE_STATE_UNAVAILABLE`）。旧格式 `{saveAs, read}` 自动映射为 `value` 类型；`{saveAs, state:"auto"}` 按控件状态自动检测。
+- 状态恢复：`captureBefore` 在操作前读取控件的**类型化状态**（value / toggle / selection / range / expanded / visibility / page），`restore: "always" | "never" | "onFailure"` 在 finally 用匹配的反向动作恢复（setValue / setChecked / selectByName / setRangeValue / expand|collapse / ensureSelected），恢复后**重新查询 UI 验证**（真实重读，绝不用保存值自证）。密码控件禁止捕获/恢复/导出（`RESTORE_SENSITIVE_STATE_BLOCKED`）；无法可靠读取的状态不执行猜测式恢复（`RESTORE_STATE_UNAVAILABLE`）。旧格式 `{saveAs, read}` 自动映射为 `value` 类型；`{saveAs, state:"auto"}` 按控件状态自动检测。
+- **selection 恢复**：捕获的是操作前**真实选中项**（`element.value`/`selectedName` + provider 暴露的 `selectedIndex`，必要时通过列表项扫描读取），绝不使用步骤的目标 `value`/`index` 参数。恢复顺序：有可靠 name → `selectByName` 并验证；name 失败且有原始 index → `selectByIndex(originalIndex)` 并验证；两者皆不可得 → `RESTORE_STATE_UNAVAILABLE`（不猜测）。
+- **page 恢复**：页面组由控件/动作契约的可选 `selectionGroup` 声明（同组控件互斥）。捕获在动作前逐个查询同组控件，找到**唯一**选中（toggleState On / selected true）的作为原页面——绝不把动作目标当原页面；0 个或多个选中 → `RESTORE_STATE_UNAVAILABLE`。恢复对原页面 `ensureSelected`，验证时重查原页面 selected 且目标页面不再 selected。
+- restore 结果包含 `{kind, attempted, success, verified, code, message}`；错误码：`RESTORE_STATE_UNAVAILABLE`（原状态不可读，不执行恢复）/ `RESTORE_VERIFICATION_FAILED`（已恢复但状态不匹配）/ `RESTORE_SENSITIVE_STATE_BLOCKED`（密码/敏感状态禁止捕获）。
 
 ## 续接失败的 run
 
@@ -284,6 +287,7 @@ npm run smoke:continue-run        # runId / continue_run e2e
 npm run smoke:workflow            # workflow_catalog / run_workflow e2e
 npm run smoke:first-use-pipeline  # fresh-process 稳定性基准（默认 20 次迭代）
 npm run smoke:public-contract-pipeline  # 公开契约驱动管道测试（不读取源码）
+npm run smoke:page-fixture          # 页面恢复实机 fixture（临时 WPF 应用，3 页互斥导航）
 npm run smoke:uia-notepad         # 通用 UIA smoke（系统编辑器）
 npm run smoke:private-app-pack    # 私有 Pack 驱动（读 SCREENSHOT_MCP_TEST_PACK 等环境变量）
 # 以及既有 smoke：notepad / type-text / menu-click / no-cursor-click / print-capture /
@@ -293,7 +297,9 @@ npm run smoke:private-app-pack    # 私有 Pack 驱动（读 SCREENSHOT_MCP_TEST
 ### 关于 benchmark 的准确表述
 
 - `smoke:first-use-pipeline` 是 **fresh-process pipeline stability benchmark**（固定工作流的进程级稳定性）与 **contract-driven first-use simulation**（公开契约驱动的首次使用模拟）：每次迭代启动全新服务器进程，仅通过 `tools/list`、`app_pack_describe`、`workflow_catalog` 等公开能力驱动固定工作流。它**不是**真实大模型自主生成管道的测试。
-- 统计严格区分：`workflowFirstAttemptSuccessRate` / `pipelineFirstAttemptSuccessRate`（首次尝试，不含 continue 恢复）、`*EventuallySuccessRate`（最终成功，允许一次 continue_run 恢复）、`continueRecoverySuccessRate`（continue 恢复单独统计）、`cleanupSuccessRate`（finally 独立）、`infrastructureFailureCount`（服务器/传输失败，不计为工作流失败）。
+- 统计严格区分：`workflowFirstAttemptSuccessRate` / `pipelineFirstAttemptSuccessRate`（首次尝试，不含 continue 恢复）、`*EventuallySuccessRate`（最终成功，允许一次 continue_run 恢复）、`continueRecoverySuccessRate`、`cleanupSuccessRate`（finally 独立）、`infrastructureFailureCount`（服务器/传输失败，不计为工作流失败）。
+- `continueRecoverySuccessRate` 的分母是 **`continueAttempts`（实际 continue_run 调用次数）**，不是迭代次数；0 次尝试时返回 `null`（绝不用 0 伪装成"恢复全部失败"）。continue 成功从不改变 firstAttempt 统计。
+- 环境前提：键盘类步骤（type_text / send_key）依赖前台焦点。残留的编辑器实例（多个同进程名窗口）或前台全屏程序会抢占焦点并拉低 first-attempt 成功率（实测：清理残留实例后 20/20）。
 - 真实不同模型的自主生成成功率需要单独评测：仅凭公开工具契约构造合法管道由 `smoke:public-contract-pipeline` 证明——该测试不导入任何 `src/` 实现，只通过 MCP 客户端读取契约并构造、校验、执行管道。
 
 热重载：默认启用（`SCREENSHOTTOOL_HOT_RELOAD=0` 关闭）。修改 `src/` 或 `scripts/win-capture.ps1` 后无需重启。

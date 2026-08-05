@@ -128,12 +128,13 @@ export function packToAppProfile(pack: LoadedPack): AppProfile {
     if (Array.isArray(raw)) {
       controls[name] = raw;
     } else if ("selectors" in raw && Array.isArray((raw as { selectors?: unknown[] }).selectors)) {
-      const entry = raw as { selectors: UiElementSelector[]; confidence?: string; notes?: string; description?: string; menu?: unknown };
+      const entry = raw as { selectors: UiElementSelector[]; confidence?: string; notes?: string; description?: string; menu?: unknown; selectionGroup?: string };
       controls[name] = {
         selectors: entry.selectors,
         confidence: CONFIDENCE_MAP[entry.confidence ?? "source-derived"] ?? "source-derived",
         notes: entry.notes ?? entry.description,
-        menu: entry.menu as ControlEntry["menu"]
+        menu: entry.menu as ControlEntry["menu"],
+        selectionGroup: entry.selectionGroup
       };
     } else {
       controls[name] = raw as UiElementSelector;

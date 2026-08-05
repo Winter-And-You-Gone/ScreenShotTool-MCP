@@ -112,6 +112,7 @@ export const packControlsSchema = z.object({
         confidence: z.enum(["stable", "conditionally-stable", "fragile", "source-derived", "runtime-verified", "unsupported", "action-limited", "ambiguous"]).optional().default("source-derived"),
         description: z.string().max(1024).optional(),
         notes: z.string().max(4096).optional(),
+        selectionGroup: nonEmptyStr.optional(),
         menu: z.object({
           opensSubmenu: z.boolean().optional(),
           command: z.boolean().optional(),
@@ -162,7 +163,8 @@ export const packActionsSchema = z.object({
     defaultExpect: z.union([packExpectSchema, z.literal(false)]).optional(),
     preferredMethod: nonEmptyStr.optional(),
     fallbackPolicy: z.enum(["default", "disabled"]).optional().default("default"),
-    maxAttempts: z.number().int().min(1).max(5).optional()
+    maxAttempts: z.number().int().min(1).max(5).optional(),
+    selectionGroup: nonEmptyStr.optional()
   }).strict()).max(2000)
 }).strict();
 

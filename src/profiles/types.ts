@@ -29,6 +29,9 @@ export type ControlEntry = {
   selectors: UiElementSelector[];
   confidence: SelectorConfidence;
   notes?: string;
+  // Page-navigation group (mutually exclusive pages). Used by state
+  // capture/restore to determine the ACTUALLY selected page.
+  selectionGroup?: string;
   // Menu-routing hints for composite actions (data-driven; expressed by App
   // Packs, interpreted by the generic profile layer - the core never knows
   // any specific app's menu structure).

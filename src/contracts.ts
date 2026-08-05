@@ -392,7 +392,26 @@ const queryOutput = obj(
 const getOutput = obj(
   {
     found: bool(),
-    element: { anyOf: [{ type: "object" }, { type: "null" }], description: "Matched element state, or null when not found." },
+    element: {
+      anyOf: [
+        {
+          type: "object",
+          properties: {
+            value: str(),
+            selected: bool(),
+            // Real pre-action selection state when the provider exposes it
+            // (never derived from action arguments).
+            selectedName: str(),
+            selectedIndex: int(),
+            toggleState: en(["On", "Off", "Indeterminate"]),
+            isPassword: bool(),
+            valueProtected: bool()
+          }
+        },
+        { type: "null" }
+      ],
+      description: "Matched element state, or null when not found. selectedName/selectedIndex are best-effort original selection info, present only when the provider exposes them."
+    },
     elapsedMs: int()
   },
   ["found", "element", "elapsedMs"]

@@ -349,6 +349,9 @@ function pipelineExecutionContext(runtime: RuntimeModules, uiaDeps: UiaDeps, pac
   return {
     dispatch: (tool, toolArgs) => executeValidatedTool(tool, toolArgs, executor),
     pack: packId ? packContext(packId) : undefined,
+    // Lets page/selection capture resolve a profile for pack-less
+    // run_steps pipelines that carry {profile} in their step args.
+    resolveProfile: (id) => getAppProfile(id),
     expectDeps: {
       getUiElement: (i) => uiaDeps.getUiElement(i),
       queryUi: (i) => uiaDeps.queryUi(i)
