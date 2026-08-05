@@ -19,7 +19,8 @@ import type * as ProfilesModule from "./profiles/registry.js";
 import type { ProfileRunStepsInput } from "./schemas.js";
 import type { UiaDeps } from "./profiles/registry.js";
 import { McpUiError } from "./uia/results.js";
-import { getContract, contracts } from "./contracts.js";
+import { getContract, contracts, toMcpToolDefinition } from "./contracts.js";
+import { executeValidatedTool, type ToolExecutorContext } from "./executor.js";
 import { registry as packRegistry, getAppProfile } from "./app-packs/registry.js";
 import { loadPackFromDir } from "./app-packs/loader.js";
 import { validatePack } from "./app-packs/validator.js";
@@ -98,15 +99,13 @@ const server = new Server(
   }
 );
 
-// Tools are registered from the contract table (src/contracts.ts): one entry
-// per tool with description + input JSON Schema.
+// Tools are registered from the contract table (src/contracts.ts). Each entry
+// carries the MCP-standard inputSchema + outputSchema + annotations (+ _meta
+// with pipeSafeFields), so a first-time client can derive contracts from
+// tools/list alone.
 server.setRequestHandler(ListToolsRequestSchema, async () => {
   return {
-    tools: Object.values(contracts).map((c) => ({
-      name: c.name,
-      description: c.description,
-      inputSchema: c.inputSchema
-    }))
+    tools: Object.values(contracts).map((c) => toMcpToolDefinition(c))
   };
 });
 
@@ -117,31 +116,12 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     const runtime = await loadRuntime();
     const uiaDeps = runtime.profiles.buildUiaDeps(runtime.windows);
 
-    // Pipeline-orchestration tools run through the pipeline engine and are
-    // handled here rather than in dispatchToolValue so they cannot recurse.
-    switch (name) {
-      case "run_steps":
-        return jsonResult(await runStepsTool(args, runtime, uiaDeps));
-      case "profile_run_steps":
-        return jsonResult(await profileRunStepsTool(args, runtime, uiaDeps));
-      case "run_workflow":
-        return jsonResult(await runWorkflowTool(args, runtime, uiaDeps));
-      case "continue_run":
-        return jsonResult(await continueRunTool(args, runtime, uiaDeps));
-      case "validate_steps":
-        return jsonResult(await validateStepsTool(args, runtime));
-      case "app_pack_list":
-        return jsonResult(await appPackListTool(args, runtime));
-      case "app_pack_describe":
-        return jsonResult(await appPackDescribeTool(args, runtime));
-      case "app_pack_validate":
-        return jsonResult(await appPackValidateTool(args, runtime));
-      case "app_pack_reload":
-        return jsonResult(await appPackReloadTool(args, runtime));
-      case "app_pack_probe":
-        return jsonResult(await appPackProbeTool(args, runtime));
-    }
-    return jsonResult(await dispatchToolValue(name, args, runtime, uiaDeps));
+    // EVERY tool call - including the pipeline-orchestration tools - goes
+    // through executeValidatedTool: read contract -> validate input ->
+    // dispatch -> validate output. There is exactly one execution path, so
+    // plain calls and pipeline steps behave identically.
+    const executor = makeExecutor(runtime, uiaDeps);
+    return jsonResult(await executeValidatedTool(name, args, executor));
   } catch (error) {
     if (error instanceof McpError) {
       throw error;
@@ -198,7 +178,7 @@ async function appPackListTool(_args: unknown, _runtime: RuntimeModules) {
 }
 
 async function appPackDescribeTool(args: unknown, runtime: RuntimeModules) {
-  const input = parseArgs(runtime.schemas.appPackDescribeSchema, args);
+  const input = args as import("./schemas.js").AppPackDescribeInput;
   const pack = packRegistry.getPack(input.pack);
   if (!pack) {
     throw new McpUiError("PACK_NOT_FOUND", `No App Pack with id '${input.pack}' is loaded.`, { pack: input.pack, loaded: packRegistry.listPacks("all").map((p) => p.manifest.id) });
@@ -269,7 +249,7 @@ async function appPackDescribeTool(args: unknown, runtime: RuntimeModules) {
 }
 
 async function appPackValidateTool(args: unknown, runtime: RuntimeModules) {
-  const input = parseArgs(runtime.schemas.appPackValidateSchema, args);
+  const input = args as import("./schemas.js").AppPackValidateInput;
   if (input.packPath) {
     // Local validation: load the single pack directory without installing it.
     const loaded = await loadPackFromDir(input.packPath);
@@ -289,15 +269,17 @@ async function appPackValidateTool(args: unknown, runtime: RuntimeModules) {
 
 async function appPackReloadTool(_args: unknown, _runtime: RuntimeModules) {
   const result = await packRegistry.load(cliArgs.appPackDir, envPackDirs());
+  // Reflect the registry's ACTUAL outcome: a reload whose new config fails
+  // validation keeps the previous packs and reports reloaded:false.
   return {
-    reloaded: true,
+    reloaded: result.reloaded,
     loadedPacks: result.loadedPacks.map((p) => packSummary(p.manifest.id)).filter((p) => p !== undefined),
     errors: result.issues
   };
 }
 
 async function appPackProbeTool(args: unknown, runtime: RuntimeModules) {
-  const input = parseArgs(runtime.schemas.appPackProbeSchema, args);
+  const input = args as import("./schemas.js").AppPackProbeInput;
   return probeApp(
     {
       listWindows: (f) => runtime.windows.listWindows(f),
@@ -306,6 +288,49 @@ async function appPackProbeTool(args: unknown, runtime: RuntimeModules) {
     },
     input
   );
+}
+
+// ── Tool contract discovery tools ──
+
+async function toolContractListTool(_args: unknown, _runtime: RuntimeModules) {
+  const tools = Object.values(contracts).map((c) => ({
+    name: c.name,
+    schemaVersion: c.schemaVersion,
+    outputSchema: c.outputSchema,
+    pipeSafeFields: c.pipeSafeFields,
+    annotations: {
+      readOnly: c.annotations?.readOnly ?? false,
+      destructive: c.annotations?.destructive ?? false,
+      idempotent: c.annotations?.idempotent ?? false,
+      retrySafe: c.annotations?.retrySafe ?? false,
+      needsExpect: c.annotations?.needsExpect ?? false
+    }
+  }));
+  return { tools };
+}
+
+async function toolContractDescribeTool(args: unknown, _runtime: RuntimeModules) {
+  const input = args as import("./schemas.js").ToolContractDescribeInput;
+  const contract = getContract(input.tool);
+  if (!contract) {
+    throw new McpUiError("TOOL_NOT_FOUND", `No tool named '${input.tool}'.`, { tool: input.tool, tools: Object.keys(contracts) });
+  }
+  const { contractExamples } = await import("./contracts.js");
+  return {
+    name: contract.name,
+    schemaVersion: contract.schemaVersion,
+    inputSchema: contract.inputSchema,
+    outputSchema: contract.outputSchema,
+    pipeSafeFields: contract.pipeSafeFields,
+    annotations: {
+      readOnly: contract.annotations?.readOnly ?? false,
+      destructive: contract.annotations?.destructive ?? false,
+      idempotent: contract.annotations?.idempotent ?? false,
+      retrySafe: contract.annotations?.retrySafe ?? false,
+      needsExpect: contract.annotations?.needsExpect ?? false
+    },
+    examples: contractExamples(contract)
+  };
 }
 
 // ── Pipeline tools ──
@@ -320,8 +345,9 @@ function packContext(packId: string): { id: string; actions: import("./app-packs
 }
 
 function pipelineExecutionContext(runtime: RuntimeModules, uiaDeps: UiaDeps, packId?: string): ExecutionContext {
+  const executor = makeExecutor(runtime, uiaDeps);
   return {
-    dispatch: (tool, toolArgs) => dispatchToolValue(tool, toolArgs, runtime, uiaDeps),
+    dispatch: (tool, toolArgs) => executeValidatedTool(tool, toolArgs, executor),
     pack: packId ? packContext(packId) : undefined,
     expectDeps: {
       getUiElement: (i) => uiaDeps.getUiElement(i),
@@ -330,8 +356,23 @@ function pipelineExecutionContext(runtime: RuntimeModules, uiaDeps: UiaDeps, pac
   };
 }
 
+// The one place where input parsing + raw dispatch live. executeValidatedTool
+// wraps this with output validation.
+function makeExecutor(runtime: RuntimeModules, uiaDeps: UiaDeps): ToolExecutorContext {
+  return {
+    parseInput: (tool, args) => {
+      const schema = runtime.schemas.toolZodSchemas[tool];
+      if (!schema) return { ok: true, value: args };
+      const parsed = schema.safeParse(args ?? {});
+      if (parsed.success) return { ok: true, value: parsed.data };
+      return { ok: false, message: z.prettifyError(parsed.error) };
+    },
+    dispatch: (tool, input) => dispatchToolValue(tool, input, runtime, uiaDeps)
+  };
+}
+
 async function runStepsTool(args: unknown, runtime: RuntimeModules, uiaDeps: UiaDeps) {
-  const input = parseArgs(runtime.schemas.runStepsSchema, args);
+  const input = args as import("./schemas.js").RunStepsInput;
   // Backward-compatible structural pre-check: invalid placeholder references
   // (forward/unknown step ids) fail the whole call with InvalidParams before
   // any step runs, exactly like the pre-pipeline run_steps.
@@ -344,7 +385,7 @@ async function runStepsTool(args: unknown, runtime: RuntimeModules, uiaDeps: Uia
 }
 
 async function profileRunStepsTool(args: unknown, runtime: RuntimeModules, uiaDeps: UiaDeps) {
-  const input = parseArgs(runtime.schemas.profileRunStepsSchema, args);
+  const input = args as import("./schemas.js").ProfileRunStepsInput;
   const pack = packRegistry.getPack(input.profile);
   if (!pack) {
     throw new McpUiError("PACK_NOT_FOUND", `No App Pack with id '${input.profile}' is loaded.`, { pack: input.profile, loaded: packRegistry.listPacks("all").map((p) => p.manifest.id) });
@@ -409,7 +450,7 @@ async function profileRunStepsTool(args: unknown, runtime: RuntimeModules, uiaDe
       maxTotalMs: input.maxTotalMs
     },
     {
-      dispatch: (tool, toolArgs) => dispatchToolValue(tool, toolArgs, runtime, uiaDeps),
+      dispatch: (tool, toolArgs) => executeValidatedTool(tool, toolArgs, makeExecutor(runtime, uiaDeps)),
       pack: { id: pack.manifest.id, actions: pack.actions, profile, version: pack.manifest.version },
       autoContext,
       expectDeps: {
@@ -430,7 +471,7 @@ async function profileRunStepsTool(args: unknown, runtime: RuntimeModules, uiaDe
 }
 
 async function runWorkflowTool(args: unknown, runtime: RuntimeModules, uiaDeps: UiaDeps) {
-  const input = parseArgs(runtime.schemas.runWorkflowSchema, args);
+  const input = args as import("./schemas.js").RunWorkflowInput;
   const pack = packRegistry.getPack(input.pack);
   if (!pack) {
     throw new McpUiError("PACK_NOT_FOUND", `No App Pack with id '${input.pack}' is loaded.`, { pack: input.pack });
@@ -445,7 +486,7 @@ async function runWorkflowTool(args: unknown, runtime: RuntimeModules, uiaDeps: 
     workflow,
     inputs: input.inputs ?? {},
     profile,
-    dispatch: (tool, toolArgs) => dispatchToolValue(tool, toolArgs, runtime, uiaDeps),
+    dispatch: (tool, toolArgs) => executeValidatedTool(tool, toolArgs, makeExecutor(runtime, uiaDeps)),
     expectDeps: {
       getUiElement: (i) => uiaDeps.getUiElement(i),
       queryUi: (i) => uiaDeps.queryUi(i)
@@ -455,7 +496,7 @@ async function runWorkflowTool(args: unknown, runtime: RuntimeModules, uiaDeps: 
 }
 
 async function validateStepsTool(args: unknown, runtime: RuntimeModules) {
-  const input = parseArgs(runtime.schemas.validateStepsSchema, args);
+  const input = args as import("./schemas.js").ValidateStepsInput;
   const pack = input.pack ? packRegistry.getPack(input.pack) : undefined;
   const v = validatePipelineStatic(
     { steps: input.steps, finally: input.finally },
@@ -483,7 +524,7 @@ async function validateStepsTool(args: unknown, runtime: RuntimeModules) {
 }
 
 async function continueRunTool(args: unknown, runtime: RuntimeModules, uiaDeps: UiaDeps) {
-  const input = parseArgs(runtime.schemas.continueRunSchema, args);
+  const input = args as import("./schemas.js").ContinueRunInput;
   const snapshot = getRun(input.runId);
   if (!snapshot) {
     return {
@@ -530,59 +571,85 @@ function withRunTtl(result: import("./pipeline.js").PipelineResult): Record<stri
 
 // ── Single-tool dispatch (also used by pipeline steps) ──
 
+// Raw dispatch: input is ALREADY validated/parsed (the unified executor did
+// it). Orchestration tools (run_steps etc.) receive their parsed input too.
 async function dispatchToolValue(
   name: string,
-  args: unknown,
+  input: unknown,
   runtime: RuntimeModules,
   uiaDeps: UiaDeps
 ): Promise<unknown> {
-  const { schemas, windows, profiles } = runtime;
+  const { windows, profiles } = runtime;
 
   switch (name) {
+    case "run_steps":
+      return runStepsTool(input, runtime, uiaDeps);
+    case "profile_run_steps":
+      return profileRunStepsTool(input, runtime, uiaDeps);
+    case "run_workflow":
+      return runWorkflowTool(input, runtime, uiaDeps);
+    case "continue_run":
+      return continueRunTool(input, runtime, uiaDeps);
+    case "validate_steps":
+      return validateStepsTool(input, runtime);
+    case "app_pack_list":
+      return appPackListTool(input, runtime);
+    case "app_pack_describe":
+      return appPackDescribeTool(input, runtime);
+    case "app_pack_validate":
+      return appPackValidateTool(input, runtime);
+    case "app_pack_reload":
+      return appPackReloadTool(input, runtime);
+    case "app_pack_probe":
+      return appPackProbeTool(input, runtime);
+    case "tool_contract_list":
+      return toolContractListTool(input, runtime);
+    case "tool_contract_describe":
+      return toolContractDescribeTool(input, runtime);
     case "launch_app":
-      return await windows.launchApp(parseArgs(schemas.launchAppSchema, args));
+      return await windows.launchApp(input as import("./schemas.js").LaunchAppInput);
     case "list_windows":
-      return await windows.listWindows(parseArgs(schemas.listWindowsSchema, args));
+      return await windows.listWindows(input as import("./schemas.js").ListWindowsInput);
     case "capture_window":
-      return await windows.captureWindow(parseArgs(schemas.captureWindowSchema, args));
+      return await windows.captureWindow(input as import("./schemas.js").CaptureWindowInput);
     case "capture_screen_region":
-      return await windows.captureScreenRegion(parseArgs(schemas.captureScreenRegionSchema, args));
+      return await windows.captureScreenRegion(input as import("./schemas.js").CaptureScreenRegionInput);
     case "click_window":
-      return await windows.clickWindow(parseArgs(schemas.clickWindowSchema, args));
+      return await windows.clickWindow(input as import("./schemas.js").ClickWindowInput);
     case "click_menu_item":
-      return await windows.clickMenuItem(parseArgs(schemas.clickMenuItemSchema, args));
+      return await windows.clickMenuItem(input as import("./schemas.js").ClickMenuItemInput);
     case "move_mouse_window":
-      return await windows.moveMouseWindow(parseArgs(schemas.moveMouseWindowSchema, args));
+      return await windows.moveMouseWindow(input as import("./schemas.js").MoveMouseWindowInput);
     case "close_app":
-      return await windows.closeApp(parseArgs(schemas.closeAppSchema, args).pid);
+      return await windows.closeApp((input as import("./schemas.js").CloseAppInput).pid);
     case "type_text":
-      return await windows.typeText(parseArgs(schemas.typeTextSchema, args));
+      return await windows.typeText(input as import("./schemas.js").TypeTextInput);
     case "send_key":
-      return await windows.sendKey(parseArgs(schemas.sendKeySchema, args));
+      return await windows.sendKey(input as import("./schemas.js").SendKeyInput);
     case "read_clipboard":
-      return await windows.readClipboard(parseArgs(schemas.readClipboardSchema, args));
+      return await windows.readClipboard(input as import("./schemas.js").ReadClipboardInput);
     case "write_clipboard":
-      return await windows.writeClipboard(parseArgs(schemas.writeClipboardSchema, args));
+      return await windows.writeClipboard(input as import("./schemas.js").WriteClipboardInput);
     case "get_window_state":
-      return await windows.getWindowState(parseArgs(schemas.getWindowStateSchema, args));
+      return await windows.getWindowState(input as import("./schemas.js").GetWindowStateInput);
     case "wait_for_window":
-      return await windows.waitForWindow(parseArgs(schemas.waitForWindowSchema, args));
+      return await windows.waitForWindow(input as import("./schemas.js").WaitForWindowInput);
     case "ui_inspect_tree":
-      return await windows.inspectUiTree(parseArgs(schemas.uiInspectTreeSchema, args));
+      return await windows.inspectUiTree(input as import("./schemas.js").UiInspectTreeInput);
     case "ui_query":
-      return await windows.queryUi(parseArgs(schemas.uiQuerySchema, args));
+      return await windows.queryUi(input as import("./schemas.js").UiQueryInput);
     case "ui_get":
-      return await windows.getUiElement(parseArgs(schemas.uiGetSchema, args));
+      return await windows.getUiElement(input as import("./schemas.js").UiGetInput);
     case "ui_action":
-      return await windows.performUiAction(parseArgs(schemas.uiActionSchema, args));
+      return await windows.performUiAction(input as import("./schemas.js").UiActionInput);
     case "ui_wait":
-      return await windows.waitForUi(parseArgs(schemas.uiWaitSchema, args));
+      return await windows.waitForUi(input as import("./schemas.js").UiWaitInput);
     case "profile_list":
       return profiles.profileList();
     case "profile_resolve":
-      return await profiles.resolveProfileControl(uiaDeps, parseArgs(schemas.profileResolveSchema, args));
+      return await profiles.resolveProfileControl(uiaDeps, input as import("./schemas.js").ProfileResolveInput);
     case "profile_action":
-      return await profiles.performProfileAction(uiaDeps, parseArgs(schemas.profileActionSchema, args));
+      return await profiles.performProfileAction(uiaDeps, input as import("./schemas.js").ProfileActionInput);
     case "profile_launch":
       return await profiles.launchProfile(
         uiaDeps,
@@ -595,31 +662,31 @@ async function dispatchToolValue(
           timeoutMs: i.timeoutMs ?? 30000
         }),
         windows.listWindows,
-        parseArgs(schemas.profileLaunchSchema, args),
+        input as import("./schemas.js").ProfileLaunchInput,
         windows.getExeManifestLevel
       );
     case "ui_catalog": {
-      const catInput = parseArgs(schemas.uiCatalogSchema, args);
+      const catInput = input as import("./schemas.js").UiCatalogInput;
       const catalog = await windows.catalogUi(catInput);
       const profile = profiles.findProfileForTarget({ processName: catInput.processName, titleContains: catInput.titleContains });
       catalog.controls = profiles.enrichCatalogControls(profile, catalog.controls);
       return catalog;
     }
     case "app_pack_list":
-      return appPackListTool(args, runtime);
+      return appPackListTool(input, runtime);
     case "app_pack_describe":
-      return appPackDescribeTool(args, runtime);
+      return appPackDescribeTool(input, runtime);
     case "app_pack_validate":
-      return appPackValidateTool(args, runtime);
+      return appPackValidateTool(input, runtime);
     case "app_pack_reload":
-      return appPackReloadTool(args, runtime);
+      return appPackReloadTool(input, runtime);
     case "app_pack_probe":
-      return appPackProbeTool(args, runtime);
+      return appPackProbeTool(input, runtime);
     case "workflow_catalog": {
-      const input = parseArgs(schemas.workflowCatalogSchema, args);
-      const pack = packRegistry.getPack(input.pack);
+      const wcInput = input as import("./schemas.js").WorkflowCatalogInput;
+      const pack = packRegistry.getPack(wcInput.pack);
       if (!pack) {
-        throw new McpUiError("PACK_NOT_FOUND", `No App Pack with id '${input.pack}' is loaded.`, { pack: input.pack });
+        throw new McpUiError("PACK_NOT_FOUND", `No App Pack with id '${wcInput.pack}' is loaded.`, { pack: wcInput.pack });
       }
       return { workflows: listWorkflows(pack) };
     }

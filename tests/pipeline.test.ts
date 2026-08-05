@@ -9,7 +9,7 @@ import { runPipeline, continuePipeline, validatePipelineStatic, type PipelineSte
 import { getContract } from "../src/contracts.js";
 import type { PackActions, PackDefaultExpect } from "../src/app-packs/types.js";
 import type { AppProfile } from "../src/profiles/types.js";
-import { clearAllRuns, saveRun, type RunSnapshot } from "../src/runs.js";
+import { clearAllRuns, getRun, saveRun, type RunSnapshot } from "../src/runs.js";
 import { McpUiError } from "../src/uia/results.js";
 
 // ── mocks ──
@@ -505,10 +505,9 @@ function makeSnapshot(overrides: Partial<RunSnapshot> = {}): RunSnapshot {
         { id: "act", tool: "profile_action", args: { control: "dialog", action: "invoke" } }
       ]
     },
-    resolvedArgs: [{ tool: "profile_launch", args: {} }, { tool: "profile_action", args: { control: "dialog", action: "invoke" } }],
-    results: [
-      { id: "launch", tool: "profile_launch", success: true, result: { pid: 4242, hwnd: "99", startedByMcp: true, reused: false, uiaRootAvailable: true } },
-      { id: "act", tool: "profile_action", success: false, error: { code: "ACTION_FAILED", message: "boom" } }
+    steps: [
+      { id: "launch", index: 0, tool: "profile_launch", pipeProjection: { pid: 4242, hwnd: "99", startedByMcp: true, reused: false, uiaRootAvailable: true, profile: "fixture" }, exports: {}, success: true },
+      { id: "act", index: 1, tool: "profile_action", pipeProjection: null, exports: {}, success: false, error: { code: "ACTION_FAILED", message: "boom" } }
     ],
     exports: { "launch.pid": 4242 },
     pid: 4242,
@@ -518,6 +517,8 @@ function makeSnapshot(overrides: Partial<RunSnapshot> = {}): RunSnapshot {
     error: { code: "ACTION_FAILED", message: "boom" },
     maxSteps: 2,
     totalTimeoutMs: 120_000,
+    continuable: true,
+    continuationReason: null,
     ...overrides
   };
 }
@@ -618,4 +619,271 @@ test("continue_run rejects unknown continuation steps with RUN_STATE_STALE", asy
   });
   assert.equal(result.success, false);
   assert.equal(result.error?.code, "RUN_STATE_STALE");
+});
+
+// ── run snapshot continuability (minimal projections) ──
+
+test("run snapshot keeps a minimal projection (not the full raw result)", async () => {
+  clearAllRuns();
+  // A step result with a huge, unreferenced payload. The projection must
+  // keep pid/hwnd (pipe-safe) + the exported field and DROP the big blob.
+  const bigBlob = { blob: "x".repeat(200_000) };
+  const ctx = makeCtx({
+    tools: {
+      launch_app: () => ({ pid: 7, hwnd: "8", ...bigBlob })
+    }
+  });
+  const result = await runPipeline(
+    {
+      steps: [
+        { id: "app", tool: "launch_app", args: { exePath: "x.exe" }, exports: { pid: "pid" } }
+      ]
+    },
+    ctx
+  );
+  assert.equal(result.success, true);
+  assert.equal(result.continuable, true);
+  const snapshot = getRun(result.runId)!;
+  const projection = snapshot.steps[0]!.pipeProjection as { pid?: number; blob?: unknown };
+  assert.equal(projection.pid, 7);
+  assert.equal(projection.blob, undefined, "large unreferenced payload must not be stored");
+  // launch_app exposes hwnd nested under the (cheap) window object; pid is
+  // the exported + pipe-safe top-level field that must survive.
+  assert.equal(JSON.stringify(snapshot).length < 50_000, true, "snapshot stays small");
+});
+
+test("a large UIA tree is trimmed but exports still allow continuation", async () => {
+  clearAllRuns();
+  // ui_inspect_tree returns a big nodes array; a later step only references
+  // the exported count. The projection keeps the export + pipe-safe fields.
+  const nodes = Array.from({ length: 2000 }, (_, i) => ({ nodeId: i, name: `n${i}`, data: "x".repeat(100) }));
+  const ctx = makeCtx({
+    tools: {
+      ui_inspect_tree: () => ({ roots: [{ hwnd: "1", isMain: true }], nodes, visitedNodes: 2000, returnedNodes: 2000, truncated: false, maxDepth: 10, maxNodes: 2000, elapsedMs: 5 })
+    }
+  });
+  const result = await runPipeline(
+    {
+      steps: [
+        { id: "tree", tool: "ui_inspect_tree", args: { pid: 1 }, exports: { count: "returnedNodes" } },
+        { id: "check", tool: "ui_wait", args: { pid: 1, selector: { controlType: "Window" }, condition: "exists" } }
+      ]
+    },
+    ctx
+  );
+  assert.equal(result.success, true);
+  assert.equal(result.continuable, true, "trimmed snapshot stays continuable");
+  const snapshot = getRun(result.runId)!;
+  assert.equal(snapshot.exports.count, 2000, "export preserved");
+  const projection = snapshot.steps[0]!.pipeProjection as { nodes?: unknown; returnedNodes?: number };
+  assert.equal(projection.returnedNodes, 2000);
+  // nodes is pipe-safe for ui_inspect_tree but oversized projections are
+  // bounded by the snapshot budget - either kept cheap or dropped; what must
+  // never happen is a continuable run that lost its exported fields.
+  assert.ok(projection.nodes === undefined || JSON.stringify(projection.nodes).length < 50_000);
+});
+
+test("a snapshot whose minimal state exceeds the budget is NOT continuable", () => {
+  clearAllRuns();
+  // Directly exercise the store: a snapshot whose minimal (already-projected)
+  // state exceeds the run budget must be flagged NOT continuable, never
+  // presented as resumable with dropped state.
+  const big = { blob: "y".repeat(2.5 * 1024 * 1024) };
+  saveRun(makeSnapshot({
+    steps: [
+      { id: "tree", index: 0, tool: "ui_inspect_tree", pipeProjection: big, exports: {}, success: true }
+    ]
+  }));
+  const saved = getRun("run_test")!;
+  assert.equal(saved.continuable, false, "oversized snapshot must not be presented as resumable");
+  assert.equal(saved.continuationReason, "RUN_SNAPSHOT_TRUNCATED");
+});
+
+test("continue_run refuses a non-continuable snapshot with RUN_NOT_CONTINUABLE", async () => {
+  clearAllRuns();
+  saveRun({ ...makeSnapshot(), continuable: false, continuationReason: "RUN_SNAPSHOT_TRUNCATED" });
+  const result = await continuePipeline({
+    runId: "run_test",
+    continueFrom: 0,
+    ctx: makeCtx(),
+    checkProcessAlive: async () => true,
+    checkHwndValid: async () => true
+  });
+  assert.equal(result.success, false);
+  assert.equal(result.error?.code, "RUN_NOT_CONTINUABLE");
+});
+
+test("continue_run replays references against the stored projection", async () => {
+  clearAllRuns();
+  const ctx = makeCtx({
+    tools: {
+      profile_action: () => ({ profile: "fixture", control: "dialog", result: { success: true } })
+    }
+  });
+  const snapshot = makeSnapshot();
+  saveRun(snapshot);
+  const result = await continuePipeline({
+    runId: "run_test",
+    continueFrom: "act",
+    ctx,
+    checkProcessAlive: async () => true,
+    checkHwndValid: async () => true,
+    getPackVersion: () => "1.0.0"
+  });
+  assert.equal(result.success, true);
+  assert.equal(result.continuable, true);
+});
+
+// ── typed restore ──
+
+test("typed restore: value kind is captured and restored via setValue", async () => {
+  let setValueValue: unknown;
+  const ctx = makeCtx({
+    tools: {
+      ui_get: () => ({ found: true, element: { automationId: "edit", value: "original", isPassword: false, valueProtected: false }, elapsedMs: 1 }),
+      ui_action: (args) => {
+        if (args.action === "setValue") setValueValue = args.value;
+        return { success: true, method: "x", coordinateFallbackUsed: false, physicalCursorMoved: false, elapsedMs: 1 };
+      }
+    }
+  });
+  const result = await runPipeline(
+    {
+      steps: [{ id: "s", tool: "read_clipboard" }],
+      captureBefore: [
+        { saveAs: "orig", read: { tool: "ui_get", args: { selector: { automationId: "edit" } } } }
+      ],
+      restore: "always"
+    },
+    ctx
+  );
+  assert.equal(setValueValue, "original");
+  assert.equal(result.restoreResults[0]!.kind, "value");
+  assert.equal(result.restoreResults[0]!.verified, true);
+});
+
+test("typed restore: toggle kind is captured and restored via setChecked", async () => {
+  const calls: string[] = [];
+  const ctx = makeCtx({
+    tools: {
+      ui_get: () => ({ found: true, element: { automationId: "chk", value: null, toggleState: "On", isPassword: false, valueProtected: false }, elapsedMs: 1 }),
+      ui_action: (args) => {
+        calls.push(`${args.action}:${args.value}`);
+        return { success: true, method: "x", coordinateFallbackUsed: false, physicalCursorMoved: false, elapsedMs: 1 };
+      }
+    }
+  });
+  const result = await runPipeline(
+    {
+      steps: [{ id: "s", tool: "read_clipboard" }],
+      captureBefore: [
+        { saveAs: "chk", read: { tool: "ui_get", args: { selector: { automationId: "chk" } } } }
+      ],
+      restore: "always"
+    },
+    ctx
+  );
+  assert.ok(calls.some((c) => c === "setChecked:true"), `expected setChecked:true, got ${calls.join(",")}`);
+  assert.equal(result.restoreResults[0]!.kind, "toggle");
+});
+
+test("typed restore: range kind is restored via setRangeValue", async () => {
+  let rangeValue: unknown;
+  const ctx = makeCtx({
+    tools: {
+      ui_get: () => ({ found: true, element: { automationId: "slider", value: null, rangeValue: 42, isPassword: false, valueProtected: false }, elapsedMs: 1 }),
+      ui_action: (args) => {
+        if (args.action === "setRangeValue") rangeValue = args.rangeValue;
+        return { success: true, method: "x", coordinateFallbackUsed: false, physicalCursorMoved: false, elapsedMs: 1 };
+      }
+    }
+  });
+  const result = await runPipeline(
+    {
+      steps: [{ id: "s", tool: "read_clipboard" }],
+      captureBefore: [
+        { saveAs: "sl", read: { tool: "ui_get", args: { selector: { automationId: "slider" } } } }
+      ],
+      restore: "always"
+    },
+    ctx
+  );
+  assert.equal(rangeValue, 42);
+  assert.equal(result.restoreResults[0]!.kind, "range");
+});
+
+test("typed restore: expanded kind is restored via expand/collapse", async () => {
+  const actions: string[] = [];
+  const ctx = makeCtx({
+    tools: {
+      ui_get: () => ({ found: true, element: { automationId: "combo", value: null, expandCollapseState: "Expanded", isPassword: false, valueProtected: false }, elapsedMs: 1 }),
+      ui_action: (args) => {
+        actions.push(String(args.action));
+        return { success: true, method: "x", coordinateFallbackUsed: false, physicalCursorMoved: false, elapsedMs: 1 };
+      }
+    }
+  });
+  const result = await runPipeline(
+    {
+      steps: [{ id: "s", tool: "read_clipboard" }],
+      captureBefore: [
+        { saveAs: "exp", read: { tool: "ui_get", args: { selector: { automationId: "combo" } } } }
+      ],
+      restore: "always"
+    },
+    ctx
+  );
+  assert.ok(actions.includes("expand"), `expected expand, got ${actions.join(",")}`);
+  assert.equal(result.restoreResults[0]!.kind, "expanded");
+});
+
+test("password-protected state is never captured or restored", async () => {
+  const ctx = makeCtx({
+    tools: {
+      ui_get: () => ({ found: true, element: { automationId: "pwd", value: "secret", isPassword: true, valueProtected: true }, elapsedMs: 1 })
+    }
+  });
+  const result = await runPipeline(
+    {
+      steps: [{ id: "s", tool: "read_clipboard" }],
+      captureBefore: [
+        { saveAs: "pwd", read: { tool: "ui_get", args: { selector: { automationId: "pwd" } } } }
+      ],
+      restore: "always"
+    },
+    ctx
+  );
+  assert.equal(result.restoreResults[0]!.valueCaptured, false);
+  assert.match(result.restoreResults[0]!.message!, /password/i);
+});
+
+test("step-level captureBefore with page kind restores via ensureSelected", async () => {
+  const calls: string[] = [];
+  const ctx = makeCtx({
+    tools: {
+      profile_action: (args) => {
+        calls.push(String(args.action));
+        if (args.action === "ensureSelected") {
+          return { profile: "fixture", control: args.control, result: { success: true, method: "noop", alreadySelected: true } };
+        }
+        return { profile: "fixture", control: args.control, result: { success: true } };
+      }
+    }
+  });
+  const result = await runPipeline(
+    {
+      steps: [
+        {
+          id: "nav",
+          tool: "profile_action",
+          args: { profile: "fixture", control: "sidebarTemp", action: "ensureSelected" },
+          captureBefore: { saveAs: "page", read: { tool: "ui_get", args: { selector: { automationId: "sidebar" } } } }
+        }
+      ],
+      restore: "always"
+    },
+    ctx
+  );
+  assert.ok(calls.includes("ensureSelected"));
+  assert.equal(result.success, true);
 });

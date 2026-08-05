@@ -133,12 +133,42 @@ async function main() {
       console.log(`profile_run_steps: step failed (${JSON.stringify((prs as { error?: unknown }).error)}). Launch/injection verified; the window itself is not invokable.`);
     }
 
-    // 9. structuredContent is present on tool results.
+    // 9. structuredContent is present on tool results and consistent with
+    //    the text content.
     const raw = await client.call("tools/call", { name: "app_pack_list", arguments: {} });
-    const result = raw.result as { structuredContent?: unknown; content: Array<{ type: string }> };
+    const result = raw.result as { structuredContent?: unknown; content: Array<{ type: string; text: string }> };
     assert.ok(result.structuredContent, "app_pack_list must return structuredContent");
     assert.ok(result.content[0]!.type === "text", "text content preserved for compatibility");
+    assert.deepEqual(JSON.parse(result.content[0]!.text), result.structuredContent, "text and structuredContent must agree");
     console.log("structuredContent: PASS");
+
+    // 10. app_pack_reload reflects the REAL registry outcome. A server
+    //     pointed at a directory with a broken pack must report
+    //     reloaded:false + errors (never a fixed reloaded:true).
+    {
+      const { mkdtemp, mkdir, writeFile } = await import("node:fs/promises");
+      const { tmpdir } = await import("node:os");
+      const path = await import("node:path");
+      const badDir = await mkdtemp(path.join(tmpdir(), "bad-pack-"));
+      await mkdir(path.join(badDir, "broken"), { recursive: true });
+      await writeFile(path.join(badDir, "broken", "manifest.json"), "{ not json", "utf8");
+
+      const { startServer: startBad, initialize: initBad, callTool: callBad } = await import("./mcp-client.js");
+      const bad = startBad(["--app-pack-dir", badDir]);
+      try {
+        await initBad(bad.client);
+        const badList = (await callBad(bad.client, "app_pack_list", {})) as { packs: unknown[] };
+        assert.deepEqual(badList.packs, [], "broken pack must not be loaded");
+        const reload = (await callBad(bad.client, "app_pack_reload", {})) as {
+          reloaded: boolean; errors: Array<{ code: string }>;
+        };
+        assert.equal(reload.reloaded, false, "reload of a broken config must report reloaded:false");
+        assert.ok(reload.errors.some((e) => e.code === "MANIFEST_UNREADABLE"), "the broken pack must be reported");
+        console.log("app_pack_reload bad-config -> reloaded:false: PASS");
+      } finally {
+        bad.child.kill();
+      }
+    }
 
     console.log("\nsmoke-app-pack: PASS");
   } finally {

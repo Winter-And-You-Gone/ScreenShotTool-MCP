@@ -9,6 +9,7 @@
 - **UI Automation（UIA）优先**：读取控件树、按 selector 查询控件、通过 UIA Pattern 操作控件、等待状态变化。
 - **App Pack 声明式适配**：任何桌面软件都可以通过一个 JSON 目录（App Pack）接入，无需修改 MCP 源码。
 - **管道引擎**：`run_steps` / `profile_run_steps` / `run_workflow` 服务端串联多步操作，支持命名步骤、`exports`、后置条件（expect）、重试、finally 清理、状态恢复与失败续接（continue_run）。
+- **机器可读工具契约**：`tools/list` 直接返回每个工具的 `inputSchema`、`outputSchema` 与标准 `annotations`（readOnlyHint/destructiveHint/idempotentHint/openWorldHint），`pipeSafeFields` 通过 `_meta` 携带；另有 `tool_contract_list` / `tool_contract_describe` 高层发现接口。所有工具调用（普通调用与管道步骤）都经过统一执行器做 input + output Schema 运行时校验。
 
 ## 目录
 
@@ -239,7 +240,7 @@ $env:SCREENSHOT_MCP_APP_PACK_DIRS = "X:\Private\AppPacks;D:\Team\AppPacks"
 - `actions.json` 的 `defaultExpect` 在调用方未提供 expect 时自动生效；显式 expect 优先；`expect:false` 关闭（返回 warning）。
 - 默认可重试：`ELEMENT_NOT_AVAILABLE / UIA_ROOT_UNAVAILABLE / TARGET_WINDOW_NOT_READY / POPUP_NOT_READY / PROVIDER_BUSY`。**不可重试**（除非 `onlyCodes` 显式列出）：`ELEMENT_AMBIGUOUS / WINDOW_AMBIGUOUS / INVALID_SELECTOR / INVALID_PARAMS / PATTERN_NOT_SUPPORTED / PASSWORD_VALUE_PROTECTED / TOOL_OUTPUT_SCHEMA_MISMATCH`。非幂等动作不自动重试；`validate_steps` 对非幂等 + retry 报 `UNSAFE_RETRY`。
 - finally：主流程成功或失败都执行；失败单独记录、不覆盖主错误；`ignoreCodes` 容忍指定错误码。
-- 状态恢复：`captureBefore` 在操作前读取控件值（密码字段不捕获），`restore: "always" | "never" | "onFailure"` 在 finally 恢复并验证，恢复失败必须报告。
+- 状态恢复：`captureBefore` 在操作前读取控件的**类型化状态**（value / toggle / selection / range / expanded / visibility / page），`restore: "always" | "never" | "onFailure"` 在 finally 用匹配的反向动作恢复（setValue / setChecked / selectByName / setRangeValue / expand|collapse / ensureSelected），恢复后重新读取验证。密码控件禁止捕获/恢复/导出（`RESTORE_SENSITIVE_STATE_BLOCKED`）；无法可靠读取的状态不执行猜测式恢复（`RESTORE_STATE_UNAVAILABLE`）。旧格式 `{saveAs, read}` 自动映射为 `value` 类型；`{saveAs, state:"auto"}` 按控件状态自动检测。
 
 ## 续接失败的 run
 
@@ -249,7 +250,7 @@ $env:SCREENSHOT_MCP_APP_PACK_DIRS = "X:\Private\AppPacks;D:\Team\AppPacks"
 { "runId": "run_abc123", "continueFrom": "openSettings" }
 ```
 
-续接前检查：run 未过期（内存保留 10 分钟，最多 20 个）→ Pack 版本未变（`RUN_PACK_VERSION_CHANGED`）→ 进程仍存在（`RUN_PROCESS_EXITED`）→ HWND 仍有效（`RUN_WINDOW_RECREATED`）→ 必要前置状态仍存在。续接从失败步骤重放，已完成步骤的结果复用（不重复执行）。
+续接前检查：run 未过期（内存保留 10 分钟，最多 20 个）→ Pack 版本未变（`RUN_PACK_VERSION_CHANGED`）→ 进程仍存在（`RUN_PROCESS_EXITED`）→ HWND 仍有效（`RUN_WINDOW_RECREATED`）→ 快照可续接（`RUN_NOT_CONTINUABLE`）。续接从失败步骤重放，已完成步骤的**最小投影**（后续步骤引用的字段 + pipe-safe 字段 + exports）复用，不重复执行、不保存完整原始结果。超大的快照（含被引用的巨型字段）如实标记 `continuable:false` + `continuationReason:"RUN_SNAPSHOT_TRUNCATED"`，绝不伪装成可恢复。
 
 ## 输出 Schema 与 structuredContent
 
@@ -276,16 +277,24 @@ $env:SCREENSHOT_MCP_APP_PACK_DIRS = "X:\Private\AppPacks;D:\Team\AppPacks"
 ## 测试
 
 ```powershell
-npm test                          # 单元测试（App Pack / pipeline / contracts / workflows / runs / piping / schemas / UIA）
-npm run smoke:app-pack            # App Pack + 管道 e2e（公共示例 Pack）
+npm test                          # 单元测试（App Pack / pipeline / executor / contracts / workflows / runs / piping / schemas / UIA）
+npm run smoke:app-pack            # App Pack + 管道 e2e（公共示例 Pack；含 reload 坏配置 → reloaded:false）
 npm run smoke:run-steps           # run_steps 顺序/管道/停链语义
 npm run smoke:continue-run        # runId / continue_run e2e
-npm run smoke:first-use-pipeline  # 首次使用基准（fresh-session，默认 20 次迭代）
+npm run smoke:workflow            # workflow_catalog / run_workflow e2e
+npm run smoke:first-use-pipeline  # fresh-process 稳定性基准（默认 20 次迭代）
+npm run smoke:public-contract-pipeline  # 公开契约驱动管道测试（不读取源码）
 npm run smoke:uia-notepad         # 通用 UIA smoke（系统编辑器）
 npm run smoke:private-app-pack    # 私有 Pack 驱动（读 SCREENSHOT_MCP_TEST_PACK 等环境变量）
 # 以及既有 smoke：notepad / type-text / menu-click / no-cursor-click / print-capture /
 # p1-fixes / perf / no-activate / clipboard / window-state / wait-for-window
 ```
+
+### 关于 benchmark 的准确表述
+
+- `smoke:first-use-pipeline` 是 **fresh-process pipeline stability benchmark**（固定工作流的进程级稳定性）与 **contract-driven first-use simulation**（公开契约驱动的首次使用模拟）：每次迭代启动全新服务器进程，仅通过 `tools/list`、`app_pack_describe`、`workflow_catalog` 等公开能力驱动固定工作流。它**不是**真实大模型自主生成管道的测试。
+- 统计严格区分：`workflowFirstAttemptSuccessRate` / `pipelineFirstAttemptSuccessRate`（首次尝试，不含 continue 恢复）、`*EventuallySuccessRate`（最终成功，允许一次 continue_run 恢复）、`continueRecoverySuccessRate`（continue 恢复单独统计）、`cleanupSuccessRate`（finally 独立）、`infrastructureFailureCount`（服务器/传输失败，不计为工作流失败）。
+- 真实不同模型的自主生成成功率需要单独评测：仅凭公开工具契约构造合法管道由 `smoke:public-contract-pipeline` 证明——该测试不导入任何 `src/` 实现，只通过 MCP 客户端读取契约并构造、校验、执行管道。
 
 热重载：默认启用（`SCREENSHOTTOOL_HOT_RELOAD=0` 关闭）。修改 `src/` 或 `scripts/win-capture.ps1` 后无需重启。
 

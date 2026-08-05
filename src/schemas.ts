@@ -479,7 +479,7 @@ export const chainableToolNames = [
   "ui_inspect_tree", "ui_query", "ui_get", "ui_action", "ui_wait", "ui_catalog",
   "profile_list", "profile_resolve", "profile_action", "profile_launch",
   "app_pack_list", "app_pack_describe", "app_pack_validate", "app_pack_reload", "app_pack_probe",
-  "workflow_catalog"
+  "workflow_catalog", "tool_contract_list", "tool_contract_describe"
 ] as const;
 
 const stepIdSchema = z.string().regex(/^[A-Za-z][A-Za-z0-9_-]{0,63}$/, "step id must match ^[A-Za-z][A-Za-z0-9_-]{0,63}$");
@@ -595,6 +595,13 @@ export const continueRunSchema = z.object({
   continueFrom: z.union([stepIdSchema, z.number().int().min(0)])
 }).strict();
 
+export const toolContractListSchema = z.object({}).strict();
+export const toolContractDescribeSchema = z.object({
+  tool: z.string().min(1).max(128)
+}).strict();
+
+export type ToolContractListInput = z.infer<typeof toolContractListSchema>;
+export type ToolContractDescribeInput = z.infer<typeof toolContractDescribeSchema>;
 export type AppPackListInput = z.infer<typeof appPackListSchema>;
 export type AppPackDescribeInput = z.infer<typeof appPackDescribeSchema>;
 export type AppPackValidateInput = z.infer<typeof appPackValidateSchema>;
@@ -637,7 +644,9 @@ export const toolZodSchemas: Record<string, z.ZodTypeAny> = {
   app_pack_validate: appPackValidateSchema,
   app_pack_reload: appPackReloadSchema,
   app_pack_probe: appPackProbeSchema,
-  workflow_catalog: workflowCatalogSchema
+  workflow_catalog: workflowCatalogSchema,
+  tool_contract_list: toolContractListSchema,
+  tool_contract_describe: toolContractDescribeSchema
 };
 
 const hwndSchemaProperty = {
@@ -1273,6 +1282,19 @@ export const toolInputSchemas = {
       continueFrom: { type: "string", description: "Step id (or numeric index) of the failed step to continue from." }
     },
     required: ["runId", "continueFrom"],
+    additionalProperties: false
+  },
+  tool_contract_list: {
+    type: "object",
+    properties: {},
+    additionalProperties: false
+  },
+  tool_contract_describe: {
+    type: "object",
+    properties: {
+      tool: { type: "string", minLength: 1, description: "Tool name from tools/list." }
+    },
+    required: ["tool"],
     additionalProperties: false
   }
 } as const;

@@ -1,11 +1,15 @@
 // Output schema validation + sensitive-value guards.
 //
-// Every tool contract carries an outputSchema. Every pipeline step result is
-// validated against its tool's outputSchema before it can be referenced by a
-// later step (TOOL_OUTPUT_SCHEMA_MISMATCH otherwise), and exports are checked
-// for sensitive fields before they are stored. This module implements a small
-// structural JSON-Schema subset validator (type / required / properties /
-// items / enum / anyOf) - enough for the contract table in contracts.ts.
+// Every tool contract carries an outputSchema. Every tool call - whether a
+// plain tools/call or a pipeline step - is validated against its tool's
+// outputSchema by the unified executor (src/executor.ts) before the result is
+// returned (TOOL_OUTPUT_SCHEMA_MISMATCH otherwise). Invalid results never flow
+// into later steps, exports, run snapshots, or structuredContent.
+//
+// This module implements a small structural JSON-Schema subset validator
+// (type / required / properties / items / enum / anyOf) - enough for the
+// contract table in contracts.ts - that reports STRUCTURED errors
+// ({path, message}) instead of a single message string.
 
 import type { JsonSchema } from "./contracts.js";
 
@@ -20,26 +24,67 @@ export function isSensitiveFieldName(segments: string[]): boolean {
   });
 }
 
-export type OutputValidation = { ok: true } | { ok: false; reason: string };
+export type ValidationError = {
+  path: string;
+  message: string;
+};
+
+export type OutputValidation = { ok: true } | { ok: false; reason: string; errors: ValidationError[] };
 
 // Validate a value against a JSON Schema. Only the subset used by the
 // contract table is supported; unknown keywords are ignored. Extra properties
 // beyond the declared ones are allowed (forward compatibility).
+//
+// ARRAY COMPATIBILITY: MCP requires an object-root outputSchema, so array
+// tools (e.g. list_windows) declare `{ type: "object", properties: { items:
+// { type: "array", ... } }, required: ["items"] }` while their raw result is
+// the bare array. When a schema declares exactly that shape and the value is
+// an array, the value is validated as `{ items: value }` - keeping the public
+// contract (and structuredContent `{items:[...]}`) consistent with the raw
+// value used by ${N.path} references.
 export function validateAgainstSchema(value: unknown, schema: JsonSchema | undefined): OutputValidation {
   if (!schema) return { ok: true };
-  const v = validateNode(value, schema, "$");
-  if (v.ok) return { ok: true };
-  return { ok: false, reason: v.reason };
+  let errors: ValidationError[] = [];
+  const ok = validateNode(value, schema, "$", errors, schema);
+  if (ok) return { ok: true };
+  return { ok: false, reason: errors[0]?.message ?? "output schema mismatch", errors };
 }
 
-function validateNode(value: unknown, schema: JsonSchema, path: string): OutputValidation {
-  // anyOf: at least one branch must validate.
+function validateNode(
+  value: unknown,
+  schema: JsonSchema,
+  path: string,
+  errors: ValidationError[],
+  rootSchema: JsonSchema
+): boolean {
+  // Array-compat auto-wrap: object schema whose only array property is
+  // "items", against a raw array value.
+  if (
+    schema.type === "object"
+    && Array.isArray(value)
+    && schema.properties?.items?.type === "array"
+    && schema.required?.includes("items")
+  ) {
+    return validateNode({ items: value }, schema, path, errors, rootSchema);
+  }
+
+  let valid = true;
+  const fail = (message: string): void => {
+    valid = false;
+    errors.push({ path, message });
+  };
+
+  // anyOf: at least one branch must validate (checked against a scratch
+  // error list so a failed branch does not pollute the report).
   if (schema.anyOf && schema.anyOf.length > 0) {
-    const branch = schema.anyOf.find((b) => validateNode(value, b, path).ok);
-    if (branch === undefined) {
-      return { ok: false, reason: `value at ${path} does not match any anyOf branch` };
+    const branchHits = schema.anyOf.some((b) => {
+      const scratch: ValidationError[] = [];
+      return validateNode(value, b, path, scratch, rootSchema);
+    });
+    if (!branchHits) {
+      fail(`value at ${path} does not match any anyOf branch`);
     }
-    return { ok: true };
+    return valid;
   }
 
   if (schema.type !== undefined) {
@@ -54,20 +99,19 @@ function validateNode(value: unknown, schema: JsonSchema, path: string): OutputV
                   : t === "null" ? value === null
                     : true;
     if (!typeOk) {
-      return { ok: false, reason: `expected ${t} at ${path}, got ${value === null ? "null" : typeof value}` };
+      fail(`expected ${t} at ${path}, got ${value === null ? "null" : typeof value}`);
     }
   }
 
   if (schema.enum !== undefined) {
     if (!schema.enum.some((e) => e === value)) {
-      return { ok: false, reason: `value at ${path} is not one of the allowed enum values` };
+      fail(`value at ${path} is not one of the allowed enum values`);
     }
   }
 
   if (Array.isArray(value) && schema.items) {
     for (let i = 0; i < value.length; i++) {
-      const r = validateNode(value[i], schema.items, `${path}[${i}]`);
-      if (!r.ok) return r;
+      if (!validateNode(value[i], schema.items, `${path}[${i}]`, errors, rootSchema)) valid = false;
     }
   }
 
@@ -75,18 +119,17 @@ function validateNode(value: unknown, schema: JsonSchema, path: string): OutputV
     const record = value as Record<string, unknown>;
     for (const [key, sub] of Object.entries(schema.properties)) {
       if (record[key] !== undefined) {
-        const r = validateNode(record[key], sub, `${path}.${key}`);
-        if (!r.ok) return r;
+        if (!validateNode(record[key], sub, `${path}.${key}`, errors, rootSchema)) valid = false;
       }
     }
     for (const key of schema.required ?? []) {
       if (record[key] === undefined) {
-        return { ok: false, reason: `missing required field '${path}.${key}'` };
+        fail(`missing required field '${path}.${key}'`);
       }
     }
   }
 
-  return { ok: true };
+  return valid;
 }
 
 // Size limits for single pipeline results (spec).

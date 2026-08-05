@@ -1,0 +1,115 @@
+// Unit tests for the unified tool executor (src/executor.ts):
+//   - every tool call goes through read contract -> validate input ->
+//     dispatch -> validate output
+//   - an output that violates its outputSchema raises
+//     TOOL_OUTPUT_SCHEMA_MISMATCH with structured validationErrors and the
+//     value is discarded (never passed on)
+//   - business errors are NOT forced through the success outputSchema
+import assert from "node:assert/strict";
+import test from "node:test";
+
+import { executeValidatedTool, ToolOutputSchemaMismatchError, type ToolExecutorContext } from "../src/executor.js";
+import { McpUiError } from "../src/uia/results.js";
+
+function makeCtx(opts: {
+  parseInput?: ToolExecutorContext["parseInput"];
+  dispatch: (tool: string, input: unknown) => Promise<unknown>;
+}): ToolExecutorContext {
+  return {
+    parseInput: opts.parseInput ?? ((tool, args) => {
+      // Minimal input validation: unknown tool rejected, else pass through.
+      if (tool === "not_a_tool") return { ok: false, message: "unknown tool" };
+      return { ok: true, value: args };
+    }),
+    dispatch: opts.dispatch
+  };
+}
+
+test("valid output passes through unchanged", async () => {
+  const ctx = makeCtx({ dispatch: async () => ({ profile: "x", pid: 1, title: "x", startedByMcp: true, reused: false, uiaRootAvailable: true }) });
+  const result = await executeValidatedTool("profile_launch", { profile: "x" }, ctx);
+  assert.deepEqual(result, { profile: "x", pid: 1, title: "x", startedByMcp: true, reused: false, uiaRootAvailable: true });
+});
+
+test("invalid output raises TOOL_OUTPUT_SCHEMA_MISMATCH with structured errors", async () => {
+  const ctx = makeCtx({
+    dispatch: async () => ({ pid: "not-a-number", title: "x" }) // pid must be integer
+  });
+  await assert.rejects(
+    () => executeValidatedTool("profile_launch", { profile: "x" }, ctx),
+    (error: unknown) => {
+      assert.ok(error instanceof ToolOutputSchemaMismatchError);
+      assert.equal(error.code, "TOOL_OUTPUT_SCHEMA_MISMATCH");
+      assert.equal(error.tool, "profile_launch");
+      assert.equal(error.schemaVersion, 1);
+      assert.ok(Array.isArray(error.validationErrors));
+      assert.ok(error.validationErrors!.some((e) => e.path.includes("pid")), JSON.stringify(error.validationErrors));
+      return true;
+    }
+  );
+});
+
+test("array tools validate against the object-root {items} schema", async () => {
+  // list_windows declares { items: [...] } publicly but returns a bare array.
+  const ctx = makeCtx({
+    dispatch: async () => [{ hwnd: "1", title: "a", pid: 1, processName: "p", className: "c", rect: { x: 0, y: 0, width: 1, height: 1 } }]
+  });
+  const result = await executeValidatedTool("list_windows", {}, ctx);
+  assert.ok(Array.isArray(result), "raw array result is preserved for ${N.path} references");
+
+  const bad = makeCtx({ dispatch: async () => [{ hwnd: 42 }] }); // missing fields + wrong type
+  await assert.rejects(
+    () => executeValidatedTool("list_windows", {}, bad),
+    (error: unknown) => {
+      assert.ok(error instanceof ToolOutputSchemaMismatchError);
+      return true;
+    }
+  );
+});
+
+test("business errors propagate as-is (not forced through the success schema)", async () => {
+  const ctx = makeCtx({
+    dispatch: async () => { throw new McpUiError("ELEMENT_NOT_FOUND", "missing"); }
+  });
+  await assert.rejects(
+    () => executeValidatedTool("ui_get", { selector: { automationId: "x" }, pid: 1 }, ctx),
+    (error: unknown) => {
+      assert.ok(error instanceof McpUiError);
+      assert.equal(error.code, "ELEMENT_NOT_FOUND");
+      return true;
+    }
+  );
+});
+
+test("input validation failures raise InvalidParams before dispatch", async () => {
+  let dispatched = false;
+  const ctx = makeCtx({
+    parseInput: (tool, args) => {
+      void tool;
+      if ((args as { bad?: boolean })?.bad) return { ok: false, message: "bad input" };
+      return { ok: true, value: args };
+    },
+    dispatch: async () => { dispatched = true; return { profile: "x", pid: 1, title: "x", startedByMcp: true, reused: false, uiaRootAvailable: true }; }
+  });
+  await assert.rejects(
+    () => executeValidatedTool("profile_launch", { bad: true }, ctx),
+    (error: unknown) => {
+      assert.equal((error as { code?: number }).code, -32602); // InvalidParams
+      return true;
+    }
+  );
+  assert.equal(dispatched, false, "dispatch must not run when input is invalid");
+});
+
+test("unknown tools raise MethodNotFound", async () => {
+  const ctx = makeCtx({
+    dispatch: async () => { throw new Error("unused"); }
+  });
+  await assert.rejects(
+    () => executeValidatedTool("nope", {}, ctx),
+    (error: unknown) => {
+      assert.equal((error as { code?: number }).code, -32601); // MethodNotFound
+      return true;
+    }
+  );
+});

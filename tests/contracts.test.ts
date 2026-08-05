@@ -4,7 +4,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { getContract, contracts, chainableContracts } from "../src/contracts.js";
+import { getContract, contracts, chainableContracts, toMcpToolDefinition, contractExamples } from "../src/contracts.js";
 import { validateAgainstSchema, isSensitiveFieldName, walkLeaves } from "../src/outputs.js";
 
 test("every tool contract has inputSchema, outputSchema and pipeSafeFields", () => {
@@ -103,4 +103,45 @@ test("launch_profile output schema matches the real result shape", () => {
 test("getContract returns undefined for unknown tools", () => {
   assert.equal(getContract("not_a_tool"), undefined);
   assert.equal(getContract("run_steps")?.name, "run_steps");
+});
+
+// ── MCP tools/list exposure ──
+
+test("toMcpToolDefinition exposes outputSchema + standard annotations", () => {
+  for (const name of Object.keys(contracts)) {
+    const def = toMcpToolDefinition(contracts[name]!);
+    assert.ok(def.outputSchema, `${name} must expose outputSchema`);
+    assert.equal(def.outputSchema.type, "object", "MCP requires an object-root outputSchema");
+    assert.ok(def.annotations, `${name} must expose annotations`);
+    assert.ok(typeof def.annotations.openWorldHint === "boolean", "openWorldHint is set for desktop-automation tools");
+    // readOnlyHint maps from the internal readOnly annotation.
+    if (contracts[name]!.annotations?.readOnly !== undefined) {
+      assert.equal(def.annotations.readOnlyHint, contracts[name]!.annotations!.readOnly);
+    }
+    // pipeSafeFields ride along in _meta.
+    assert.deepEqual(def._meta?.pipeSafeFields, contracts[name]!.pipeSafeFields);
+  }
+});
+
+test("array tools expose {items} object-root schemas (MCP compatible)", () => {
+  const def = toMcpToolDefinition(contracts.list_windows!);
+  assert.equal(def.outputSchema.type, "object");
+  assert.equal(def.outputSchema.properties?.items?.type, "array");
+  assert.ok(def.outputSchema.required?.includes("items"));
+});
+
+test("contractExamples derives result paths from pipeSafeFields", () => {
+  const ex = contractExamples(contracts.profile_launch!);
+  assert.ok(ex.some((e) => e.resultPath === "pid" && e.type === "integer"));
+  assert.ok(ex.some((e) => e.resultPath === "hwnd" && e.type === "string"));
+});
+
+test("internal-only annotations are not leaked through tools/list annotations", () => {
+  const def = toMcpToolDefinition(contracts.ui_action!);
+  const keys = Object.keys(def.annotations);
+  assert.ok(!keys.includes("needsExpect"), "needsExpect is internal");
+  assert.ok(!keys.includes("retrySafe"), "retrySafe is internal");
+  // ...but the full internal annotations ARE available via the describe
+  // surface (tool_contract_describe implementation uses contracts directly).
+  assert.equal(contracts.ui_action!.annotations?.needsExpect, true);
 });

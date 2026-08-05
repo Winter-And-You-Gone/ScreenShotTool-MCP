@@ -362,6 +362,17 @@ function collectPlaceholderPaths(args: unknown, head: string): string[][] {
 function fieldExistsInSchema(contract: ToolContract, segments: string[]): boolean {
   let node: import("../contracts.js").JsonSchema = contract.outputSchema;
   for (const seg of segments) {
+    // Numeric segments index into arrays.
+    if (/^\d+$/.test(seg)) {
+      if (node.type === "array" && node.items) {
+        node = node.items;
+        continue;
+      }
+      if (node.type === "object" && node.properties?.items?.type === "array") {
+        node = node.properties.items.items ?? {};
+        continue;
+      }
+    }
     if (node.type === "array" && node.items) node = node.items;
     // Unverifiable schema node (any / no declared properties): assume deeper
     // paths may exist.

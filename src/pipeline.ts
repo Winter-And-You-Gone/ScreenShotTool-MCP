@@ -15,8 +15,8 @@ import type { PackActions, PackDefaultExpect, PackWorkflowStep } from "./app-pac
 import type { AppProfile } from "./profiles/types.js";
 import { evaluateExpect, type ExpectContext, type ExpectResult } from "./expect.js";
 import { extractReferenceHeads, resolvePlaceholdersEx, validateReferences, type PipeContext } from "./piping.js";
-import { estimateJsonBytes, isSensitiveFieldName, MAX_PIPELINE_RESULT_BYTES, MAX_STEP_RESULT_BYTES, validateAgainstSchema } from "./outputs.js";
-import { createRunId, saveRun, type RunSnapshot } from "./runs.js";
+import { estimateJsonBytes, isSensitiveFieldName, MAX_PIPELINE_RESULT_BYTES, MAX_STEP_RESULT_BYTES } from "./outputs.js";
+import { createRunId, saveRun, type RunSnapshot, type StepSnapshot } from "./runs.js";
 
 // ── Limits (spec section 23) ──
 
@@ -129,6 +129,9 @@ export type PipelineResult = {
   finallyResults: StepExecutionResult[];
   restoreResults: Array<{ key: string; success: boolean; message?: string; valueCaptured?: boolean }>;
   warnings: string[];
+  // Continuability of the saved run snapshot (continue_run preconditions).
+  continuable: boolean;
+  continuationReason: string | null;
 };
 
 // ── Static validation (shared by validate_steps and run-time preflight) ──
@@ -332,6 +335,17 @@ export function validatePipelineStatic(input: PipelineInput, ctx: StaticValidati
 function fieldExists(contract: ToolContract, segments: string[]): boolean {
   let node: import("./contracts.js").JsonSchema = contract.outputSchema;
   for (const seg of segments) {
+    // Numeric segments index into arrays.
+    if (/^\d+$/.test(seg)) {
+      if (node.type === "array" && node.items) {
+        node = node.items;
+        continue;
+      }
+      if (node.type === "object" && node.properties?.items?.type === "array") {
+        node = node.properties.items.items ?? {};
+        continue;
+      }
+    }
     if (node.type === "array" && node.items) node = node.items;
     // Unverifiable schema node (any / untyped / no declared properties):
     // deeper paths cannot be checked statically, assume they may exist.
@@ -434,7 +448,292 @@ export type ExecutionContext = {
   expectDeps: ExpectContext;
 };
 
-type CapturedValue = { tool: string; args: Record<string, unknown>; value: unknown; protected: boolean };
+// ── Typed state capture / restore ──
+//
+// captureBefore records a TYPED state snapshot (not just a raw value):
+// value / toggle / selection / range / expanded / visibility / page. The
+// capture kind is derived from the step's action when available, else
+// auto-detected from the control's UIA state. Restore replays the matching
+// reverse action and VERIFIES the state afterwards. Password-protected
+// controls are never captured or restored.
+
+export type CapturedState =
+  | { kind: "value"; value: string }
+  | { kind: "toggle"; checked: boolean }
+  | { kind: "selection"; name?: string; index?: number }
+  | { kind: "range"; value: number }
+  | { kind: "expanded"; expanded: boolean }
+  | { kind: "visibility"; visible: boolean }
+  | { kind: "page"; control: string };
+
+export type CapturedValue = {
+  key: string;
+  state: CapturedState;
+  protected: boolean;
+  readTool: string;
+  readArgs: Record<string, unknown>;
+  // For step-level captures: the step's own tool/args (restore targets the
+  // same control with the matching reverse action).
+  stepTool?: string;
+  stepArgs?: Record<string, unknown>;
+};
+
+// Map a step action to the state kind it mutates.
+function captureKindForAction(action: string | undefined): CapturedState["kind"] | "auto" {
+  switch (action) {
+    case "setValue": case "appendText": case "clear": return "value";
+    case "setChecked": case "toggle": return "toggle";
+    case "selectByName": case "selectByIndex": return "selection";
+    case "setRangeValue": return "range";
+    case "expand": case "collapse": return "expanded";
+    case "ensureSelected": case "ensurePageSelected": return "page";
+    default: return "auto";
+  }
+}
+
+// Read a control's state before an action (for later restore). Password
+// fields are never captured (valueProtected).
+async function captureValue(
+  entry: CaptureEntry,
+  ctx: ExecutionContext,
+  byId: Map<string, unknown>,
+  byIndex: unknown[],
+  step?: PipelineStepInput
+): Promise<CapturedValue | undefined> {
+  const read = entry.read ?? { tool: "ui_get", args: {} };
+  const readTool = read.tool ?? "ui_get";
+  let args: unknown;
+  try {
+    const resolution = resolvePlaceholdersEx(read.args ?? {}, { byId, byIndex, pack: ctx.pack ? { id: ctx.pack.id } : undefined, inputs: ctx.inputs });
+    if (!resolution.ok) return undefined;
+    args = resolution.value;
+  } catch {
+    return undefined;
+  }
+
+  // Page selection: the target control IS the state (selected page); no read
+  // needed when the step itself names it.
+  if (step && captureKindForAction(step.args?.action as string | undefined) === "page") {
+    const control = step.args?.control as string | undefined;
+    if (control) {
+      return {
+        key: entry.saveAs,
+        state: { kind: "page", control },
+        protected: false,
+        readTool,
+        readArgs: (read.args ?? {}) as Record<string, unknown>,
+        stepTool: step.tool,
+        stepArgs: step.args as Record<string, unknown>
+      };
+    }
+  }
+
+  try {
+    const result = await ctx.dispatch(readTool, args);
+    const element = (result as { element?: { isPassword?: boolean; valueProtected?: boolean; value?: string | null; toggleState?: string | null; rangeValue?: number | null; expandCollapseState?: string | null; offscreen?: boolean } }).element;
+    if (!element) return undefined;
+    if (element.isPassword || element.valueProtected) {
+      return { key: entry.saveAs, state: { kind: "value", value: "" }, protected: true, readTool, readArgs: (read.args ?? {}) as Record<string, unknown> };
+    }
+
+    const kind = step ? captureKindForAction(step.args?.action as string | undefined) : "auto";
+    let state: CapturedState | undefined;
+    switch (kind) {
+      case "value":
+        if (typeof element.value === "string") state = { kind: "value", value: element.value };
+        break;
+      case "toggle":
+        if (element.toggleState !== null && element.toggleState !== undefined) state = { kind: "toggle", checked: element.toggleState === "On" };
+        break;
+      case "selection": {
+        const index = typeof step?.args?.index === "number" ? step.args.index : undefined;
+        state = { kind: "selection", ...(typeof element.value === "string" && element.value.length > 0 ? { name: element.value } : {}), ...(index !== undefined ? { index } : {}) };
+        break;
+      }
+      case "range":
+        if (typeof element.rangeValue === "number") state = { kind: "range", value: element.rangeValue };
+        break;
+      case "expanded":
+        if (element.expandCollapseState !== null && element.expandCollapseState !== undefined) state = { kind: "expanded", expanded: element.expandCollapseState === "Expanded" };
+        break;
+      default: {
+        // auto: prefer the most specific state the control exposes.
+        if (element.toggleState !== null && element.toggleState !== undefined) state = { kind: "toggle", checked: element.toggleState === "On" };
+        else if (typeof element.rangeValue === "number") state = { kind: "range", value: element.rangeValue };
+        else if (element.expandCollapseState !== null && element.expandCollapseState !== undefined) state = { kind: "expanded", expanded: element.expandCollapseState === "Expanded" };
+        else if (typeof element.value === "string") state = { kind: "value", value: element.value };
+        break;
+      }
+    }
+    if (!state) return undefined;
+    return {
+      key: entry.saveAs,
+      state,
+      protected: false,
+      readTool,
+      readArgs: (read.args ?? {}) as Record<string, unknown>,
+      ...(step ? { stepTool: step.tool, stepArgs: step.args as Record<string, unknown> } : {})
+    };
+  } catch {
+    return undefined;
+  }
+}
+
+export type RestoreResult = {
+  key: string;
+  attempted: boolean;
+  success: boolean;
+  kind?: string;
+  method?: string;
+  verified?: boolean;
+  message?: string;
+  valueCaptured?: boolean;
+};
+
+async function runRestore(
+  input: PipelineInput,
+  success: boolean,
+  captured: Map<string, CapturedValue>,
+  ctx: ExecutionContext,
+  byId: Map<string, unknown>,
+  byIndex: unknown[],
+  deadline: number
+): Promise<RestoreResult[]> {
+  const mode = input.restore ?? "never";
+  if (mode === "never" || (mode === "onFailure" && success)) return [];
+  const results: RestoreResult[] = [];
+  for (const entry of captured.values()) {
+    if (Date.now() > deadline) {
+      results.push({ key: entry.key, attempted: false, success: false, message: "Restore skipped: pipeline time budget exceeded.", valueCaptured: !entry.protected });
+      continue;
+    }
+    if (entry.protected) {
+      results.push({
+        key: entry.key, attempted: false, success: false,
+        message: "State not captured (password-protected); capture, restore, export and error echo are blocked.",
+        valueCaptured: false
+      });
+      continue;
+    }
+    const outcome = await restoreOne(entry, ctx);
+    results.push(outcome);
+  }
+  return results;
+}
+
+// Restore one captured state with the matching reverse action, then VERIFY by
+// re-reading the control.
+async function restoreOne(entry: CapturedValue, ctx: ExecutionContext): Promise<RestoreResult> {
+  const base: RestoreResult = { key: entry.key, attempted: true, success: false, valueCaptured: true, kind: entry.state.kind };
+  try {
+    const restorePlan = restoreActionFor(entry);
+    if (restorePlan.action === null) {
+      return { ...base, message: `No restore action available for state kind '${entry.state.kind}' captured with '${entry.readTool}' (RESTORE_STATE_UNAVAILABLE).` };
+    }
+    await ctx.dispatch(restorePlan.restoreArgs.tool, restorePlan.restoreArgs.args);
+    // Verify by re-reading the same control.
+    const verified = await verifyRestore(entry, ctx);
+    return {
+      ...base,
+      success: verified.ok,
+      method: restorePlan.action,
+      verified: verified.ok,
+      message: verified.ok ? undefined : `Restore did not verify: expected ${verified.expected}, read ${verified.actual} (RESTORE_VERIFICATION_FAILED).`
+    };
+  } catch (error) {
+    const code = (error as { code?: string }).code;
+    const message = error instanceof Error ? error.message : String(error);
+    if (code === "RESTORE_SENSITIVE_STATE_BLOCKED") {
+      return { ...base, success: false, message: "Password-protected state is never captured or restored (RESTORE_SENSITIVE_STATE_BLOCKED).", valueCaptured: false };
+    }
+    return { ...base, message: `Restore failed: ${code ?? ""} ${message}`.trim() };
+  }
+}
+
+// Build the reverse action for a captured state. Step-level captures restore
+// through the step's own tool with the same target; pipeline-level captures
+// restore through ui_action on the captured selector.
+function restoreActionFor(entry: CapturedValue): { action: string; restoreArgs: { tool: string; args: Record<string, unknown> } } | { action: null } {
+  const stepTool = entry.stepTool;
+  const stepArgs = entry.stepArgs;
+  const s = entry.state;
+
+  if (s.kind === "page" && stepTool === "profile_action" && stepArgs) {
+    return { action: "ensureSelected", restoreArgs: { tool: "profile_action", args: { ...stepArgs, action: "ensureSelected" } } };
+  }
+
+  if (stepTool === "profile_action" && stepArgs) {
+    const target = (a: string, extra: Record<string, unknown> = {}) => ({ action: a, restoreArgs: { tool: "profile_action", args: { ...stepArgs, action: a, ...extra } } });
+    switch (s.kind) {
+      case "value": return target("setValue", { value: s.value });
+      case "toggle": return target("setChecked", { value: s.checked ? "true" : "false" });
+      case "selection":
+        if (s.name !== undefined) return target("selectByName", { value: s.name });
+        if (s.index !== undefined) return target("selectByIndex", { index: s.index });
+        return { action: null };
+      case "range": return target("setRangeValue", { rangeValue: s.value });
+      case "expanded": return target(s.expanded ? "expand" : "collapse");
+      default: return { action: null };
+    }
+  }
+
+  if (stepTool === "ui_action" && stepArgs) {
+    const target = (a: string, extra: Record<string, unknown> = {}) => ({ action: a, restoreArgs: { tool: "ui_action", args: { ...stepArgs, action: a, ...extra } } });
+    switch (s.kind) {
+      case "value": return target("setValue", { value: s.value });
+      case "toggle": return target("setChecked", { value: s.checked ? "true" : "false" });
+      case "range": return target("setRangeValue", { rangeValue: s.value });
+      case "expanded": return target(s.expanded ? "expand" : "collapse");
+      default: return { action: null };
+    }
+  }
+
+  // Pipeline-level capture (read via ui_get with a selector): restore via
+  // ui_action on the same selector.
+  if (entry.readTool === "ui_get") {
+    const selectorArgs = { ...entry.readArgs };
+    const target = (a: string, extra: Record<string, unknown> = {}) => ({ action: a, restoreArgs: { tool: "ui_action", args: { ...selectorArgs, action: a, ...extra } } });
+    switch (s.kind) {
+      case "value": return target("setValue", { value: s.value });
+      case "toggle": return target("setChecked", { value: s.checked ? "true" : "false" });
+      case "range": return target("setRangeValue", { rangeValue: s.value });
+      case "expanded": return target(s.expanded ? "expand" : "collapse");
+      // selection cannot be restored by name through ui_action
+      default: return { action: null };
+    }
+  }
+  return { action: null };
+}
+
+// Re-read the control and compare the captured state's field.
+async function verifyRestore(entry: CapturedValue, ctx: ExecutionContext): Promise<{ ok: boolean; expected: string; actual: string }> {
+  const s = entry.state;
+  const readTool = entry.readTool ?? "ui_get";
+  const readArgs = entry.readArgs;
+  let result: unknown;
+  try {
+    result = await ctx.dispatch(readTool, readArgs);
+  } catch (error) {
+    const code = (error as { code?: string }).code;
+    if (code === "RESTORE_SENSITIVE_STATE_BLOCKED") throw error;
+    return { ok: false, expected: String(s.kind), actual: `read failed: ${error instanceof Error ? error.message : String(error)}` };
+  }
+  const element = (result as { element?: { isPassword?: boolean; valueProtected?: boolean; value?: string | null; toggleState?: string | null; rangeValue?: number | null; expandCollapseState?: string | null; offscreen?: boolean } }).element;
+  if (!element) return { ok: false, expected: String(s.kind), actual: "element not found" };
+  if (element.isPassword || element.valueProtected) {
+    throw new Error("RESTORE_SENSITIVE_STATE_BLOCKED");
+  }
+  switch (s.kind) {
+    case "value": return { ok: element.value === s.value, expected: String(s.value), actual: String(element.value) };
+    case "toggle": return { ok: (element.toggleState === "On") === s.checked, expected: String(s.checked), actual: String(element.toggleState) };
+    case "range": return { ok: element.rangeValue === s.value, expected: String(s.value), actual: String(element.rangeValue) };
+    case "expanded": return { ok: (element.expandCollapseState === "Expanded") === s.expanded, expected: String(s.expanded), actual: String(element.expandCollapseState) };
+    case "visibility": return { ok: !element.offscreen === s.visible, expected: String(s.visible), actual: String(!element.offscreen) };
+    case "selection": return { ok: s.name === undefined || element.value === s.name, expected: s.name ?? String(s.index), actual: String(element.value) };
+    case "page": return { ok: true, expected: s.control, actual: s.control };
+    default: return { ok: false, expected: "unknown", actual: "unknown state kind" };
+  }
+}
 
 export async function runPipeline(input: PipelineInput, ctx: ExecutionContext): Promise<PipelineResult> {
   const runId = createRunId();
@@ -442,6 +741,8 @@ export async function runPipeline(input: PipelineInput, ctx: ExecutionContext): 
   const deadline = Date.now() + maxTotalMs;
   const warnings: string[] = [];
   const exports: Record<string, unknown> = {};
+  // Per-step exported values (used by the minimal run snapshot).
+  const stepExportValues: Array<Record<string, unknown>> = [];
   const byId = new Map<string, unknown>();
   const byIndex: unknown[] = [];
   const stepResults: StepExecutionResult[] = [];
@@ -478,9 +779,9 @@ export async function runPipeline(input: PipelineInput, ctx: ExecutionContext): 
     }
     const step = input.steps[i]!;
 
-    // Step-level captureBefore: read the control's value before acting.
+    // Step-level captureBefore: read the control's state before acting.
     if (step.captureBefore?.saveAs) {
-      const capturedValue = await captureValue(step.captureBefore, ctx, byId, byIndex);
+      const capturedValue = await captureValue(step.captureBefore, ctx, byId, byIndex, step);
       if (capturedValue) captured.set(step.captureBefore.saveAs, capturedValue);
     }
 
@@ -493,8 +794,9 @@ export async function runPipeline(input: PipelineInput, ctx: ExecutionContext): 
         completedIds.push(step.id);
       }
       // Validate exports.
-      const exportErrors = applyExports(step, exec.result!, exports);
-      for (const err of exportErrors) {
+      const exportOutcome = applyExports(step, exec.result!, exports);
+      stepExportValues.push(exportOutcome.values);
+      for (const err of exportOutcome.errors) {
         stepResults.push({ tool: step.tool, success: false, error: err });
         stoppedAtIndex = i;
         stopError = err;
@@ -518,7 +820,29 @@ export async function runPipeline(input: PipelineInput, ctx: ExecutionContext): 
   const restoreResults = await runRestore(input, success, captured, ctx, byId, byIndex, deadline);
   const finallyResults = await runFinally(input, ctx, pipeCtx, exports, deadline, warnings);
 
-  // Persist a snapshot for continue_run.
+  // Persist a MINIMAL continuable snapshot: per completed step only the
+  // fields later steps reference + pipe-safe fields + that step's exports
+  // (pipeProjection). Oversized snapshots are marked not-continuable, never
+  // silently presented as resumable.
+  const futureRefs = collectFutureReferences(input);
+  const stepSnapshots: StepSnapshot[] = [];
+  for (let i = 0; i < input.steps.length; i++) {
+    const exec = stepResults[i];
+    if (!exec) break; // steps after the stop point never ran
+    const step = input.steps[i]!;
+    const contract = getContract(step.tool);
+    stepSnapshots.push({
+      id: step.id,
+      index: i,
+      tool: step.tool,
+      pipeProjection: exec.success && contract
+        ? buildPipeProjection(i, step.id, exec.result, futureRefs, step.exports ?? {}, contract)
+        : null,
+      exports: stepExportValues[i] ?? {},
+      success: exec.success,
+      error: exec.error
+    });
+  }
   const snapshot: RunSnapshot = {
     runId,
     kind: "run_steps",
@@ -531,16 +855,17 @@ export async function runPipeline(input: PipelineInput, ctx: ExecutionContext): 
     hwnd: ctx.autoContext?.hwnd,
     title: ctx.autoContext?.title,
     profile: ctx.autoContext?.profile,
-    resolvedArgs: input.steps.map((s) => ({ tool: s.tool, args: s.args })),
-    results: input.steps.map((s, i) => ({ id: s.id, tool: s.tool, success: stepResults[i]?.success ?? false, result: stepResults[i]?.result, error: stepResults[i]?.error })),
+    steps: stepSnapshots,
     exports,
     stoppedAtStep: stoppedAtIndex ?? input.steps.length,
     error: stopError,
     inputs: ctx.inputs,
     maxSteps: input.steps.length,
-    totalTimeoutMs: maxTotalMs
+    totalTimeoutMs: maxTotalMs,
+    continuable: false,
+    continuationReason: null
   };
-  saveRun(snapshot);
+  const saved = saveRun(snapshot);
 
   return {
     schemaVersion: 1,
@@ -557,7 +882,9 @@ export async function runPipeline(input: PipelineInput, ctx: ExecutionContext): 
     ...(stopError ? { error: stopError } : {}),
     finallyResults,
     restoreResults,
-    warnings
+    warnings,
+    continuable: saved.continuable,
+    continuationReason: saved.continuationReason
   };
 }
 
@@ -588,8 +915,98 @@ function pipelineFailure(
     error,
     finallyResults,
     restoreResults: restoreResults ?? [],
-    warnings
+    warnings,
+    continuable: false,
+    continuationReason: null
   };
+}
+
+// ── Minimal continuable snapshots ──
+//
+// Before execution we statically collect every placeholder reference in step
+// args, expects, finally steps and capture/restore reads. After a step
+// completes we keep ONLY:
+//   - the fields future steps reference from this step,
+//   - this step's exported fields,
+//   - the tool contract's pipe-safe top-level fields,
+//   - cheap context objects (small arrays/objects).
+// The full raw result is never stored in the run snapshot.
+
+function collectFutureReferences(input: PipelineInput): Map<string, string[][]> {
+  const refs = new Map<string, string[][]>();
+  const add = (value: unknown): void => {
+    for (const r of extractReferenceHeads(value)) {
+      const list = refs.get(r.head) ?? [];
+      if (!list.some((p) => p.join(".") === r.tail.join("."))) list.push(r.tail);
+      refs.set(r.head, list);
+    }
+  };
+  for (const step of input.steps) {
+    add(step.args);
+    if (step.expect) add(step.expect);
+    if (step.captureBefore?.read?.args) add(step.captureBefore.read.args);
+  }
+  for (const f of input.finally ?? []) {
+    add(f.args);
+    if (f.expect) add(f.expect);
+    if (f.captureBefore?.read?.args) add(f.captureBefore.read.args);
+  }
+  for (const c of input.captureBefore ?? []) add(c.read?.args);
+  return refs;
+}
+
+function buildPipeProjection(
+  stepIndex: number,
+  stepId: string | undefined,
+  result: unknown,
+  futureRefs: Map<string, string[][]>,
+  exportPaths: Record<string, string>,
+  contract: ToolContract
+): unknown {
+  const required: string[][] = [];
+  // 1. This step's exported paths.
+  for (const path of Object.values(exportPaths)) {
+    required.push(path.split(".").filter((s) => s !== "$" && s !== ""));
+  }
+  // 2. Future references targeting this step (by index and by id).
+  const heads = [String(stepIndex), ...(stepId ? [stepId] : [])];
+  for (const head of heads) {
+    for (const tail of futureRefs.get(head) ?? []) required.push(tail);
+  }
+  // 3. Contract pipe-safe top-level fields are kept when cheap (bounded).
+  return pickPaths(result, required, contract.pipeSafeFields);
+}
+
+// Oversized pipe-safe fields (e.g. a full ui_inspect_tree node array) are
+// NOT projected unless explicitly referenced - the snapshot must stay small
+// enough to be honestly resumable.
+const PIPE_SAFE_PROJECTION_MAX_BYTES = 64 * 1024;
+
+// Keep only the top-level subtrees touched by the required paths (plus cheap
+// context objects and cheap pipe-safe fields). Index references keep the
+// whole array (indices are data-dependent and cannot be sliced statically).
+function pickPaths(value: unknown, paths: string[][], pipeSafeFields: string[] = []): unknown {
+  if (value === null || typeof value !== "object") return value;
+  const top = new Set<string>();
+  let anyIndex = false;
+  for (const p of paths) {
+    if (p.length === 0) continue;
+    if (/^\d+$/.test(p[0]!)) anyIndex = true;
+    else top.add(p[0]!);
+  }
+  if (Array.isArray(value)) return anyIndex ? value : [];
+  const out: Record<string, unknown> = {};
+  for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
+    if (top.has(k)) {
+      out[k] = v;
+    } else if (pipeSafeFields.includes(k) && v !== null && typeof v === "object" && estimateJsonBytes(v) <= PIPE_SAFE_PROJECTION_MAX_BYTES) {
+      out[k] = v;
+    } else if (v !== null && typeof v === "object" && estimateJsonBytes(v) <= 4096) {
+      // Cheap context objects are preserved (bounded, harmless).
+      out[k] = v;
+    }
+  }
+  return out;
 }
 
 // Execute one step with expect + retry semantics.
@@ -645,17 +1062,9 @@ async function executeStep(
       return { tool: step.tool, success: false, error: lastError };
     }
 
-    // Validate the result against the tool's outputSchema before it can be
-    // used by later steps.
-    const outputCheck = validateAgainstSchema(result, contract.outputSchema);
-    if (!outputCheck.ok) {
-      lastError = { code: "TOOL_OUTPUT_SCHEMA_MISMATCH", message: `${step.tool} result failed its output schema: ${outputCheck.reason}` };
-      if (shouldRetry(lastError.code, onlyCodes, step, ctx)) {
-        await sleep(delayMs * Math.pow(backoff, attempt));
-        continue;
-      }
-      return { tool: step.tool, success: false, error: lastError };
-    }
+    // NOTE: output schema validation happens ONCE in the unified executor
+    // (src/executor.ts) for every tool call, including pipeline steps - a
+    // result that failed validation never reaches this point.
 
     // Expect: explicit > pack defaultExpect > none.
     let expect: PackDefaultExpect | false | undefined = step.expect;
@@ -739,12 +1148,13 @@ function shouldRetry(
   return false;
 }
 
-function applyExports(step: PipelineStepInput, result: unknown, exports: Record<string, unknown>): Array<{ code?: string; message: string; details?: unknown }> {
+function applyExports(step: PipelineStepInput, result: unknown, exports: Record<string, unknown>): { errors: Array<{ code?: string; message: string; details?: unknown }>; values: Record<string, unknown> } {
   const errors: Array<{ code?: string; message: string; details?: unknown }> = [];
+  const values: Record<string, unknown> = {};
   const entries = Object.entries(step.exports ?? {});
   if (entries.length > MAX_EXPORTS_PER_STEP) {
     errors.push({ code: "TOO_MANY_EXPORTS", message: `Step '${step.id ?? ""}' declares ${entries.length} exports; the limit is ${MAX_EXPORTS_PER_STEP}.` });
-    return errors;
+    return { errors, values };
   }
   for (const [name, path] of entries) {
     if (isSensitiveFieldName(name.split("."))) {
@@ -775,8 +1185,9 @@ function applyExports(step: PipelineStepInput, result: unknown, exports: Record<
       continue;
     }
     exports[name] = value;
+    values[name] = value;
   }
-  return errors;
+  return { errors, values };
 }
 
 function resolveExportPath(result: unknown, segments: string[]): { ok: true; value: unknown } | { ok: false; reason: string } {
@@ -808,88 +1219,6 @@ function resolveExportPath(result: unknown, segments: string[]): { ok: true; val
 
 // Read a control's value before an action (for later restore). Password
 // fields are never captured (valueProtected).
-async function captureValue(
-  entry: CaptureEntry,
-  ctx: ExecutionContext,
-  byId: Map<string, unknown>,
-  byIndex: unknown[]
-): Promise<CapturedValue | undefined> {
-  const read = entry.read ?? { tool: "ui_get", args: {} };
-  let args: unknown;
-  try {
-    const resolution = resolvePlaceholdersEx(read.args ?? {}, { byId, byIndex, pack: ctx.pack ? { id: ctx.pack.id } : undefined, inputs: ctx.inputs });
-    if (!resolution.ok) return undefined;
-    args = resolution.value;
-  } catch {
-    return undefined;
-  }
-  try {
-    const result = await ctx.dispatch(read.tool ?? "ui_get", args);
-    const element = (result as { element?: { value?: unknown; valueProtected?: boolean } }).element;
-    if (!element) return undefined;
-    if (element.valueProtected) {
-      return { tool: read.tool ?? "ui_get", args: (read.args ?? {}) as Record<string, unknown>, value: undefined, protected: true };
-    }
-    if (element.value === null || element.value === undefined) return undefined;
-    return { tool: read.tool ?? "ui_get", args: (read.args ?? {}) as Record<string, unknown>, value: element.value, protected: false };
-  } catch {
-    return undefined;
-  }
-}
-
-async function runRestore(
-  input: PipelineInput,
-  success: boolean,
-  captured: Map<string, CapturedValue>,
-  ctx: ExecutionContext,
-  byId: Map<string, unknown>,
-  byIndex: unknown[],
-  deadline: number
-): Promise<Array<{ key: string; success: boolean; message?: string; valueCaptured?: boolean }>> {
-  const mode = input.restore ?? "never";
-  if (mode === "never" || (mode === "onFailure" && success)) return [];
-  const results: Array<{ key: string; success: boolean; message?: string; valueCaptured?: boolean }> = [];
-  for (const [key, entry] of captured) {
-    if (entry.protected) {
-      results.push({ key, success: false, message: "Value not captured (password-protected); nothing to restore.", valueCaptured: false });
-      continue;
-    }
-    if (Date.now() > deadline) {
-      results.push({ key, success: false, message: "Restore skipped: pipeline time budget exceeded." });
-      continue;
-    }
-    try {
-      const args = { ...entry.args } as Record<string, unknown>;
-      const readTool = entry.tool;
-      if (readTool === "ui_get") {
-        const restoreArgs = { ...args, action: "setValue", value: entry.value };
-        await ctx.dispatch("ui_action", restoreArgs);
-      } else if (readTool === "profile_action") {
-        await ctx.dispatch("profile_action", { ...args, action: "setValue", value: entry.value });
-      } else if (readTool === "profile_resolve") {
-        await ctx.dispatch("profile_action", { ...args, action: "setValue", value: entry.value });
-      } else {
-        results.push({ key, success: false, message: `Cannot restore a value captured with tool '${readTool}'.` });
-        continue;
-      }
-      // Verify the restore by reading again.
-      const verifyArgs = readTool === "ui_get" ? args : args;
-      const after = await ctx.dispatch(readTool, verifyArgs);
-      const afterValue = (after as { element?: { value?: unknown; valueProtected?: boolean } }).element?.value;
-      const restored = afterValue === entry.value;
-      results.push({
-        key,
-        success: restored,
-        message: restored ? undefined : `Restore did not verify: expected '${String(entry.value).slice(0, 40)}', read '${String(afterValue).slice(0, 40)}'.`,
-        valueCaptured: true
-      });
-    } catch (error) {
-      results.push({ key, success: false, message: `Restore failed: ${error instanceof Error ? error.message : String(error)}`, valueCaptured: true });
-    }
-  }
-  return results;
-}
-
 async function runFinally(
   input: PipelineInput,
   ctx: ExecutionContext,
@@ -910,13 +1239,9 @@ async function runFinally(
       continue;
     }
     try {
+      // Output validation happens once in the unified executor, same as for
+      // main steps.
       const result = await ctx.dispatch(step.tool, resolution.value);
-      const contract = getContract(step.tool);
-      const outputCheck = contract ? validateAgainstSchema(result, contract.outputSchema) : { ok: true as const };
-      if (!outputCheck.ok) {
-        results.push({ tool: step.tool, success: false, error: { code: "TOOL_OUTPUT_SCHEMA_MISMATCH", message: outputCheck.reason } });
-        continue;
-      }
       results.push({ tool: step.tool, success: true, result });
     } catch (error) {
       const normalized = normalizeStepError(error);
@@ -935,9 +1260,9 @@ async function runFinally(
 function normalizeStepError(error: unknown): { code?: string; message: string; details?: unknown } {
   if (error && typeof error === "object") {
     const e = error as { code?: unknown; message?: unknown; details?: unknown; name?: unknown };
-    if (typeof e.code === "string" || typeof e.message === "string") {
+    if (typeof e.code === "string" || typeof e.message === "string" || typeof e.code === "number") {
       return {
-        ...(typeof e.code === "string" ? { code: e.code } : {}),
+        ...(typeof e.code === "string" || typeof e.code === "number" ? { code: String(e.code) } : {}),
         message: typeof e.message === "string" ? e.message : String(error),
         ...(e.details !== undefined ? { details: e.details } : {})
       };
@@ -984,8 +1309,16 @@ export async function continuePipeline(opts: ContinueOptions): Promise<PipelineR
       schemaVersion: 1, success: false, runId, status: "failed", total: 0, completed: 0,
       stoppedAtIndex: null, completedSteps: [], steps: [], exports: {},
       error: { code: "RUN_EXPIRED", message: `Run '${runId}' was not found or has expired (runs are kept in memory for 10 minutes).` },
-      finallyResults: [], restoreResults: [], warnings: []
+      finallyResults: [], restoreResults: [], warnings: [],
+      continuable: false, continuationReason: null
     };
+  }
+
+  // The snapshot must actually be resumable: a truncated snapshot (over the
+  // run result budget) is refused explicitly instead of failing later on
+  // missing references.
+  if (!snapshot.continuable) {
+    return fail(runId, "RUN_NOT_CONTINUABLE", `Run '${runId}' is not continuable: its snapshot was truncated beyond what can be honestly resumed (${snapshot.continuationReason ?? "RUN_SNAPSHOT_TRUNCATED"}). Re-run the pipeline from the start.`);
   }
 
   // Pack version must still match.
@@ -1001,8 +1334,8 @@ export async function continuePipeline(opts: ContinueOptions): Promise<PipelineR
   const launchExports = snapshot.exports?.launch as { pid?: number; hwnd?: string } | undefined;
   let foundPid = snapshot.pid ?? (typeof launchExports?.pid === "number" ? launchExports.pid : undefined);
   let foundHwnd = snapshot.hwnd ?? (typeof launchExports?.hwnd === "string" ? launchExports.hwnd : undefined);
-  for (const r of snapshot.results) {
-    const res = r.result as { pid?: number; hwnd?: string | number } | undefined;
+  for (const r of snapshot.steps) {
+    const res = r.pipeProjection as { pid?: number; hwnd?: string | number } | null | undefined;
     if (!res) continue;
     if (foundPid === undefined && typeof res.pid === "number") foundPid = res.pid;
     if (foundHwnd === undefined && (typeof res.hwnd === "string" || typeof res.hwnd === "number")) foundHwnd = String(res.hwnd);
@@ -1051,17 +1384,18 @@ export async function continuePipeline(opts: ContinueOptions): Promise<PipelineR
   const byId = new Map<string, unknown>();
   const completedIds: string[] = [];
   for (let i = 0; i < fromIndex; i++) {
-    const stored = snapshot.results[i];
-    if (!stored) return fail(runId, "RUN_STATE_STALE", `Missing stored result for step ${i}; cannot continue.`);
-    results.push(stored.result);
+    const stored = snapshot.steps[i];
+    if (!stored) return fail(runId, "RUN_STATE_STALE", `Missing stored projection for step ${i}; cannot continue.`);
+    results.push(stored.pipeProjection);
     if (stored.id) {
-      byId.set(stored.id, stored.result);
+      byId.set(stored.id, stored.pipeProjection);
       completedIds.push(stored.id);
     }
   }
 
   const stepResults: StepExecutionResult[] = [];
   const exports = { ...snapshot.exports };
+  const stepExportValues: Array<Record<string, unknown>> = [];
   let stoppedAtIndex: number | null = null;
   let stopError: { code?: string; message: string; details?: unknown } | undefined;
 
@@ -1082,10 +1416,11 @@ export async function continuePipeline(opts: ContinueOptions): Promise<PipelineR
         byId.set(step.id, exec.result);
         completedIds.push(step.id);
       }
-      const exportErrors = applyExports(step, exec.result!, exports);
-      if (exportErrors.length > 0) {
+      const exportOutcome = applyExports(step, exec.result!, exports);
+      stepExportValues.push(exportOutcome.values);
+      if (exportOutcome.errors.length > 0) {
         stoppedAtIndex = i;
-        stopError = exportErrors[0]!;
+        stopError = exportOutcome.errors[0]!;
         break;
       }
     } else {
@@ -1096,17 +1431,44 @@ export async function continuePipeline(opts: ContinueOptions): Promise<PipelineR
   }
 
   // Save the updated snapshot (with a fresh TTL) so the run can be continued
-  // again.
+  // again. Completed prefix steps keep their original projections; newly
+  // completed steps are projected the same way as in runPipeline.
+  const futureRefs = collectFutureReferences(input);
+  const freshSteps: StepSnapshot[] = [];
+  for (let i = 0; i < input.steps.length; i++) {
+    if (i < fromIndex) {
+      const prefix = snapshot.steps[i];
+      if (prefix) freshSteps.push(prefix);
+      continue;
+    }
+    const exec = stepResults[i - fromIndex];
+    if (!exec) break;
+    const step = input.steps[i]!;
+    const contract = getContract(step.tool);
+    freshSteps.push({
+      id: step.id,
+      index: i,
+      tool: step.tool,
+      pipeProjection: exec.success && contract
+        ? buildPipeProjection(i, step.id, exec.result, futureRefs, step.exports ?? {}, contract)
+        : null,
+      exports: stepExportValues[i] ?? {},
+      success: exec.success,
+      error: exec.error
+    });
+  }
   const fresh: RunSnapshot = {
     ...snapshot,
     createdAtMs: Date.now(),
     expiresAtMs: Date.now() + 10 * 60 * 1000,
-    results: input.steps.map((s, i) => ({ id: s.id, tool: s.tool, success: stepResults[i]?.success ?? snapshot.results[i]?.success ?? false, result: stepResults[i]?.result ?? snapshot.results[i]?.result, error: stepResults[i]?.error ?? snapshot.results[i]?.error })),
+    steps: freshSteps,
     exports,
     stoppedAtStep: stoppedAtIndex ?? input.steps.length,
-    error: stopError
+    error: stopError,
+    continuable: false,
+    continuationReason: null
   };
-  saveRun(fresh);
+  const saved = saveRun(fresh);
 
   const success = stoppedAtIndex === null;
   return {
@@ -1125,7 +1487,9 @@ export async function continuePipeline(opts: ContinueOptions): Promise<PipelineR
     ...(stopError ? { error: stopError } : {}),
     finallyResults: [],
     restoreResults: [],
-    warnings: []
+    warnings: [],
+    continuable: saved.continuable,
+    continuationReason: saved.continuationReason
   };
 }
 
@@ -1139,7 +1503,9 @@ function fail(
     schemaVersion: 1, success: false, runId, status: "failed", total: 0, completed: 0,
     stoppedAtIndex: null, completedSteps: [], steps: [], exports: {},
     error: { code, message, ...(suggestion ? { details: { suggestion } } : {}) },
-    finallyResults: [], restoreResults: [], warnings: []
+    finallyResults: [], restoreResults: [], warnings: [],
+    continuable: false,
+    continuationReason: null
   };
 }
 

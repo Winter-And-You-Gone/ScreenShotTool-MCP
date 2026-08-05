@@ -47,6 +47,77 @@ export type ToolContract = {
   annotations?: ToolAnnotations;
 };
 
+// ── MCP tools/list exposure ──
+//
+// The MCP SDK (>= 1.10) supports outputSchema + annotations natively in
+// tools/list. The protocol requires an OBJECT-root outputSchema (it describes
+// the structuredContent object), so array tools expose their array under
+// "items" - matching the structuredContent wrapper and the raw value used by
+// ${N.path} references (see outputs.ts array-compat).
+//
+// Internal-only annotations (retrySafe, needsExpect) are NOT exposed through
+// tools/list; they are available via tool_contract_describe.
+
+export type McpToolAnnotations = {
+  title?: string;
+  readOnlyHint?: boolean;
+  destructiveHint?: boolean;
+  idempotentHint?: boolean;
+  openWorldHint?: boolean;
+};
+
+// Map internal annotations to the MCP standard hints.
+export function toMcpToolAnnotations(annotations: ToolAnnotations | undefined): McpToolAnnotations {
+  if (!annotations) return {};
+  const out: McpToolAnnotations = {};
+  if (annotations.readOnly !== undefined) out.readOnlyHint = annotations.readOnly;
+  if (annotations.destructive !== undefined) out.destructiveHint = annotations.destructive;
+  if (annotations.idempotent !== undefined) out.idempotentHint = annotations.idempotent;
+  // Every tool in this server operates on the live desktop, which changes
+  // independently of the server - open-world is the honest default.
+  out.openWorldHint = true;
+  return out;
+}
+
+export type McpToolDefinition = {
+  name: string;
+  description: string;
+  inputSchema: JsonSchema;
+  outputSchema: JsonSchema;
+  annotations: McpToolAnnotations;
+  _meta?: Record<string, unknown>;
+};
+
+// Build the tools/list entry for a contract. pipeSafeFields ride along in
+// _meta (a protocol-sanctioned extension field), so clients that know the
+// convention can read them without tools/list being rejected by clients that
+// ignore unknown top-level fields.
+export function toMcpToolDefinition(contract: ToolContract): McpToolDefinition {
+  return {
+    name: contract.name,
+    description: contract.description,
+    inputSchema: contract.inputSchema,
+    outputSchema: contract.outputSchema,
+    annotations: toMcpToolAnnotations(contract.annotations),
+    _meta: {
+      pipeSafeFields: contract.pipeSafeFields
+    }
+  };
+}
+
+// Derive example result paths for tool_contract_describe from the output
+// schema + pipeSafeFields.
+export function contractExamples(contract: ToolContract): Array<{ resultPath: string; type: string }> {
+  const examples: Array<{ resultPath: string; type: string }> = [];
+  for (const field of contract.pipeSafeFields) {
+    const prop = contract.outputSchema.properties?.[field];
+    if (!prop) continue;
+    const type = prop.type ?? (prop.anyOf ? "any" : "any");
+    examples.push({ resultPath: field, type });
+  }
+  return examples;
+}
+
 // Helper to build a JSON Schema object with required fields, keeping the
 // table below terse.
 const obj = (
@@ -91,13 +162,15 @@ const windowInfo = obj(
   ["hwnd", "title", "pid", "processName", "className", "rect"]
 );
 
+// Business errors may or may not carry a machine code; message is always
+// present.
 const errorShape = obj(
   {
     code: str(),
     message: str(),
     details: any()
   },
-  ["code", "message"]
+  ["message"]
 );
 
 const stepResult = obj(
@@ -122,7 +195,10 @@ const launchAppOutput = obj(
   {
     pid: int(),
     window: {
-      ...windowInfo,
+      anyOf: [
+        windowInfo,
+        { type: "null" }
+      ],
       description: "First visible window, or null when waitForWindow=false."
     }
   },
@@ -130,7 +206,13 @@ const launchAppOutput = obj(
   "launch_app success result."
 );
 
-const listWindowsOutput = arr(windowInfo, "list_windows success result: window list.");
+const listWindowsOutput = obj(
+  {
+    items: arr(windowInfo, "Window list.")
+  },
+  ["items"],
+  "list_windows success result: { items: WindowInfo[] }. The raw array is also returned as the step result (${N.path} indexes it directly)."
+);
 
 const captureOutput = obj(
   {
@@ -271,7 +353,7 @@ const waitForWindowOutput = obj(
   {
     found: bool(),
     mode: str(),
-    window: { ...windowInfo, type: "object" },
+    window: { anyOf: [windowInfo, { type: "null" }] },
     elapsedMs: int(),
     timeoutMs: int(),
     timestamp: str()
@@ -310,7 +392,7 @@ const queryOutput = obj(
 const getOutput = obj(
   {
     found: bool(),
-    element: { type: "object", description: "Matched element state, or null when not found." },
+    element: { anyOf: [{ type: "object" }, { type: "null" }], description: "Matched element state, or null when not found." },
     elapsedMs: int()
   },
   ["found", "element", "elapsedMs"]
@@ -553,7 +635,7 @@ const runStepsOutput = obj(
     success: bool(),
     total: int(),
     completed: int(),
-    stoppedAtIndex: int(),
+    stoppedAtIndex: { anyOf: [{ type: "integer" }, { type: "null" }] },
     runId: str(),
     status: str(),
     stoppedAt: str(),
@@ -660,11 +742,11 @@ export const contracts: Record<string, ToolContract> = {
   },
   list_windows: {
     name: "list_windows",
-    description: "List visible top-level Windows desktop windows, optionally filtered by pid/processName/titleContains. Returns: WindowInfo[] (hwnd,title,pid,processName,className,rect). Pipe-safe: [i].hwnd, [i].pid, [i].title.",
+    description: "List visible top-level Windows desktop windows, optionally filtered by pid/processName/titleContains. Returns { items: WindowInfo[] } where each item has hwnd,title,pid,processName,className,rect. structuredContent is {items:[...]}; the step result is the raw array (${0.0.hwnd} indexes it). Pipe-safe: items, items[i].hwnd, items[i].pid, items[i].title.",
     inputSchema: toolInputSchemas.list_windows as unknown as JsonSchema,
     outputSchema: listWindowsOutput,
     schemaVersion: 1,
-    pipeSafeFields: [],
+    pipeSafeFields: ["items"],
     annotations: { readOnly: true, idempotent: true, retrySafe: true }
   },
   capture_window: {
@@ -957,12 +1039,65 @@ export const contracts: Record<string, ToolContract> = {
   },
   continue_run: {
     name: "continue_run",
-    description: "Continue a failed pipeline from a saved run snapshot (runId + continueFrom). Checks: run not expired, pack version unchanged, process alive, hwnd valid. Returns: success, runId, status, continuedFrom, stoppedAt, completedSteps, exports, steps[], error.",
+    description: "Continue a failed pipeline from a saved run snapshot (runId + continueFrom). Checks: run not expired, pack version unchanged, process alive, hwnd valid, snapshot continuable. Returns: success, runId, status, continuedFrom, stoppedAt, completedSteps, exports, steps[], error.",
     inputSchema: toolInputSchemas.continue_run as unknown as JsonSchema,
     outputSchema: continueRunOutput,
     schemaVersion: 1,
     pipeSafeFields: ["success", "runId", "status", "exports"],
     annotations: { idempotent: false, retrySafe: false }
+  },
+  tool_contract_list: {
+    name: "tool_contract_list",
+    description: "List every tool's public contract: inputSchema, outputSchema, pipeSafeFields, and annotations (readOnly/destructive/idempotent/retrySafe/needsExpect). Model-friendly discovery layer on top of tools/list. Returns: tools[{name, schemaVersion, outputSchema, pipeSafeFields, annotations}]. Pipe-safe: tools.",
+    inputSchema: toolInputSchemas.tool_contract_list as unknown as JsonSchema,
+    outputSchema: obj(
+      {
+        tools: arr(
+          obj(
+            {
+              name: str(),
+              schemaVersion: int(),
+              outputSchema: any(),
+              pipeSafeFields: arr(str()),
+              annotations: any()
+            },
+            ["name", "schemaVersion", "outputSchema", "pipeSafeFields"]
+          )
+        )
+      },
+      ["tools"]
+    ),
+    schemaVersion: 1,
+    pipeSafeFields: ["tools"],
+    annotations: { readOnly: true, idempotent: true, retrySafe: true }
+  },
+  tool_contract_describe: {
+    name: "tool_contract_describe",
+    description: "Describe one tool's full public contract: inputSchema, outputSchema, pipeSafeFields, annotations, and example result paths derived from the schema. Returns: name, schemaVersion, inputSchema, outputSchema, pipeSafeFields, annotations, examples[{resultPath,type}]. Pipe-safe: outputSchema, pipeSafeFields.",
+    inputSchema: toolInputSchemas.tool_contract_describe as unknown as JsonSchema,
+    outputSchema: obj(
+      {
+        name: str(),
+        schemaVersion: int(),
+        inputSchema: any(),
+        outputSchema: any(),
+        pipeSafeFields: arr(str()),
+        annotations: any(),
+        examples: arr(
+          obj(
+            {
+              resultPath: str(),
+              type: str()
+            },
+            ["resultPath", "type"]
+          )
+        )
+      },
+      ["name", "schemaVersion", "inputSchema", "outputSchema", "pipeSafeFields", "examples"]
+    ),
+    schemaVersion: 1,
+    pipeSafeFields: ["outputSchema", "pipeSafeFields"],
+    annotations: { readOnly: true, idempotent: true, retrySafe: true }
   }
 };
 
