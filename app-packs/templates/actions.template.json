@@ -11,7 +11,8 @@
         "condition": "exists",
         "timeoutMs": 5000,
         "pollIntervalMs": 150
-      }
+      },
+      "backgroundPolicy": "safe"
     }
   ]
 }

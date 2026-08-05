@@ -151,6 +151,7 @@ export function packToAppProfile(pack: LoadedPack): AppProfile {
     executableEnv: profile.executableEnv,
     requiresAsInvoker: profile.security?.requiresAsInvoker ?? false,
     launch: profile.launch,
+    interaction: profile.interaction,
     submenuAidPatterns: profile.submenuAidPatterns,
     controls
   };

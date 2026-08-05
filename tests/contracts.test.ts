@@ -92,7 +92,10 @@ test("walkLeaves visits every leaf path", () => {
 test("launch_profile output schema matches the real result shape", () => {
   const schema = contracts.profile_launch!.outputSchema;
   const ok = validateAgainstSchema(
-    { profile: "notepad", pid: 123, hwnd: "99", title: "x", startedByMcp: true, reused: false, uiaRootAvailable: true },
+    {
+      profile: "notepad", pid: 123, hwnd: "99", title: "x", startedByMcp: true, reused: false, uiaRootAvailable: true,
+      interaction: { requestedMode: "auto", effectiveMode: "background", foregroundChanged: false, targetActivated: false, physicalCursorMoved: false }
+    },
     schema
   );
   assert.equal(ok.ok, true);

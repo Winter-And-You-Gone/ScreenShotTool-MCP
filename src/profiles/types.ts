@@ -8,6 +8,7 @@
 // profile layer holding a stale module instance (and a second worker).
 
 import type { UiElementSelector, WindowSelector } from "../uia/types.js";
+import type { PackInteractionConfig } from "../interaction.js";
 
 // Confidence label for a control's selectors.
 // - "runtime-verified": a live UIA probe resolved this control to a unique
@@ -78,6 +79,8 @@ export type AppProfile = {
     timeoutMs?: number;
     noActivate?: boolean;
   };
+  // Pack-declared interaction defaults (profile.json "interaction").
+  interaction?: PackInteractionConfig;
   // Each logical control maps to one or more candidate selectors (tried in
   // order) plus a confidence label. For backwards compatibility a bare
   // selector / selector[] is also accepted and wrapped with the default

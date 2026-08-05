@@ -32,7 +32,9 @@
     "smoke:private-app-pack": "tsx tests/smoke-private-pack.ts",
     "smoke:workflow": "tsx tests/smoke-workflow.ts",
     "smoke:public-contract-pipeline": "tsx tests/smoke-public-contract-pipeline.ts",
-    "smoke:page-fixture": "tsx tests/smoke-page-fixture.ts"
+    "smoke:page-fixture": "tsx tests/smoke-page-fixture.ts",
+    "smoke:vaporview-background": "tsx tests/smoke-vaporview-background.ts",
+    "smoke:vaporview-foreground-demo": "tsx tests/smoke-vaporview-foreground-demo.ts"
   },
   "engines": {
     "node": ">=20"

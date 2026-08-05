@@ -25,7 +25,12 @@
           },
           "preferredMethod": { "type": "string", "description": "Informational: preferred trigger method." },
           "fallbackPolicy": { "type": "string", "enum": ["default", "disabled"], "default": "default" },
-          "maxAttempts": { "type": "integer", "minimum": 1, "maximum": 5 }
+          "maxAttempts": { "type": "integer", "minimum": 1, "maximum": 5 },
+          "backgroundPolicy": {
+            "type": "string",
+            "enum": ["safe", "bestEffort", "foregroundRequired"],
+            "description": "Declared background capability. safe: verified to need no activation/global input. bestEffort: usually works in background, failures surface as errors (never auto-upgraded to foreground). foregroundRequired: rejected up front in background mode (FOREGROUND_REQUIRED / PIPELINE_NOT_BACKGROUND_SAFE)."
+          }
         },
         "required": ["control", "action"],
         "additionalProperties": false

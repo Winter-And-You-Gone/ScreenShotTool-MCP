@@ -16,6 +16,11 @@
           "tested": { "type": "boolean", "default": false, "description": "True when the workflow has been verified against the live app." },
           "restoresState": { "type": "boolean", "default": false },
           "visibility": { "type": "string", "enum": ["session", "hidden", "internal"], "default": "session" },
+          "interactionMode": {
+            "type": "string",
+            "enum": ["auto", "background", "foregroundDemo"],
+            "description": "Workflow-level interaction mode (priority between the caller's explicit interactionMode and the pack profile default)."
+          },
           "inputSchema": {
             "type": "object",
             "properties": {

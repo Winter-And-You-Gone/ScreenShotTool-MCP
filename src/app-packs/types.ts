@@ -7,6 +7,7 @@
 
 import type { UiElementSelector } from "../uia/types.js";
 import type { SelectorConfidence } from "../profiles/types.js";
+import type { BackgroundPolicy, InteractionMode, PackInteractionConfig } from "../interaction.js";
 
 // 4.1 manifest.json ---------------------------------------------------------
 
@@ -52,6 +53,9 @@ export type PackProfile = {
   security?: {
     requiresAsInvoker?: boolean;
   };
+  // Interaction-mode defaults for this pack (auto/background/foregroundDemo).
+  // The core resolves mode as: caller explicit > workflow config > this > auto.
+  interaction?: PackInteractionConfig;
   // AutomationId regexes that identify menu rows which open a submenu; used
   // by the generic openMenu/openSubmenu composites to label items.
   submenuAidPatterns?: string[];
@@ -137,6 +141,14 @@ export type PackActionContract = {
   // Page-navigation group this control belongs to (optional; must match the
   // controls' own selectionGroup when both are declared).
   selectionGroup?: string;
+  // Declared background capability of this action:
+  //   safe               - verified to need no activation and no global input.
+  //   bestEffort         - usually works in background, but the app or UIA
+  //                        provider may refuse; failures surface as errors and
+  //                        are NEVER auto-upgraded to foreground.
+  //   foregroundRequired - rejected up front in background mode
+  //                        (FOREGROUND_REQUIRED / PIPELINE_NOT_BACKGROUND_SAFE).
+  backgroundPolicy?: BackgroundPolicy;
 };
 
 export type PackActions = {
@@ -174,6 +186,9 @@ export type PackWorkflow = {
   tested?: boolean;
   restoresState?: boolean;
   visibility?: CatalogVisibility;
+  // Workflow-level interaction mode (priority between the caller's explicit
+  // interactionMode and the pack profile default).
+  interactionMode?: InteractionMode;
   inputSchema?: {
     type?: string;
     properties?: Record<string, unknown>;

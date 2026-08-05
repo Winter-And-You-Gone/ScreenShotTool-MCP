@@ -22,13 +22,14 @@
 7. [生成 Pack 草稿](#生成-pack-草稿)
 8. [使用 Workflow](#使用-workflow)
 9. [profile_run_steps](#profile_run_steps)
-10. [命名步骤与 exports](#命名步骤与-exports)
-11. [expect / retry / finally](#expect--retry--finally)
-12. [续接失败的 run](#续接失败的-run)
-13. [输出 Schema 与 structuredContent](#输出-schema-与-structuredcontent)
-14. [安全限制](#安全限制)
-15. [私有 Pack 与公共仓库](#私有-pack-与公共仓库)
-16. [测试](#测试)
+10. [交互模式（interactionMode）](#交互模式interactionmode)
+11. [命名步骤与 exports](#命名步骤与-exports)
+12. [expect / retry / finally](#expect--retry--finally)
+13. [续接失败的 run](#续接失败的-run)
+14. [输出 Schema 与 structuredContent](#输出-schema-与-structuredcontent)
+15. [安全限制](#安全限制)
+16. [私有 Pack 与公共仓库](#私有-pack-与公共仓库)
+17. [测试](#测试)
 
 ## 快速开始
 
@@ -208,6 +209,93 @@ $env:SCREENSHOT_MCP_APP_PACK_DIRS = "X:\Private\AppPacks;D:\Team\AppPacks"
 ```
 
 服务端自动：`profile_launch`（可复用运行中实例）→ 注入 profile/pid/hwnd → 按 Pack selector 解析控件 → 复合动作（`selectByName` / `selectByIndex` / `openMenu` / `openSubmenu` / `ensureSelected`）处理同 PID popup 并验证前后状态 → 应用 `defaultExpect` → finally 清理。**永不移动物理鼠标。**
+
+## 交互模式（interactionMode）
+
+统一交互模式控制"是否允许把目标应用带到前台"。核心保持**通用**：未配置的软件
+保持 `auto`（旧行为不变）；只有 App Pack 声明默认值或调用方显式传入时才改变行为。
+
+三个模式：
+
+- `auto`（默认）——旧行为，不做任何强制、不做任何承诺。
+- `background`——严格后台：不抢占前台、不置顶、不移动物理鼠标、不用全局键盘输入；
+  截图不要求目标窗口位于屏幕顶层；后台方法失败时**绝不静默升级为前台**。
+- `foregroundDemo`——仅调用方**显式**指定时生效：允许恢复/激活/置顶目标窗口，允许菜单、
+  弹窗在顶层出现；演示结束时**默认恢复用户原来的前台窗口**（`restorePreviousForeground`
+  默认 `true`）。
+
+### 优先级
+
+```text
+调用方显式 interactionMode → workflow 配置（workflows.json interactionMode）
+→ App Pack profile 默认值（profile.json interaction.defaultMode）→ auto
+```
+
+### 支持的参数
+
+以下高层工具支持可选参数（显式 `interactionMode` 优先级高于旧的
+`noActivate` / `focus` 参数，两者统一换算为 interaction policy）：
+
+```jsonc
+{ "interactionMode": "background" }
+{ "interactionMode": "foregroundDemo",
+  "foregroundDemo": { "restorePreviousForeground": true, "stepDelayMs": 200 } }
+```
+
+- `profile_launch` / `profile_action` / `capture_window` / `run_steps` /
+  `profile_run_steps` / `run_workflow`。
+
+### Pack 声明：profile.json
+
+```jsonc
+{ "interaction": {
+    "defaultMode": "background",
+    "allowForegroundFallback": false,   // 必须保持 false：核心从不静默升级前台
+    "backgroundPresentation": "behind", // 后台显示在用户当前前台窗口之后（默认）
+    "restorePreviousForeground": true } }
+```
+
+### Pack 声明：actions.json backgroundPolicy
+
+每个动作契约可声明后台能力：
+
+```jsonc
+{ "control": "sampleButton", "action": "invoke", "backgroundPolicy": "safe" }
+```
+
+- `safe`——已确认不需要激活窗口或全局输入。
+- `bestEffort`——通常能后台完成，但应用或 UIA Provider 可能拒绝；失败返回明确错误，
+  不自动升级前台。
+- `foregroundRequired`——background 模式下执行前直接拒绝（`FOREGROUND_REQUIRED`）。
+
+### 错误与管道预检
+
+- background 无可用后台方法 → `FOREGROUND_REQUIRED`
+  （details：`requestedMode/effectiveMode/foregroundChanged/reason/suggestedMode:"foregroundDemo"`）。
+- 管道（`run_steps` / `profile_run_steps` / `run_workflow`）在 background 模式下包含
+  `foregroundRequired` 步骤 → **执行任何步骤之前**返回 `PIPELINE_NOT_BACKGROUND_SAFE`，
+  details 列出 `unsafeSteps: [{stepId, backgroundPolicy, suggestedMode}]`。
+  `bestEffort` 步骤允许执行，运行时失败再返回明确错误。禁止执行到中途突然抢前台。
+- 后台截图空白帧 → `BACKGROUND_CAPTURE_UNAVAILABLE`（不自动置顶重试）。
+- 后台启动时若应用自身抢前台，核心尝试恢复原前台窗口并如实报告
+  `foregroundChanged:true` / `foregroundRestored:true`；无法恢复时返回 warning，绝不谎报。
+
+### 统一结果元数据 interaction
+
+高层工具与管道结果新增 `interaction` 报告：
+
+```jsonc
+{ "interaction": { "requestedMode": "background", "effectiveMode": "background",
+    "backgroundPolicy": "safe", "method": "InvokePattern",
+    "foregroundBefore": "0x1A2B3C", "foregroundAfter": "0x1A2B3C",
+    "foregroundChanged": false, "foregroundRestored": true,
+    "targetActivated": false, "physicalCursorMoved": false } }
+```
+
+覆盖 `profile_launch` / `profile_action` / `profile_run_steps` / `run_workflow` /
+`capture_window`（截图还报告真实 `captureMethod`）。`workflow_catalog` 与
+`app_pack_describe` 公开 `defaultInteractionMode` / `backgroundPolicy` /
+`foregroundRequiredSteps`，模型第一次使用时即可判断哪些 Workflow 可完全后台运行。
 
 ## 命名步骤与 exports
 

@@ -33,6 +33,7 @@ import type {
   UiError
 } from "./uia/types.js";
 import { McpUiError } from "./uia/results.js";
+import { captureInteractionReport, type InteractionMode, type InteractionReport } from "./interaction.js";
 
 export type WaitAndSuppressInput = {
   pid: number;
@@ -88,6 +89,9 @@ export type CaptureResult = {
   target: string;
   rect: Rect;
   timestamp: string;
+  // True when the captured frame is blank/fully-transparent (uniform grid
+  // sample). Present only on the PrintWindow path.
+  blankFrame?: boolean;
 };
 
 export type ClickResult = {
@@ -233,6 +237,8 @@ type HelperRequest =
   | { action: "noactivate-minimize"; target: { hwnd: string; previousForegroundHwnd?: string } }
   | { action: "wait-and-suppress"; target: WaitAndSuppressInput }
   | { action: "get-foreground-window"; target?: Record<string, unknown> }
+  | { action: "activate-window"; target: { hwnd: string } }
+  | { action: "restore-foreground-window"; target: { previousForegroundHwnd?: string } }
   | { action: "read-clipboard"; target?: Record<string, unknown> }
   | { action: "write-clipboard"; target: WriteClipboardInput }
   | { action: "get-window-state"; target: GetWindowStateInput }
@@ -722,9 +728,29 @@ export async function listWindows(filters: ListWindowsInput = {}): Promise<Windo
   return runHelper<WindowInfo[]>({ action: "list-windows", filters });
 }
 
-export async function captureWindow(input: CaptureWindowInput): Promise<CaptureResult> {
+export async function captureWindow(input: CaptureWindowInput, resolvedMode?: InteractionMode): Promise<CaptureResult & { interaction?: InteractionReport }> {
   const outputPath = await ensureOutputPath(input.outputPath);
   const { outputPath: _outputPath, ...target } = input;
+  const mode = resolvedMode ?? "auto";
+
+  // Interaction policy for the capture:
+  //  - background: force the non-activating PrintWindow path (never activate,
+  //    never change z-order); a blank frame fails with
+  //    BACKGROUND_CAPTURE_UNAVAILABLE - NEVER silently upgraded to a
+  //    foreground screen grab.
+  //  - foregroundDemo: the window MAY be activated for a 'screen' capture
+  //    (allowed; the helper restores the previous foreground afterwards).
+  //  - auto: legacy behavior untouched.
+  const isBackground = mode === "background";
+  const captureTarget = {
+    ...target,
+    ...(isBackground ? { focus: false, noActivate: true, captureMethod: "print" as const } : {})
+  };
+
+  // Foreground observation around the capture (honest reporting; the capture
+  // itself runs standalone, these reads go through the shared worker).
+  const foregroundBefore = await getForegroundWindowHwnd().catch(() => undefined);
+
   // Capture runs in a SEPARATE PowerShell process (not the shared worker).
   // PrintWindow/CopyFromScreen can block synchronously on an unresponsive
   // target window (e.g. an Electron/Qt app that isn't pumping messages), and
@@ -735,11 +761,59 @@ export async function captureWindow(input: CaptureWindowInput): Promise<CaptureR
   // standalone isolates the stall: a hung capture dies alone at its own
   // (shorter) timeout and other tools keep working. Cost is ~1s cold start per
   // capture, which is negligible next to the cost of a wedged MCP server.
-  return runStandaloneHelper<CaptureResult>(
-    { action: "capture-window", target, outputPath },
-    CAPTURE_TIMEOUT_MS,
-    "capture_window"
-  );
+  let result: CaptureResult;
+  try {
+    result = await runStandaloneHelper<CaptureResult>(
+      { action: "capture-window", target: captureTarget, outputPath },
+      CAPTURE_TIMEOUT_MS,
+      "capture_window"
+    );
+  } catch (error) {
+    // Structured capture errors (e.g. blank frame) surface with their code;
+    // enrich the BACKGROUND_CAPTURE_UNAVAILABLE failure with the interaction
+    // context required by the background contract.
+    if (error instanceof HelperError && error.code === "BACKGROUND_CAPTURE_UNAVAILABLE") {
+      const foregroundAfter = await getForegroundWindowHwnd().catch(() => undefined);
+      throw new HelperError(error.message, "BACKGROUND_CAPTURE_UNAVAILABLE", {
+        ...(typeof error.details === "object" && error.details !== null ? { ...(error.details as Record<string, unknown>) } : {}),
+        requestedMode: mode,
+        effectiveMode: "background",
+        captureMethod: "PrintWindow",
+        foregroundChanged: foregroundBefore !== undefined && foregroundAfter !== undefined && foregroundBefore !== foregroundAfter,
+        suggestedMode: "foregroundDemo"
+      });
+    }
+    throw error;
+  }
+
+  const foregroundAfter = await getForegroundWindowHwnd().catch(() => undefined);
+  const foregroundChanged = foregroundBefore !== undefined && foregroundAfter !== undefined && foregroundBefore !== foregroundAfter;
+
+  // background mode: a blank/fully-transparent frame is a failed background
+  // capture - refuse with BACKGROUND_CAPTURE_UNAVAILABLE instead of saving it.
+  if (isBackground && result.blankFrame === true) {
+    throw new HelperError(
+      "PrintWindow produced a blank/fully-transparent frame; the window does not render in the background.",
+      "BACKGROUND_CAPTURE_UNAVAILABLE",
+      {
+        requestedMode: mode,
+        effectiveMode: "background",
+        captureMethod: "PrintWindow",
+        foregroundChanged,
+        suggestedMode: "foregroundDemo"
+      }
+    );
+  }
+
+  const interaction: InteractionReport = captureInteractionReport(mode, {
+    ...(foregroundBefore !== undefined ? { foregroundBefore } : {}),
+    ...(foregroundAfter !== undefined ? { foregroundAfter } : {}),
+    foregroundChanged,
+    captureMethod: "PrintWindow",
+    targetActivated: mode === "foregroundDemo" && (target.captureMethod ?? "print") === "screen"
+  });
+
+  return { ...result, interaction };
 }
 
 export async function captureScreenRegion(input: CaptureScreenRegionInput): Promise<CaptureResult> {
@@ -1294,7 +1368,33 @@ function minimizeWindow(hwnd: string, noActivate = false, previousForegroundHwnd
   return runHelper({ action, target });
 }
 
-async function getForegroundWindowHwnd(): Promise<string> {
+// ── Foreground helpers (interaction policy support) ──
+
+export type ActivateWindowResult = {
+  activated: boolean;
+  foregroundHwnd: string;
+};
+
+export type RestoreForegroundResult = {
+  restored: boolean;
+  foregroundHwnd: string;
+  foregroundChanged: boolean;
+};
+
+// foregroundDemo presentation: restore + raise + activate the target window.
+// Never moves the physical cursor.
+export async function activateWindow(hwnd: string): Promise<ActivateWindowResult> {
+  return runHelper<ActivateWindowResult>({ action: "activate-window", target: { hwnd } });
+}
+
+// Restore a previous foreground window (best-effort). Used after a
+// foregroundDemo session and to recover from an app that self-activates
+// during a background launch.
+export async function restoreForegroundWindow(previousForegroundHwnd?: string): Promise<RestoreForegroundResult> {
+  return runHelper<RestoreForegroundResult>({ action: "restore-foreground-window", target: { previousForegroundHwnd } });
+}
+
+export async function getForegroundWindowHwnd(): Promise<string> {
   const result = await runHelper<ForegroundWindowResult>({ action: "get-foreground-window", target: {} });
   return result.hwnd;
 }

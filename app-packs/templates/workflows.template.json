@@ -32,7 +32,8 @@
             "action": "invoke"
           }
         }
-      ]
+      ],
+      "interactionMode": "auto"
     }
   ]
 }

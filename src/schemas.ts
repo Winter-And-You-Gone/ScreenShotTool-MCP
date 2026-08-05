@@ -7,6 +7,23 @@ import {
   validateRegex
 } from "./uia/selectors.js";
 import { packExpectSchema } from "./app-packs/schemas.js";
+import { INTERACTION_MODES } from "./interaction.js";
+
+const interactionModeSchema = z.enum(INTERACTION_MODES);
+// Caller-supplied foregroundDemo options (all optional; pack/profile defaults
+// apply otherwise).
+const foregroundDemoOptionsSchema = z.object({
+  restorePreviousForeground: z.boolean().optional(),
+  stepDelayMs: z.number().int().min(0).max(5000).optional()
+}).strict();
+
+// Shared interaction params added to the high-level tools that must respect
+// the interaction policy. Explicit interactionMode always wins over the old
+// noActivate/focus/activate params.
+const interactionParams = {
+  interactionMode: interactionModeSchema.optional(),
+  foregroundDemo: foregroundDemoOptionsSchema.optional()
+} as const;
 
 const positiveInt = z.number().int().positive();
 const nonNegativeInt = z.number().int().nonnegative();
@@ -93,7 +110,8 @@ export const captureWindowSchema = z.object({
   focus: z.boolean().optional().default(true),
   captureMethod: z.enum(["screen", "print"]).optional().default("print"),
   noActivate: z.boolean().optional().default(false),
-  outputPath: z.string().min(1).optional()
+  outputPath: z.string().min(1).optional(),
+  ...interactionParams
 }).strict().refine(
   (value) => value.hwnd !== undefined || value.pid !== undefined || value.processName !== undefined || value.titleContains !== undefined,
   "Provide at least one of hwnd, pid, processName, or titleContains."
@@ -413,7 +431,8 @@ export const profileActionSchema = z.object({
   includeProcessPopups: z.boolean().optional().default(true),
   maxDepth: uiaMaxDepth.optional().default(15),
   maxNodes: uiaMaxNodes.optional().default(2000),
-  timeoutMs: uiaActionTimeout.optional().default(15000)
+  timeoutMs: uiaActionTimeout.optional().default(15000),
+  ...interactionParams
 }).strict().refine(
   (value) => value.action === "setValue" || value.action === "appendText" ? value.value !== undefined : true,
   "setValue/appendText require a 'value' string."
@@ -451,7 +470,8 @@ export const profileLaunchSchema = z.object({
   noActivate: z.boolean().optional().default(true),
   startMinimized: z.boolean().optional().default(false),
   timeoutMs: z.number().int().min(100).max(120000).optional().default(30000),
-  reuseIfRunning: z.boolean().optional().default(true)
+  reuseIfRunning: z.boolean().optional().default(true),
+  ...interactionParams
 }).strict();
 export type ProfileLaunchInput = z.infer<typeof profileLaunchSchema>;
 
@@ -514,7 +534,8 @@ export const runStepsSchema = z.object({
   finally: z.array(runStepsStepSchema).max(20).optional(),
   captureBefore: z.array(captureBeforeSchema).max(32).optional(),
   restore: z.enum(["always", "never", "onFailure"]).optional().default("never"),
-  maxTotalMs: z.number().int().min(1000).max(600_000).optional().default(120_000)
+  maxTotalMs: z.number().int().min(1000).max(600_000).optional().default(120_000),
+  ...interactionParams
 }).strict();
 export type RunStepsInput = z.infer<typeof runStepsSchema>;
 export type RunStepsStepInput = z.infer<typeof runStepsStepSchema>;
@@ -577,7 +598,8 @@ export const profileRunStepsSchema = z.object({
   finally: z.array(profileRunStepSchema).max(20).optional(),
   restore: z.enum(["always", "never", "onFailure"]).optional().default("never"),
   captureBefore: z.array(captureBeforeSchema).max(32).optional(),
-  maxTotalMs: z.number().int().min(1000).max(600_000).optional().default(120_000)
+  maxTotalMs: z.number().int().min(1000).max(600_000).optional().default(120_000),
+  ...interactionParams
 }).strict();
 
 export const workflowCatalogSchema = z.object({
@@ -587,7 +609,8 @@ export const workflowCatalogSchema = z.object({
 export const runWorkflowSchema = z.object({
   pack: z.string().min(1).max(128),
   workflow: z.string().min(1).max(128),
-  inputs: z.record(z.string(), z.unknown()).optional().default({})
+  inputs: z.record(z.string(), z.unknown()).optional().default({}),
+  ...interactionParams
 }).strict();
 
 export const continueRunSchema = z.object({
@@ -664,6 +687,24 @@ const atLeastOneSelectorAnyOf = [
   { required: ["titleContains"] }
 ] as const;
 
+// Shared JSON Schema for the interactionMode + foregroundDemo params.
+const interactionParamsJson = {
+  interactionMode: {
+    type: "string",
+    enum: ["auto", "background", "foregroundDemo"],
+    description: "Interaction policy. auto (default): legacy behavior. background: strict background - no foreground steal, no topmost, no physical cursor, no global keyboard input, capture must not require top-level visibility; failures never auto-upgrade to foreground (FOREGROUND_REQUIRED). foregroundDemo: explicit foreground presentation; the target may be restored/activated and the previous foreground window is restored afterwards by default."
+  },
+  foregroundDemo: {
+    type: "object",
+    properties: {
+      restorePreviousForeground: { type: "boolean", default: true, description: "Restore the previous foreground window when the demo (pipeline/workflow) finishes." },
+      stepDelayMs: { type: "integer", minimum: 0, maximum: 5000, description: "Pause between pipeline steps to let the UI stabilize." }
+    },
+    additionalProperties: false,
+    description: "foregroundDemo options (only honored when interactionMode=foregroundDemo)."
+  }
+} as const;
+
 // JSON Schema for a UI element selector. Mirrors uiElementSelectorSchema in
 // Zod. Recursive (ancestor / path) via a $defs reference.
 const uiElementSelectorJsonSchema = {
@@ -731,8 +772,9 @@ export const toolInputSchemas = {
       },
       focus: { type: "boolean", default: true, description: "Bring the window to the foreground before capturing. Set false to preserve open menus, popups, or transient UI." },
       captureMethod: { type: "string", enum: ["screen", "print"], default: "print", description: "Capture method: 'print' uses PrintWindow API (captures window content even behind other windows, default). 'screen' uses CopyFromScreen (needs visible area, only use when print fails or you need to capture separate popup/tooltip windows)." },
-      noActivate: { type: "boolean", default: false, description: "When true, prefer non-activating capture. With captureMethod 'screen', the helper falls back to PrintWindow to avoid changing foreground/z-order." },
-      outputPath: { type: "string", description: "Optional absolute PNG output path." }
+      noActivate: { type: "boolean", default: false, description: "When true, prefer non-activating capture. With captureMethod 'screen', the helper falls back to PrintWindow to avoid changing foreground/z-order. Superseded by interactionMode=background, which forces the non-activating path." },
+      outputPath: { type: "string", description: "Optional absolute PNG output path." },
+      ...interactionParamsJson
     },
     additionalProperties: false,
     anyOf: atLeastOneSelectorAnyOf
@@ -1038,7 +1080,8 @@ export const toolInputSchemas = {
       includeProcessPopups: { type: "boolean", default: true },
       maxDepth: { type: "integer", minimum: 1, maximum: 30, default: 15 },
       maxNodes: { type: "integer", minimum: 1, maximum: 5000, default: 2000 },
-      timeoutMs: { type: "integer", minimum: 500, maximum: 120000, default: 15000 }
+      timeoutMs: { type: "integer", minimum: 500, maximum: 120000, default: 15000 },
+      ...interactionParamsJson
     },
     required: ["profile", "control", "action"],
     additionalProperties: false,
@@ -1052,9 +1095,10 @@ export const toolInputSchemas = {
       args: { type: "array", items: { type: "string" }, description: "Process arguments." },
       waitForWindow: { type: "boolean", default: true },
       noActivate: { type: "boolean", default: true, description: "Best-effort background launch (recommended)." },
-      startMinimized: { type: "boolean", default: false },
+      startMinimized: { type: "boolean", default: false, description: "Superseded by interactionMode=background, which keeps the window normal-but-behind (never minimized by default)." },
       timeoutMs: { type: "integer", minimum: 100, maximum: 120000, default: 30000 },
-      reuseIfRunning: { type: "boolean", default: true, description: "If a process with a matching name is already running, attach to it instead of launching a new one." }
+      reuseIfRunning: { type: "boolean", default: true, description: "If a process with a matching name is already running, attach to it instead of launching a new one." },
+      ...interactionParamsJson
     },
     required: ["profile"],
     additionalProperties: false
@@ -1154,7 +1198,8 @@ export const toolInputSchemas = {
         description: "Capture control values before the main steps (key -> ui_get args), restored in finally when restore is enabled."
       },
       restore: { type: "string", enum: ["always", "never", "onFailure"], default: "never", description: "Restore captured values in finally: always / never / onFailure." },
-      maxTotalMs: { type: "integer", minimum: 1000, maximum: 600000, default: 120000, description: "Overall pipeline time budget." }
+      maxTotalMs: { type: "integer", minimum: 1000, maximum: 600000, default: 120000, description: "Overall pipeline time budget." },
+      ...interactionParamsJson
     },
     required: ["steps"],
     additionalProperties: false
@@ -1252,7 +1297,8 @@ export const toolInputSchemas = {
       finally: { type: "array", maxItems: 20, items: { type: "object" } },
       restore: { type: "string", enum: ["always", "never", "onFailure"], default: "never" },
       captureBefore: { type: "array", maxItems: 32, items: { type: "object" } },
-      maxTotalMs: { type: "integer", minimum: 1000, maximum: 600000, default: 120000 }
+      maxTotalMs: { type: "integer", minimum: 1000, maximum: 600000, default: 120000 },
+      ...interactionParamsJson
     },
     required: ["profile", "steps"],
     additionalProperties: false
@@ -1270,7 +1316,8 @@ export const toolInputSchemas = {
     properties: {
       pack: { type: "string", minLength: 1, description: "Pack id from app_pack_list." },
       workflow: { type: "string", minLength: 1, description: "Workflow id from workflow_catalog." },
-      inputs: { type: "object", description: "Workflow inputs validated against the workflow's inputSchema." }
+      inputs: { type: "object", description: "Workflow inputs validated against the workflow's inputSchema." },
+      ...interactionParamsJson
     },
     required: ["pack", "workflow"],
     additionalProperties: false

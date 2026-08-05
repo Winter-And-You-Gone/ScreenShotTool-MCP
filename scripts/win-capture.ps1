@@ -731,6 +731,29 @@ function Save-Screenshot {
   }
 }
 
+# Detect a blank / fully-transparent frame: a uniform grid sample of the
+# bitmap's pixels is all the same color (including all-alpha-0). PrintWindow
+# can produce such frames when the target does not render in the background;
+# background mode must report BACKGROUND_CAPTURE_UNAVAILABLE instead of saving
+# a useless PNG.
+function Test-BitmapBlank {
+  param([System.Drawing.Bitmap]$Bitmap, [int]$Grid = 5)
+  $w = $Bitmap.Width
+  $h = $Bitmap.Height
+  if ($w -le 0 -or $h -le 0) { return $true }
+  $firstArgb = $null
+  for ($gy = 0; $gy -lt $Grid; $gy++) {
+    for ($gx = 0; $gx -lt $Grid; $gx++) {
+      $x = [int](($w - 1) * $gx / ($Grid - 1))
+      $y = [int](($h - 1) * $gy / ($Grid - 1))
+      $argb = $Bitmap.GetPixel($x, $y).ToArgb()
+      if ($null -eq $firstArgb) { $firstArgb = $argb }
+      elseif ($argb -ne $firstArgb) { return $false }
+    }
+  }
+  return $true
+}
+
 function Capture-WindowPrint {
   param(
     [object]$Window,
@@ -816,6 +839,16 @@ function Capture-WindowPrint {
 
           $fullBitmap = [System.Drawing.Image]::FromHbitmap($hBitmap)
 
+          # Blank-frame detection (grid sample) - reported on the result so the
+          # TS layer can decide how to fail (background mode refuses silently
+          # blank captures with BACKGROUND_CAPTURE_UNAVAILABLE).
+          $blankFrame = $false
+          try {
+            $blankFrame = Test-BitmapBlank -Bitmap ([System.Drawing.Bitmap]$fullBitmap)
+          } catch {
+            $blankFrame = $false
+          }
+
           try {
             if ($captureWidth -ne $fullWidth -or $captureHeight -ne $fullHeight -or $captureX -ne 0 -or $captureY -ne 0) {
               $croppedBitmap = New-Object System.Drawing.Bitmap $captureWidth, $captureHeight
@@ -873,6 +906,7 @@ function Capture-WindowPrint {
     target = "window:" + $Window.hwnd
     rect = $rect
     timestamp = (Get-Date).ToUniversalTime().ToString("o")
+    blankFrame = $blankFrame
   }
 }
 
@@ -2237,6 +2271,53 @@ function Get-ForegroundWindow {
   return [ordered]@{
     hwnd = $hwnd.ToInt64().ToString()
     timestamp = (Get-Date).ToUniversalTime().ToString("o")
+  }
+}
+
+# foregroundDemo presentation: restore the target (from minimized), raise it to
+# the top of the z-order, and activate it via the Alt-keybd_event trick (the
+# SetForegroundWindow restriction). NEVER moves the physical cursor.
+function Activate-Window {
+  param([hashtable]$Target)
+  $hwnd = [IntPtr]([int64]$Target.hwnd)
+  if ([ScreenshotTool.Native]::IsIconic($hwnd)) {
+    $SW_RESTORE = 9
+    [ScreenshotTool.Native]::ShowWindow($hwnd, $SW_RESTORE) | Out-Null
+  }
+  [ScreenshotTool.Native]::keybd_event([byte]0x12, 0, [uint32]0, [UIntPtr]::Zero)
+  [ScreenshotTool.Native]::keybd_event([byte]0x12, 0, [uint32]2, [UIntPtr]::Zero)
+  [ScreenshotTool.Native]::SetForegroundWindow($hwnd) | Out-Null
+  $SWP_NOSIZE = [uint32]0x0001
+  $SWP_NOMOVE = [uint32]0x0002
+  [ScreenshotTool.Native]::SetWindowPos($hwnd, [IntPtr]0, 0, 0, 0, 0, ($SWP_NOSIZE -bor $SWP_NOMOVE)) | Out-Null
+  Start-Sleep -Milliseconds 150
+  $fg = [ScreenshotTool.Native]::GetForegroundWindow()
+  return [ordered]@{
+    activated = ($fg -eq $hwnd)
+    foregroundHwnd = $fg.ToInt64().ToString()
+  }
+}
+
+# Restore a previous foreground window (foregroundDemo cleanup / background
+# self-activation recovery). Best-effort: reports whether the restore worked.
+function Restore-ForegroundWindow {
+  param([hashtable]$Target)
+  $previous = [IntPtr]::Zero
+  if ($Target.ContainsKey("previousForegroundHwnd") -and $null -ne $Target.previousForegroundHwnd) {
+    $previous = [IntPtr]([int64]$Target.previousForegroundHwnd)
+  }
+  $before = [ScreenshotTool.Native]::GetForegroundWindow()
+  if ($previous -ne [IntPtr]::Zero -and $previous -ne $before) {
+    [ScreenshotTool.Native]::keybd_event([byte]0x12, 0, [uint32]0, [UIntPtr]::Zero)
+    [ScreenshotTool.Native]::keybd_event([byte]0x12, 0, [uint32]2, [UIntPtr]::Zero)
+    [ScreenshotTool.Native]::SetForegroundWindow($previous) | Out-Null
+    Start-Sleep -Milliseconds 150
+  }
+  $after = [ScreenshotTool.Native]::GetForegroundWindow()
+  return [ordered]@{
+    restored = ($after -eq $previous)
+    foregroundHwnd = $after.ToInt64().ToString()
+    foregroundChanged = ($before -ne $after)
   }
 }
 
@@ -4053,6 +4134,12 @@ function Invoke-Action {
     }
     "get-foreground-window" {
       return Get-ForegroundWindow
+    }
+    "activate-window" {
+      return Activate-Window -Target $Request.target
+    }
+    "restore-foreground-window" {
+      return Restore-ForegroundWindow -Target $Request.target
     }
     "read-clipboard" {
       return Read-Clipboard -Target $Request.target

@@ -12,6 +12,17 @@ const nonEmptyStr = z.string().min(1).max(256);
 const optionalTimeout = z.number().int().min(100).max(300_000);
 const optionalPoll = z.number().int().min(50).max(10_000);
 
+// Shared interaction-mode + background-policy enums (mirror src/interaction.ts).
+const interactionModeSchema = z.enum(["auto", "background", "foregroundDemo"]);
+const backgroundPolicySchema = z.enum(["safe", "bestEffort", "foregroundRequired"]);
+
+const packInteractionSchema = z.object({
+  defaultMode: interactionModeSchema.optional(),
+  allowForegroundFallback: z.boolean().optional(),
+  backgroundPresentation: z.enum(["behind", "minimized", "normal"]).optional(),
+  restorePreviousForeground: z.boolean().optional()
+}).strict();
+
 // Shared selector schema (same locator semantics as ui_element_selector).
 export const packSelectorSchema: z.ZodType<import("../uia/types.js").UiElementSelector> = z.object({
   automationId: z.string().min(1).max(256).optional(),
@@ -90,6 +101,7 @@ export const packProfileSchema = z.object({
   security: z.object({
     requiresAsInvoker: z.boolean().optional().default(false)
   }).strict().optional(),
+  interaction: packInteractionSchema.optional(),
   submenuAidPatterns: z.array(nonEmptyStr).max(16).optional()
 }).strict().refine(
   (value) => {
@@ -164,7 +176,8 @@ export const packActionsSchema = z.object({
     preferredMethod: nonEmptyStr.optional(),
     fallbackPolicy: z.enum(["default", "disabled"]).optional().default("default"),
     maxAttempts: z.number().int().min(1).max(5).optional(),
-    selectionGroup: nonEmptyStr.optional()
+    selectionGroup: nonEmptyStr.optional(),
+    backgroundPolicy: backgroundPolicySchema.optional()
   }).strict()).max(2000)
 }).strict();
 
@@ -203,6 +216,7 @@ export const packWorkflowsSchema = z.object({
     tested: z.boolean().optional().default(false),
     restoresState: z.boolean().optional().default(false),
     visibility: z.enum(["session", "hidden", "internal"]).optional().default("session"),
+    interactionMode: interactionModeSchema.optional(),
     inputSchema: z.object({
       type: z.literal("object").optional().default("object"),
       properties: inputSchemaProperties.optional().default({}),

@@ -32,6 +32,13 @@ import {
   validatePipelineStatic,
   type ExecutionContext
 } from "./pipeline.js";
+import {
+  backgroundUnsafeSteps,
+  pipelineNotBackgroundSafeError,
+  resolveInteractionMode,
+  type InteractionMode,
+  type InteractionOptions
+} from "./interaction.js";
 import { validateReferences } from "./piping.js";
 import { getRun, runTtlRemainingMs } from "./runs.js";
 
@@ -207,7 +214,8 @@ async function appPackDescribeTool(args: unknown, runtime: RuntimeModules) {
     retrySafe: c.retrySafe,
     destructive: c.destructive,
     ...(c.defaultExpect ? { defaultExpect: c.defaultExpect } : {}),
-    ...(c.requiresConfirmation ? { requiresConfirmation: true } : {})
+    ...(c.requiresConfirmation ? { requiresConfirmation: true } : {}),
+    ...(c.backgroundPolicy ? { backgroundPolicy: c.backgroundPolicy } : {})
   }));
 
   const workflows = listWorkflows(pack);
@@ -234,17 +242,19 @@ async function appPackDescribeTool(args: unknown, runtime: RuntimeModules) {
       executableEnv: pack.profile.executableEnv,
       mainWindow: pack.profile.mainWindow,
       launch: pack.profile.launch,
-      security: pack.profile.security
+      security: pack.profile.security,
+      interaction: pack.profile.interaction
     },
     controls,
     actions,
     workflows,
     limitations,
     pipeSafe: {
-      profile_launch: ["pid", "hwnd", "title"],
-      profile_action: ["result", "selectorUsed"],
+      profile_launch: ["pid", "hwnd", "title", "interaction"],
+      profile_action: ["result", "selectorUsed", "interaction"],
       ui_wait: ["matched", "timedOut"]
-    }
+    },
+    defaultInteractionMode: pack.profile.interaction?.defaultMode ?? "auto"
   };
 }
 
@@ -352,6 +362,10 @@ function pipelineExecutionContext(runtime: RuntimeModules, uiaDeps: UiaDeps, pac
     // Lets page/selection capture resolve a profile for pack-less
     // run_steps pipelines that carry {profile} in their step args.
     resolveProfile: (id) => getAppProfile(id),
+    resolvePackActions: (id) => packRegistry.getPack(id)?.actions,
+    // foregroundDemo cleanup: restore the previous foreground window when the
+    // pipeline finishes.
+    restoreForeground: (hwnd) => runtime.windows.restoreForegroundWindow(hwnd),
     expectDeps: {
       getUiElement: (i) => uiaDeps.getUiElement(i),
       queryUi: (i) => uiaDeps.queryUi(i)
@@ -383,8 +397,32 @@ async function runStepsTool(args: unknown, runtime: RuntimeModules, uiaDeps: Uia
   if (!refCheck.ok) {
     throw new McpError(ErrorCode.InvalidParams, refCheck.message);
   }
-  const result = await runPipeline(input, pipelineExecutionContext(runtime, uiaDeps));
+  // run_steps has no pack context of its own: the mode comes from the caller,
+  // or from the pack default of the profile(s) its steps reference (profile
+  // actions inside the pipeline resolve the same default individually, so the
+  // pipeline-level preflight must match). Otherwise auto.
+  const mode: InteractionMode = input.interactionMode ?? stepsPackDefault(input.steps) ?? "auto";
+  const result = await runPipeline(input, {
+    ...pipelineExecutionContext(runtime, uiaDeps),
+    interactionMode: mode,
+    interaction: input.foregroundDemo
+  });
   return withRunTtl(result);
+}
+
+// First non-auto interaction default declared by the packs whose profile ids
+// appear as literal step args (steps referencing a profiled app inherit its
+// interaction policy at the pipeline level).
+function stepsPackDefault(steps: Array<{ args?: Record<string, unknown> }>): InteractionMode | undefined {
+  for (const step of steps) {
+    const profileId = step.args?.profile;
+    if (typeof profileId === "string" && !profileId.startsWith("${")) {
+      const pack = packRegistry.getPack(profileId);
+      const packDefault = pack?.profile.interaction?.defaultMode;
+      if (packDefault && packDefault !== "auto") return packDefault;
+    }
+  }
+  return undefined;
 }
 
 async function profileRunStepsTool(args: unknown, runtime: RuntimeModules, uiaDeps: UiaDeps) {
@@ -394,6 +432,26 @@ async function profileRunStepsTool(args: unknown, runtime: RuntimeModules, uiaDe
     throw new McpUiError("PACK_NOT_FOUND", `No App Pack with id '${input.profile}' is loaded.`, { pack: input.profile, loaded: packRegistry.listPacks("all").map((p) => p.manifest.id) });
   }
   const profile = getAppProfile(input.profile)!;
+
+  // Interaction mode: explicit > pack default > auto. Background preflights
+  // the steps BEFORE launching (no launch side effects for a refused run);
+  // foregroundDemo activates the window at launch and restores the previous
+  // foreground when the pipeline finishes.
+  const mode: InteractionMode = resolveInteractionMode({ explicit: input.interactionMode, packDefault: profile.interaction?.defaultMode });
+  const foregroundDemo = input.foregroundDemo;
+  if (mode === "background") {
+    // Preflight on the {control, action} steps (profile_action shape).
+    const preflightSteps = input.steps.map((s) => ({
+      ...(s.id ? { id: s.id } : {}),
+      tool: "profile_action" as const,
+      args: { profile: input.profile, control: s.control, action: s.action }
+    }));
+    const unsafe = backgroundUnsafeSteps(preflightSteps, (id) => packRegistry.getPack(id)?.actions, pack.actions);
+    if (unsafe.length > 0) {
+      const err = pipelineNotBackgroundSafeError(mode, unsafe);
+      throw new McpUiError("PIPELINE_NOT_BACKGROUND_SAFE", err.message, err.details);
+    }
+  }
 
   // 1. Launch / attach to the app.
   const launchResult = await runtime.profiles.launchProfile(
@@ -414,7 +472,9 @@ async function profileRunStepsTool(args: unknown, runtime: RuntimeModules, uiaDe
       ...(input.launch?.reuseIfRunning !== undefined ? { reuseIfRunning: input.launch.reuseIfRunning } : {}),
       ...(input.launch?.waitForWindow !== undefined ? { waitForWindow: input.launch.waitForWindow } : {}),
       ...(input.launch?.noActivate !== undefined ? { noActivate: input.launch.noActivate } : {}),
-      ...(input.launch?.timeoutMs !== undefined ? { timeoutMs: input.launch.timeoutMs } : {})
+      ...(input.launch?.timeoutMs !== undefined ? { timeoutMs: input.launch.timeoutMs } : {}),
+      interactionMode: mode,
+      foregroundDemo
     },
     runtime.windows.getExeManifestLevel
   );
@@ -459,7 +519,13 @@ async function profileRunStepsTool(args: unknown, runtime: RuntimeModules, uiaDe
       expectDeps: {
         getUiElement: (i) => uiaDeps.getUiElement(i),
         queryUi: (i) => uiaDeps.queryUi(i)
-      }
+      },
+      interactionMode: mode,
+      interaction: {
+        ...(foregroundDemo ?? {}),
+        ...(launchResult.interaction.foregroundBefore ? { foregroundBefore: launchResult.interaction.foregroundBefore } : {})
+      },
+      restoreForeground: (hwnd) => runtime.windows.restoreForegroundWindow(hwnd)
     }
   );
 
@@ -484,16 +550,50 @@ async function runWorkflowTool(args: unknown, runtime: RuntimeModules, uiaDeps: 
     throw new McpUiError("WORKFLOW_NOT_FOUND", `Pack '${input.pack}' has no workflow named '${input.workflow}'.`, { pack: input.pack, workflow: input.workflow, available: pack.workflows.workflows.map((w) => w.id) });
   }
   const profile = getAppProfile(input.pack)!;
+
+  // Interaction mode: explicit > workflow > pack default > auto.
+  const mode: InteractionMode = resolveInteractionMode({
+    explicit: input.interactionMode,
+    workflow: workflow.interactionMode,
+    packDefault: profile.interaction?.defaultMode
+  });
+  const foregroundDemo = input.foregroundDemo;
+
+  // Background preflight BEFORE the workflow runs (no launch side effects for
+  // a refused workflow).
+  if (mode === "background") {
+    const unsafe = backgroundUnsafeSteps(workflow.steps, (id) => packRegistry.getPack(id)?.actions, pack.actions);
+    if (unsafe.length > 0) {
+      const err = pipelineNotBackgroundSafeError(mode, unsafe);
+      throw new McpUiError("PIPELINE_NOT_BACKGROUND_SAFE", err.message, err.details);
+    }
+  }
+
+  // foregroundDemo: the workflow's profile_launch step must present the app
+  // in the foreground. The pipeline's interaction context is not visible to
+  // individual steps, so the resolved mode is injected into every launch
+  // step's args (constants are safe to inject server-side).
+  const steps = workflow.steps.map((s) => {
+    if (mode === "foregroundDemo" && s.tool === "profile_launch" && typeof s.args.profile === "string") {
+      return { ...s, args: { ...s.args, interactionMode: "foregroundDemo" as const } };
+    }
+    return s;
+  });
+  const workflowToRun = { ...workflow, steps };
+
   const result = await runWorkflow({
     pack,
-    workflow,
+    workflow: workflowToRun,
     inputs: input.inputs ?? {},
     profile,
     dispatch: (tool, toolArgs) => executeValidatedTool(tool, toolArgs, makeExecutor(runtime, uiaDeps)),
     expectDeps: {
       getUiElement: (i) => uiaDeps.getUiElement(i),
       queryUi: (i) => uiaDeps.queryUi(i)
-    }
+    },
+    interactionMode: mode,
+    interaction: foregroundDemo,
+    restoreForeground: (hwnd) => runtime.windows.restoreForegroundWindow(hwnd)
   });
   return { ...withRunTtl(result), pack: input.pack, workflow: input.workflow };
 }
@@ -538,10 +638,19 @@ async function continueRunTool(args: unknown, runtime: RuntimeModules, uiaDeps: 
     };
   }
 
+  // A continuation keeps the pack's interaction default (the run's own mode
+  // was resolved at run time; re-resolving from the pack keeps background
+  // preflights intact for the remaining steps).
+  const profile = snapshot.packId ? getAppProfile(snapshot.packId) : undefined;
+  const continuationMode: InteractionMode = resolveInteractionMode({ packDefault: profile?.interaction?.defaultMode });
+
   const result = await continuePipeline({
     runId: input.runId,
     continueFrom: input.continueFrom,
-    ctx: pipelineExecutionContext(runtime, uiaDeps, snapshot.packId),
+    ctx: {
+      ...pipelineExecutionContext(runtime, uiaDeps, snapshot.packId),
+      interactionMode: continuationMode
+    },
     checkProcessAlive: async (pid) => {
       try {
         const wins = await runtime.windows.listWindows({ pid });
@@ -613,8 +722,17 @@ async function dispatchToolValue(
       return await windows.launchApp(input as import("./schemas.js").LaunchAppInput);
     case "list_windows":
       return await windows.listWindows(input as import("./schemas.js").ListWindowsInput);
-    case "capture_window":
-      return await windows.captureWindow(input as import("./schemas.js").CaptureWindowInput);
+    case "capture_window": {
+      // Interaction mode: explicit > pack default (matched by process name /
+      // title) > auto. capture_window itself never hardcodes any app.
+      const captureInput = input as import("./schemas.js").CaptureWindowInput;
+      const targetProfile = profiles.findProfileForTarget({ processName: captureInput.processName, titleContains: captureInput.titleContains });
+      const captureMode: InteractionMode = resolveInteractionMode({
+        explicit: captureInput.interactionMode,
+        packDefault: targetProfile?.interaction?.defaultMode
+      });
+      return await windows.captureWindow(captureInput, captureMode);
+    }
     case "capture_screen_region":
       return await windows.captureScreenRegion(input as import("./schemas.js").CaptureScreenRegionInput);
     case "click_window":
@@ -691,7 +809,11 @@ async function dispatchToolValue(
       if (!pack) {
         throw new McpUiError("PACK_NOT_FOUND", `No App Pack with id '${wcInput.pack}' is loaded.`, { pack: wcInput.pack });
       }
-      return { workflows: listWorkflows(pack) };
+      const profile = getAppProfile(wcInput.pack);
+      return {
+        defaultInteractionMode: profile?.interaction?.defaultMode ?? "auto",
+        workflows: listWorkflows(pack)
+      };
     }
     default:
       throw new McpError(ErrorCode.MethodNotFound, `Unknown tool: ${name}`);

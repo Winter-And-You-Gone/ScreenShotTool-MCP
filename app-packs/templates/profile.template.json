@@ -17,5 +17,11 @@
   },
   "security": {
     "requiresAsInvoker": false
+  },
+  "interaction": {
+    "defaultMode": "auto",
+    "allowForegroundFallback": false,
+    "backgroundPresentation": "behind",
+    "restorePreviousForeground": true
   }
 }

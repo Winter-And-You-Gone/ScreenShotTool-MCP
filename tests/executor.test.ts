@@ -11,6 +11,24 @@ import test from "node:test";
 import { executeValidatedTool, ToolOutputSchemaMismatchError, type ToolExecutorContext } from "../src/executor.js";
 import { McpUiError } from "../src/uia/results.js";
 
+// A valid profile_launch dispatch result (the output schema requires the
+// interaction report since the interaction-policy work).
+const LAUNCH_RESULT = {
+  profile: "x",
+  pid: 1,
+  title: "x",
+  startedByMcp: true,
+  reused: false,
+  uiaRootAvailable: true,
+  interaction: {
+    requestedMode: "auto",
+    effectiveMode: "background",
+    foregroundChanged: false,
+    targetActivated: false,
+    physicalCursorMoved: false
+  }
+};
+
 function makeCtx(opts: {
   parseInput?: ToolExecutorContext["parseInput"];
   dispatch: (tool: string, input: unknown) => Promise<unknown>;
@@ -26,9 +44,9 @@ function makeCtx(opts: {
 }
 
 test("valid output passes through unchanged", async () => {
-  const ctx = makeCtx({ dispatch: async () => ({ profile: "x", pid: 1, title: "x", startedByMcp: true, reused: false, uiaRootAvailable: true }) });
+  const ctx = makeCtx({ dispatch: async () => LAUNCH_RESULT });
   const result = await executeValidatedTool("profile_launch", { profile: "x" }, ctx);
-  assert.deepEqual(result, { profile: "x", pid: 1, title: "x", startedByMcp: true, reused: false, uiaRootAvailable: true });
+  assert.deepEqual(result, LAUNCH_RESULT);
 });
 
 test("invalid output raises TOOL_OUTPUT_SCHEMA_MISMATCH with structured errors", async () => {
@@ -89,7 +107,7 @@ test("input validation failures raise InvalidParams before dispatch", async () =
       if ((args as { bad?: boolean })?.bad) return { ok: false, message: "bad input" };
       return { ok: true, value: args };
     },
-    dispatch: async () => { dispatched = true; return { profile: "x", pid: 1, title: "x", startedByMcp: true, reused: false, uiaRootAvailable: true }; }
+    dispatch: async () => { dispatched = true; return LAUNCH_RESULT; }
   });
   await assert.rejects(
     () => executeValidatedTool("profile_launch", { bad: true }, ctx),

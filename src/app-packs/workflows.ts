@@ -10,6 +10,13 @@ import type { LoadedPack, PackWorkflow } from "./types.js";
 import { runPipeline, type ExecutionContext, type PipelineInput, type PipelineResult } from "../pipeline.js";
 import { McpUiError } from "../uia/results.js";
 import { getContract } from "../contracts.js";
+import {
+  backgroundUnsafeSteps,
+  stepBackgroundPolicy,
+  type BackgroundPolicy,
+  type InteractionMode,
+  type InteractionOptions
+} from "../interaction.js";
 
 export type WorkflowCatalogEntry = {
   id: string;
@@ -19,20 +26,42 @@ export type WorkflowCatalogEntry = {
   restoresState: boolean;
   requiredInputs: string[];
   visibility: string;
+  // Declared background capability of the workflow (aggregated over its
+  // steps): foregroundRequired when any step is (those workflows need
+  // interactionMode=foregroundDemo), bestEffort when a step may fail in
+  // background, safe when every step is verified background-safe.
+  backgroundPolicy: BackgroundPolicy;
+  // The steps that block background execution (foregroundRequired).
+  foregroundRequiredSteps: Array<{ stepId?: string; backgroundPolicy: BackgroundPolicy; suggestedMode: "foregroundDemo" }>;
 };
 
 export function listWorkflows(pack: LoadedPack, includeInternal = false): WorkflowCatalogEntry[] {
   return pack.workflows.workflows
     .filter((w) => includeInternal || (w.visibility ?? "session") !== "internal")
-    .map((w) => ({
-      id: w.id,
-      description: w.description ?? "",
-      safe: w.safe ?? false,
-      tested: w.tested ?? false,
-      restoresState: w.restoresState ?? false,
-      requiredInputs: w.inputSchema?.required ?? [],
-      visibility: w.visibility ?? "session"
-    }));
+    .map((w) => {
+      const unsafe = backgroundUnsafeSteps(w.steps, () => undefined, pack.actions);
+      const policies = w.steps.map((s) => stepBackgroundPolicy(pack.actions, s));
+      const backgroundPolicy: BackgroundPolicy = unsafe.length > 0
+        ? "foregroundRequired"
+        : policies.some((p) => p === "bestEffort")
+          ? "bestEffort"
+          : "safe";
+      return {
+        id: w.id,
+        description: w.description ?? "",
+        safe: w.safe ?? false,
+        tested: w.tested ?? false,
+        restoresState: w.restoresState ?? false,
+        requiredInputs: w.inputSchema?.required ?? [],
+        visibility: w.visibility ?? "session",
+        backgroundPolicy,
+        foregroundRequiredSteps: unsafe.map((s) => ({
+          ...(s.stepId ? { stepId: s.stepId } : {}),
+          backgroundPolicy: s.backgroundPolicy,
+          suggestedMode: s.suggestedMode
+        }))
+      };
+    });
 }
 
 export function getWorkflow(pack: LoadedPack, id: string): PackWorkflow | undefined {
@@ -71,6 +100,10 @@ export type RunWorkflowOptions = {
   dispatch: ExecutionContext["dispatch"];
   expectDeps: ExecutionContext["expectDeps"];
   autoContext?: ExecutionContext["autoContext"];
+  // Resolved interaction mode (explicit > workflow > pack default > auto).
+  interactionMode?: InteractionMode;
+  interaction?: InteractionOptions & { foregroundBefore?: string };
+  restoreForeground?: ExecutionContext["restoreForeground"];
 };
 
 export async function runWorkflow(opts: RunWorkflowOptions): Promise<PipelineResult> {
@@ -116,6 +149,9 @@ export async function runWorkflow(opts: RunWorkflowOptions): Promise<PipelineRes
     pack: { id: pack.manifest.id, actions: pack.actions, profile: opts.profile, version: pack.manifest.version },
     inputs,
     autoContext: opts.autoContext,
-    expectDeps: opts.expectDeps
+    expectDeps: opts.expectDeps,
+    interactionMode: opts.interactionMode,
+    interaction: opts.interaction,
+    restoreForeground: opts.restoreForeground
   });
 }

@@ -226,6 +226,41 @@ const captureOutput = obj(
   ["path", "width", "height", "target", "rect", "timestamp"]
 );
 
+// Unified interaction-impact metadata reported by high-level tools and the
+// aggregate pipeline result. Only hwnd values + booleans - never titles,
+// process info, or sensitive data.
+const interactionShape = obj(
+  {
+    requestedMode: en(["auto", "background", "foregroundDemo"]),
+    effectiveMode: en(["background", "foregroundDemo"]),
+    backgroundPolicy: en(["safe", "bestEffort", "foregroundRequired"]),
+    method: str(),
+    foregroundBefore: str(),
+    foregroundAfter: str(),
+    foregroundChanged: bool(),
+    foregroundRestored: bool(),
+    targetActivated: bool(),
+    physicalCursorMoved: bool()
+  },
+  ["requestedMode", "effectiveMode", "foregroundChanged", "targetActivated", "physicalCursorMoved"],
+  "Interaction-impact report: mode resolution, foreground changes, activation and physical-cursor movement for this call."
+);
+
+// capture_window carries the interaction report (capture_screen_region does
+// not: it has no target window and never touches the foreground).
+const captureWindowOutput = obj(
+  {
+    path: str(),
+    width: int(),
+    height: int(),
+    target: str(),
+    rect: any(),
+    timestamp: str(),
+    interaction: interactionShape
+  },
+  ["path", "width", "height", "target", "rect", "timestamp", "interaction"]
+);
+
 const clickOutput = obj(
   {
     clicked: bool(),
@@ -532,9 +567,10 @@ const profileActionOutput = obj(
     selectorUsed: any(),
     confidence: str(),
     notes: str(),
-    result: any()
+    result: any(),
+    interaction: interactionShape
   },
-  ["profile", "control", "result"]
+  ["profile", "control", "result", "interaction"]
 );
 
 const profileLaunchOutput = obj(
@@ -546,9 +582,10 @@ const profileLaunchOutput = obj(
     startedByMcp: bool(),
     reused: bool(),
     uiaRootAvailable: bool(),
-    manifestLevel: str()
+    manifestLevel: str(),
+    interaction: interactionShape
   },
-  ["profile", "pid", "startedByMcp", "uiaRootAvailable"],
+  ["profile", "pid", "startedByMcp", "uiaRootAvailable", "interaction"],
   "profile_launch success result (stable fields: profile, pid, hwnd, title, startedByMcp, reused, uiaRootAvailable)."
 );
 
@@ -588,7 +625,8 @@ const appPackDescribeOutput = obj(
     actions: arr(any()),
     workflows: arr(any()),
     limitations: arr(str()),
-    pipeSafe: any()
+    pipeSafe: any(),
+    defaultInteractionMode: str()
   },
   ["pack", "displayName", "version", "source", "controls", "workflows"]
 );
@@ -670,7 +708,8 @@ const runStepsOutput = obj(
     steps: arr(stepResult),
     error: errorShape,
     finallyResults: arr(any()),
-    restoreResults: arr(any())
+    restoreResults: arr(any()),
+    interaction: interactionShape
   },
   ["schemaVersion", "success", "total", "completed", "stoppedAtIndex", "steps"]
 );
@@ -700,6 +739,7 @@ const validateStepsOutput = obj(
 
 const workflowCatalogOutput = obj(
   {
+    defaultInteractionMode: str(),
     workflows: arr(
       obj(
         {
@@ -709,7 +749,18 @@ const workflowCatalogOutput = obj(
           tested: bool(),
           restoresState: bool(),
           requiredInputs: arr(str()),
-          visibility: str()
+          visibility: str(),
+          backgroundPolicy: str(),
+          foregroundRequiredSteps: arr(
+            obj(
+              {
+                stepId: str(),
+                backgroundPolicy: str(),
+                suggestedMode: str()
+              },
+              ["backgroundPolicy", "suggestedMode"]
+            )
+          )
         },
         ["id", "description", "safe", "tested", "restoresState", "requiredInputs"]
       )
@@ -731,7 +782,8 @@ const runWorkflowOutput = obj(
     exports: any(),
     steps: arr(stepResult),
     error: errorShape,
-    finallyResults: arr(any())
+    finallyResults: arr(any()),
+    interaction: interactionShape
   },
   ["schemaVersion", "success", "runId", "pack", "workflow", "steps"]
 );
@@ -777,11 +829,11 @@ export const contracts: Record<string, ToolContract> = {
   },
   capture_window: {
     name: "capture_window",
-    description: "IMPORTANT: screenshots are SLOW (1-5s each). Prefer state checks (list_windows, ui_get) over screenshots. 'print' mode uses PrintWindow (works occluded/minimized, misses separate popup/tooltip windows); 'screen' mode copies the visible screen. Returns: path,width,height,target,rect,timestamp. Pipe-safe: path.",
+    description: "IMPORTANT: screenshots are SLOW (1-5s each). Prefer state checks (list_windows, ui_get) over screenshots. 'print' mode uses PrintWindow (works occluded/minimized, misses separate popup/tooltip windows); 'screen' mode copies the visible screen. interactionMode=background forces the non-activating PrintWindow path and reports interaction metadata; capture never auto-upgrades to foreground (BACKGROUND_CAPTURE_UNAVAILABLE instead). Returns: path,width,height,target,rect,timestamp,interaction. Pipe-safe: path, interaction.",
     inputSchema: toolInputSchemas.capture_window as unknown as JsonSchema,
-    outputSchema: captureOutput,
+    outputSchema: captureWindowOutput,
     schemaVersion: 1,
-    pipeSafeFields: ["path", "width", "height"],
+    pipeSafeFields: ["path", "width", "height", "interaction"],
     annotations: { readOnly: true, idempotent: true, retrySafe: true }
   },
   capture_screen_region: {
@@ -957,20 +1009,20 @@ export const contracts: Record<string, ToolContract> = {
   },
   profile_action: {
     name: "profile_action",
-    description: "Perform an action on a logical control from an App Pack (tries candidate selectors in order; supports composite actions selectByName/selectByIndex/getSelection/openMenu/openSubmenu that handle same-PID popups and verify before/after state; never moves the physical mouse). Pack defaultExpect applies unless you pass expect:false. ASYNC-ISH: verify the outcome with ui_wait or an expect. Returns: profile, control, selectorUsed, confidence, result.",
+    description: "Perform an action on a logical control from an App Pack (tries candidate selectors in order; supports composite actions selectByName/selectByIndex/getSelection/openMenu/openSubmenu that handle same-PID popups and verify before/after state; never moves the physical mouse). Pack defaultExpect applies unless you pass expect:false. ASYNC-ISH: verify the outcome with ui_wait or an expect. In background mode actions declared foregroundRequired are refused up front (FOREGROUND_REQUIRED). Returns: profile, control, selectorUsed, confidence, result, interaction.",
     inputSchema: toolInputSchemas.profile_action as unknown as JsonSchema,
     outputSchema: profileActionOutput,
     schemaVersion: 1,
-    pipeSafeFields: ["profile", "control", "selectorUsed", "confidence", "result"],
+    pipeSafeFields: ["profile", "control", "selectorUsed", "confidence", "result", "interaction"],
     annotations: { idempotent: false, retrySafe: false, needsExpect: true }
   },
   profile_launch: {
     name: "profile_launch",
-    description: "Launch a profiled app from an App Pack by pack id, resolving the executable via exePath > pack executableEnv > common build dirs > PATH. Returns: profile, pid, hwnd, title, startedByMcp, reused, uiaRootAvailable. Pipe-safe: pid, hwnd, title. Recommended as step 0 of a pipeline.",
+    description: "Launch a profiled app from an App Pack by pack id, resolving the executable via exePath > pack executableEnv > common build dirs > PATH. interactionMode=background keeps the window behind the current foreground window (no steal, no topmost, no minimize) and reports interaction metadata; foregroundDemo restores+activates the window. Returns: profile, pid, hwnd, title, startedByMcp, reused, uiaRootAvailable, interaction. Pipe-safe: pid, hwnd, title, interaction. Recommended as step 0 of a pipeline.",
     inputSchema: toolInputSchemas.profile_launch as unknown as JsonSchema,
     outputSchema: profileLaunchOutput,
     schemaVersion: 1,
-    pipeSafeFields: ["profile", "pid", "hwnd", "title", "startedByMcp", "reused", "uiaRootAvailable"],
+    pipeSafeFields: ["profile", "pid", "hwnd", "title", "startedByMcp", "reused", "uiaRootAvailable", "interaction"],
     annotations: { idempotent: false, retrySafe: true }
   },
   app_pack_list: {
@@ -984,7 +1036,7 @@ export const contracts: Record<string, ToolContract> = {
   },
   app_pack_describe: {
     name: "app_pack_describe",
-    description: "Describe a loaded App Pack: launch contract, logical controls, supported actions, default postconditions, visible workflows, known limitations, and pipe-safe examples. Call this once per pack before building a pipeline - everything a first-time model needs is here. Returns: pack, displayName, version, source, profile, controls[], actions[], workflows[], limitations[], pipeSafe.",
+    description: "Describe a loaded App Pack: launch contract, logical controls, supported actions (incl. backgroundPolicy), visible workflows (incl. backgroundPolicy/foregroundRequiredSteps), defaultInteractionMode, known limitations, and pipe-safe examples. Call this once per pack before building a pipeline - everything a first-time model needs is here. Returns: pack, displayName, version, source, profile, controls[], actions[], workflows[], limitations[], pipeSafe, defaultInteractionMode.",
     inputSchema: toolInputSchemas.app_pack_describe as unknown as JsonSchema,
     outputSchema: appPackDescribeOutput,
     schemaVersion: 1,
@@ -1029,25 +1081,25 @@ export const contracts: Record<string, ToolContract> = {
   },
   run_steps: {
     name: "run_steps",
-    description: "Execute a sequence of tools server-side in one call. Steps may have an id (recommended), tool, args with ${id.path} or ${N.path} placeholders, exports{name:path}, expect{postcondition}, retry, captureBefore. Stops on first error; finally runs regardless; returns runId for continue_run. Returns: success, total, completed, stoppedAtIndex, steps[], exports, runId. Pipe-safe: steps, exports.",
+    description: "Execute a sequence of tools server-side in one call. Steps may have an id (recommended), tool, args with ${id.path} or ${N.path} placeholders, exports{name:path}, expect{postcondition}, retry, captureBefore. Stops on first error; finally runs regardless; returns runId for continue_run. interactionMode=background preflights every step (PIPELINE_NOT_BACKGROUND_SAFE before any step runs when a step is foregroundRequired); foregroundDemo restores the previous foreground window at the end. Returns: success, total, completed, stoppedAtIndex, steps[], exports, runId, interaction. Pipe-safe: steps, exports, interaction.",
     inputSchema: toolInputSchemas.run_steps as unknown as JsonSchema,
     outputSchema: runStepsOutput,
     schemaVersion: 1,
-    pipeSafeFields: ["success", "total", "completed", "stoppedAtIndex", "runId", "steps", "exports"],
+    pipeSafeFields: ["success", "total", "completed", "stoppedAtIndex", "runId", "steps", "exports", "interaction"],
     annotations: { idempotent: false, retrySafe: false }
   },
   profile_run_steps: {
     name: "profile_run_steps",
-    description: "Run a pipeline against a loaded App Pack profile: the server launches the app (launch config optional), injects profile/pid/hwnd into every step, resolves controls by logical name, applies defaultExpect from the pack's actions.json, handles same-PID popups. Model does NOT repeat profile/pid/includeProcessPopups. Returns: success, runId, profile, pid, steps[], exports.",
+    description: "Run a pipeline against a loaded App Pack profile: the server launches the app (launch config optional), injects profile/pid/hwnd into every step, resolves controls by logical name, applies defaultExpect from the pack's actions.json, handles same-PID popups. Model does NOT repeat profile/pid/includeProcessPopups. interactionMode resolves explicit > pack default > auto; background preflights steps (PIPELINE_NOT_BACKGROUND_SAFE) before launch. Returns: success, runId, profile, pid, steps[], exports, interaction.",
     inputSchema: toolInputSchemas.profile_run_steps as unknown as JsonSchema,
     outputSchema: runStepsOutput,
     schemaVersion: 1,
-    pipeSafeFields: ["success", "runId", "profile", "pid", "hwnd", "steps", "exports"],
+    pipeSafeFields: ["success", "runId", "profile", "pid", "hwnd", "steps", "exports", "interaction"],
     annotations: { idempotent: false, retrySafe: false }
   },
   workflow_catalog: {
     name: "workflow_catalog",
-    description: "List workflows defined by a loaded App Pack (respects catalogVisibility). Returns: workflows[{id,description,safe,tested,restoresState,requiredInputs,visibility}]. Pipe-safe: workflows.",
+    description: "List workflows defined by a loaded App Pack (respects catalogVisibility). Each entry reports backgroundPolicy (safe/bestEffort/foregroundRequired) and foregroundRequiredSteps so a model knows which workflows can run fully in background; defaultInteractionMode is the pack's interaction default. Returns: defaultInteractionMode, workflows[{id,description,safe,tested,restoresState,requiredInputs,visibility,backgroundPolicy,foregroundRequiredSteps}]. Pipe-safe: workflows.",
     inputSchema: toolInputSchemas.workflow_catalog as unknown as JsonSchema,
     outputSchema: workflowCatalogOutput,
     schemaVersion: 1,
@@ -1056,11 +1108,11 @@ export const contracts: Record<string, ToolContract> = {
   },
   run_workflow: {
     name: "run_workflow",
-    description: "Run a named workflow from a loaded App Pack. Inputs validated against the workflow inputSchema; ${pack.id} is injected server-side; pack defaultExpect applies; finally runs; returns runId for continue_run. Returns: success, runId, pack, workflow, status, completedSteps, exports, steps[], error.",
+    description: "Run a named workflow from a loaded App Pack. Inputs validated against the workflow inputSchema; ${pack.id} is injected server-side; pack defaultExpect applies; finally runs; returns runId for continue_run. interactionMode resolves explicit > workflow > pack default > auto; background preflights the workflow's steps; foregroundDemo restores the previous foreground window at the end. Returns: success, runId, pack, workflow, status, completedSteps, exports, steps[], error, interaction.",
     inputSchema: toolInputSchemas.run_workflow as unknown as JsonSchema,
     outputSchema: runWorkflowOutput,
     schemaVersion: 1,
-    pipeSafeFields: ["success", "runId", "pack", "workflow", "exports", "steps"],
+    pipeSafeFields: ["success", "runId", "pack", "workflow", "exports", "steps", "interaction"],
     annotations: { idempotent: false, retrySafe: false }
   },
   continue_run: {

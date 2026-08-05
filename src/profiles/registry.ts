@@ -35,6 +35,15 @@ import {
 } from "./types.js";
 import type { ProfileResolveInput, ProfileActionInput } from "../schemas.js";
 import { McpUiError } from "../uia/results.js";
+import {
+  backgroundPolicyForAction,
+  effectiveModeFor,
+  foregroundRequiredError,
+  resolveInteractionMode,
+  type InteractionMode,
+  type InteractionReport,
+  type InteractionOptions
+} from "../interaction.js";
 
 // The UIA surface the profile layer needs. index.ts supplies the real
 // implementations from the loaded windows.js runtime module.
@@ -107,6 +116,10 @@ export type UiaDeps = {
     modifiers?: string[];
     noActivate?: boolean;
   }) => Promise<unknown>;
+  // Foreground observation + manipulation (interaction policy support).
+  getForegroundWindow: () => Promise<string>;
+  activateWindow: (hwnd: string) => Promise<{ activated: boolean; foregroundHwnd: string }>;
+  restoreForegroundWindow: (previousForegroundHwnd?: string) => Promise<{ restored: boolean; foregroundHwnd: string; foregroundChanged: boolean }>;
 };
 
 export function getProfile(id: string): AppProfile | undefined {
@@ -236,6 +249,13 @@ export async function resolveProfileControl(
   );
 }
 
+// Resolve the pack's action contracts for a profile (for backgroundPolicy
+// lookup). The profile layer stays data-driven: contracts come from the
+// loaded App Pack, never from hardcoded source.
+function getPackActions(profileId: string): import("../app-packs/types.js").PackActions | undefined {
+  return packRegistry.getPack(profileId)?.actions;
+}
+
 // Perform an action on a logical control. Reuses performUiAction (the generic
 // UIA layer) - no pattern logic is duplicated here.
 export async function performProfileAction(
@@ -248,6 +268,7 @@ export async function performProfileAction(
   confidence?: SelectorConfidence;
   notes?: string;
   result: unknown;
+  interaction: InteractionReport;
 }> {
   const profile = getProfile(input.profile);
   if (!profile) {
@@ -263,6 +284,19 @@ export async function performProfileAction(
   }
   const candidates = entry.selectors;
   const confidence = entry.confidence;
+
+  // Interaction mode: explicit > pack default > auto.
+  const mode = resolveInteractionMode({ explicit: input.interactionMode, packDefault: profile.interaction?.defaultMode });
+  const policy = backgroundPolicyForAction(getPackActions(input.profile), input.control, input.action);
+
+  // background mode: actions the pack declares foregroundRequired are refused
+  // BEFORE any UIA work - never executed and never upgraded to foreground.
+  if (mode === "background" && policy === "foregroundRequired") {
+    throw foregroundRequiredError(
+      `Action '${input.action}' on control '${input.control}' is declared foregroundRequired by the App Pack; it has no verified background-safe method.`,
+      { requestedMode: mode, backgroundPolicy: policy }
+    );
+  }
 
   const windowSel = profileWindowSelector(profile, { hwnd: input.hwnd, pid: input.pid, processName: input.processName, titleContains: input.titleContains });
   const candidatesTried: Array<{ selector: UiElementSelector; outcome: string; message?: string }> = [];
@@ -286,7 +320,8 @@ export async function performProfileAction(
   // composite path triggers them via a non-blocking focus + Enter key.
   const composite = new Set(["selectByName", "selectByIndex", "getSelection", "openMenu", "openSubmenu", "ensureSelected"]);
   if (composite.has(input.action) || (input.action === "invoke" && isKeyboardInvokeControl(entry))) {
-    const compositeResult = await performCompositeProfileAction(deps, profile, input, entry, windowSel);
+    const foregroundBefore = await readForeground(deps);
+    const compositeResult = await performCompositeProfileAction(deps, profile, input, entry, windowSel, mode, policy);
     // Composite actions verify before/after state; a failed verification is a
     // step failure, not a silent success.
     const resultValue = compositeResult.result as { success?: boolean } | undefined;
@@ -295,9 +330,22 @@ export async function performProfileAction(
         profile: profile.id, control: input.control, action: input.action, result: compositeResult.result
       });
     }
-    return compositeResult;
+    let foregroundAfter = await readForeground(deps);
+    let foregroundChanged = foregroundBefore !== undefined && foregroundAfter !== undefined && foregroundBefore !== foregroundAfter;
+    let foregroundRestored: boolean | undefined;
+    if (mode === "background" && foregroundChanged && foregroundBefore !== undefined) {
+      foregroundRestored = await restoreIfChanged(deps, foregroundBefore);
+      foregroundAfter = await readForeground(deps);
+      foregroundChanged = foregroundAfter !== undefined && foregroundAfter !== foregroundBefore;
+    }
+    const method = (compositeResult.result as { method?: string }).method;
+    return {
+      ...compositeResult,
+      interaction: buildActionReport(mode, policy, foregroundBefore, foregroundAfter, foregroundChanged, method, false, foregroundRestored)
+    };
   }
 
+  const foregroundBefore = await readForeground(deps);
   for (let i = 0; i < candidates.length; i++) {
     const selector = candidates[i]!;
     try {
@@ -318,13 +366,25 @@ export async function performProfileAction(
         maxNodes: input.maxNodes,
         timeoutMs: input.timeoutMs
       });
+      let foregroundAfter = await readForeground(deps);
+      let foregroundChanged = foregroundBefore !== undefined && foregroundAfter !== undefined && foregroundBefore !== foregroundAfter;
+      // background mode: an action must never leave the foreground changed;
+      // if the target (or something else) stole it, restore the original and
+      // verify the FINAL state (the app can re-steal immediately).
+      let foregroundRestored: boolean | undefined;
+      if (mode === "background" && foregroundChanged && foregroundBefore !== undefined) {
+        foregroundRestored = await restoreIfChanged(deps, foregroundBefore);
+        foregroundAfter = await readForeground(deps);
+        foregroundChanged = foregroundAfter !== undefined && foregroundAfter !== foregroundBefore;
+      }
       return {
         profile: profile.id,
         control: input.control,
         selectorUsed: selector,
         confidence,
         notes: entry.notes,
-        result
+        result,
+        interaction: buildActionReport(mode, policy, foregroundBefore, foregroundAfter, foregroundChanged, result.method, false, foregroundRestored)
       };
     } catch (error) {
       lastError = error;
@@ -361,6 +421,51 @@ export async function performProfileAction(
   });
 }
 
+// Read the current foreground hwnd (best-effort; undefined when unavailable).
+async function readForeground(deps: UiaDeps): Promise<string | undefined> {
+  try {
+    return await deps.getForegroundWindow();
+  } catch {
+    return undefined;
+  }
+}
+
+// background mode: restore the previous foreground window and report whether
+// the restore worked. Best-effort - a failed restore is reported, never
+// silently presented as clean background.
+async function restoreIfChanged(deps: UiaDeps, previousForegroundHwnd: string): Promise<boolean> {
+  try {
+    const r = await deps.restoreForegroundWindow(previousForegroundHwnd);
+    return r.restored;
+  } catch {
+    return false;
+  }
+}
+
+function buildActionReport(
+  mode: InteractionMode,
+  policy: import("../interaction.js").BackgroundPolicy | undefined,
+  foregroundBefore: string | undefined,
+  foregroundAfter: string | undefined,
+  foregroundChanged: boolean,
+  method: string | undefined,
+  targetActivated: boolean,
+  foregroundRestored?: boolean
+): InteractionReport {
+  return {
+    requestedMode: mode,
+    effectiveMode: effectiveModeFor(mode, foregroundChanged || targetActivated),
+    ...(policy ? { backgroundPolicy: policy } : {}),
+    ...(method ? { method } : {}),
+    ...(foregroundBefore ? { foregroundBefore } : {}),
+    ...(foregroundAfter ? { foregroundAfter } : {}),
+    foregroundChanged,
+    ...(foregroundRestored !== undefined ? { foregroundRestored } : {}),
+    targetActivated,
+    physicalCursorMoved: false
+  };
+}
+
 // profile_list is pure data - no UIA deps needed.
 export function profileList() {
   return {
@@ -381,13 +486,19 @@ export function buildUiaDeps(windows: {
   queryUi: (input: never) => Promise<QueryResult>;
   inspectUiTree: (input: never) => Promise<InspectTreeResult>;
   sendKey: (input: never) => Promise<unknown>;
+  getForegroundWindowHwnd: () => Promise<string>;
+  activateWindow: (hwnd: string) => Promise<{ activated: boolean; foregroundHwnd: string }>;
+  restoreForegroundWindow: (previousForegroundHwnd?: string) => Promise<{ restored: boolean; foregroundHwnd: string; foregroundChanged: boolean }>;
 }): UiaDeps {
   return {
     getUiElement: windows.getUiElement as UiaDeps["getUiElement"],
     performUiAction: windows.performUiAction as UiaDeps["performUiAction"],
     queryUi: windows.queryUi as UiaDeps["queryUi"],
     inspectUiTree: windows.inspectUiTree as UiaDeps["inspectUiTree"],
-    sendKey: windows.sendKey as UiaDeps["sendKey"]
+    sendKey: windows.sendKey as UiaDeps["sendKey"],
+    getForegroundWindow: windows.getForegroundWindowHwnd as UiaDeps["getForegroundWindow"],
+    activateWindow: windows.activateWindow as UiaDeps["activateWindow"],
+    restoreForegroundWindow: windows.restoreForegroundWindow as UiaDeps["restoreForegroundWindow"]
   };
 }
 
@@ -524,7 +635,9 @@ async function performCompositeProfileAction(
   profile: AppProfile,
   input: ProfileActionInput,
   entry: ControlEntry,
-  windowSel: { hwnd?: string | number; pid?: number; processName?: string; titleContains?: string }
+  windowSel: { hwnd?: string | number; pid?: number; processName?: string; titleContains?: string },
+  mode: InteractionMode = "auto",
+  policy?: import("../interaction.js").BackgroundPolicy
 ): Promise<{ profile: string; control: string; selectorUsed?: UiElementSelector; confidence?: SelectorConfidence; notes?: string; result: unknown }> {
   const selector = await resolveUniqueSelector(deps, windowSel, entry, input);
   const actionTimeout = input.timeoutMs ?? 15000;
@@ -712,6 +825,15 @@ async function performCompositeProfileAction(
   }
 
   if (!selected) {
+    // background mode: the keyboard fallback (focus + Alt+Down / arrows /
+    // Enter) is keyboard interaction the background contract forbids. Refuse
+    // with FOREGROUND_REQUIRED instead of executing it - never upgrade.
+    if (mode === "background") {
+      throw foregroundRequiredError(
+        `The ComboBox '${input.control}' requires foreground keyboard interaction (no SelectionItemPattern/ValuePattern path available in background mode).`,
+        { requestedMode: mode, backgroundPolicy: policy ?? "bestEffort", method: "keyboard-fallback" }
+      );
+    }
     // Keyboard fallback. Focus the combo first.
     await deps.performUiAction({ ...win(), selector, action: "focus", includeProcessPopups: true, timeoutMs: actionTimeout }).catch(() => undefined);
     await sleep(150);
@@ -788,9 +910,9 @@ export async function launchProfile(
   deps: UiaDeps,
   windowsLaunch: (input: { exePath: string; args?: string[]; waitForWindow?: boolean; noActivate?: boolean; startMinimized?: boolean; timeoutMs?: number }) => Promise<{ pid: number; window: { hwnd: string; title: string; pid: number; processName: string; className: string; rect: unknown } | null }>,
   listWindows: (filters: { processName?: string }) => Promise<Array<{ hwnd: string; title: string; pid: number; processName: string }>>,
-  input: { profile: string; exePath?: string; args?: string[]; waitForWindow?: boolean; noActivate?: boolean; startMinimized?: boolean; timeoutMs?: number; reuseIfRunning?: boolean },
+  input: { profile: string; exePath?: string; args?: string[]; waitForWindow?: boolean; noActivate?: boolean; startMinimized?: boolean; timeoutMs?: number; reuseIfRunning?: boolean; interactionMode?: InteractionMode; foregroundDemo?: InteractionOptions },
   getExeManifestLevel?: (exePath: string) => Promise<string>
-): Promise<{ profile: string; pid: number; hwnd?: string; title?: string; startedByMcp: boolean; reused: boolean; uiaRootAvailable: boolean; manifestLevel?: string }> {
+): Promise<{ profile: string; pid: number; hwnd?: string; title?: string; startedByMcp: boolean; reused: boolean; uiaRootAvailable: boolean; manifestLevel?: string; interaction: InteractionReport; warning?: string }> {
   const profile = getProfile(input.profile);
   if (!profile) {
     throw new McpUiError("PROFILE_NOT_FOUND", `No profile with id '${input.profile}'.`, { profile: input.profile });
@@ -799,8 +921,18 @@ export async function launchProfile(
     throw new McpUiError("PROFILE_NOT_FOUND", `Profile '${input.profile}' has no executableNames; cannot launch.`, { profile: input.profile });
   }
 
+  // Interaction mode: explicit > pack default > auto. Explicit mode wins over
+  // the legacy noActivate/startMinimized params.
+  const mode = resolveInteractionMode({ explicit: input.interactionMode, packDefault: profile.interaction?.defaultMode });
+  const isBackground = mode === "background";
+  const isDemo = mode === "foregroundDemo";
+  const noActivate = isBackground ? true : (input.noActivate ?? profile.launch?.noActivate ?? true);
+  const startMinimized = isBackground ? false : (input.startMinimized ?? false);
+
   // Apply pack-declared launch defaults for omitted fields.
   const launchDefaults = profile.launch ?? {};
+
+  const foregroundBefore = await readForeground(deps);
 
   // Reuse an already-running instance if allowed.
   if ((input.reuseIfRunning ?? launchDefaults.reuseIfRunning ?? true) !== false) {
@@ -814,7 +946,7 @@ export async function launchProfile(
           const r = await deps.getUiElement({ hwnd: win.hwnd, selector: { controlType: "Window" }, includeProcessPopups: false, timeoutMs: 8000 });
           uiaOk = r.found;
         } catch { uiaOk = false; }
-        return { profile: profile.id, pid: win.pid, hwnd: win.hwnd, title: win.title, startedByMcp: false, reused: true, uiaRootAvailable: uiaOk };
+        return await launchOutcome({ profile: profile.id, pid: win.pid, hwnd: win.hwnd, title: win.title, startedByMcp: false, reused: true, uiaRootAvailable: uiaOk });
       }
     }
   }
@@ -842,8 +974,8 @@ export async function launchProfile(
     exePath,
     args: input.args,
     waitForWindow: input.waitForWindow ?? launchDefaults.waitForWindow ?? true,
-    noActivate: input.noActivate ?? launchDefaults.noActivate ?? true,
-    startMinimized: input.startMinimized ?? false,
+    noActivate,
+    startMinimized,
     timeoutMs: input.timeoutMs ?? launchDefaults.timeoutMs ?? 30000
   });
 
@@ -856,7 +988,7 @@ export async function launchProfile(
     } catch { uiaRootAvailable = false; }
   }
 
-  return {
+  return await launchOutcome({
     profile: profile.id,
     pid: launched.pid,
     hwnd: launched.window?.hwnd,
@@ -865,7 +997,62 @@ export async function launchProfile(
     reused: false,
     uiaRootAvailable,
     ...(manifestLevel !== undefined ? { manifestLevel } : {})
-  };
+  });
+
+  // Shared outcome path: foreground observation, foregroundDemo activation,
+  // background steal recovery, and the interaction report.
+  async function launchOutcome(base: { profile: string; pid: number; hwnd?: string; title?: string; startedByMcp: boolean; reused: boolean; uiaRootAvailable: boolean; manifestLevel?: string }): Promise<{ profile: string; pid: number; hwnd?: string; title?: string; startedByMcp: boolean; reused: boolean; uiaRootAvailable: boolean; manifestLevel?: string; interaction: InteractionReport; warning?: string }> {
+    const targetHwnd = base.hwnd;
+    let targetActivated = false;
+    let foregroundChanged = false;
+    let foregroundRestored: boolean | undefined;
+
+    // foregroundDemo: restore + raise + activate the target window so menus,
+    // popups and dialogs appear on top. The previous foreground window is
+    // captured here and restored by the pipeline when the demo finishes.
+    if (isDemo && targetHwnd) {
+      try {
+        const act = await deps.activateWindow(targetHwnd);
+        targetActivated = act.activated;
+      } catch {
+        targetActivated = false;
+      }
+    }
+
+    let foregroundAfter = await readForeground(deps);
+    foregroundChanged = foregroundBefore !== undefined && foregroundAfter !== undefined && foregroundBefore !== foregroundAfter;
+
+    // background mode: if the app (or anything else) stole the foreground,
+    // attempt to restore the original window. Qt apps can self-activate
+    // repeatedly during late startup, so the restore is verified against the
+    // FINAL foreground state (bounded attempts), never trusted from the
+    // SetForegroundWindow call alone.
+    if (isBackground && foregroundChanged && foregroundBefore !== undefined) {
+      for (let attempt = 0; attempt < 2; attempt++) {
+        foregroundRestored = await restoreIfChanged(deps, foregroundBefore);
+        foregroundAfter = await readForeground(deps);
+        if (foregroundAfter === foregroundBefore) break;
+      }
+      foregroundChanged = foregroundAfter !== undefined && foregroundAfter !== foregroundBefore;
+    }
+
+    const interaction: InteractionReport = {
+      requestedMode: mode,
+      effectiveMode: effectiveModeFor(mode, foregroundChanged || targetActivated),
+      ...(foregroundBefore ? { foregroundBefore } : {}),
+      ...(foregroundAfter ? { foregroundAfter } : {}),
+      foregroundChanged,
+      ...(foregroundRestored !== undefined ? { foregroundRestored } : {}),
+      targetActivated,
+      physicalCursorMoved: false
+    };
+    const warning = isBackground && foregroundChanged && foregroundRestored === true && foregroundAfter !== foregroundBefore
+      ? "The target application re-took the foreground during background launch; the previous foreground window could not be held."
+      : isBackground && foregroundChanged && foregroundRestored === false
+        ? "The target application took the foreground during background launch and the previous foreground window could not be restored."
+        : undefined;
+    return { ...base, interaction, ...(warning ? { warning } : {}) };
+  }
 }
 
 // Resolve the executable path per the spec priority chain. Does NOT hardcode

@@ -56,6 +56,33 @@
       },
       "additionalProperties": false
     },
+    "interaction": {
+      "type": "object",
+      "description": "Interaction-mode defaults. Mode resolution: caller explicit interactionMode > workflow interactionMode > this > auto.",
+      "properties": {
+        "defaultMode": {
+          "type": "string",
+          "enum": ["auto", "background", "foregroundDemo"],
+          "description": "auto: legacy behavior (no promises). background: strict background (no foreground steal, no global input, capture must not need top-level visibility). foregroundDemo: only when the caller explicitly asks."
+        },
+        "allowForegroundFallback": {
+          "type": "boolean",
+          "description": "Whether a background failure may auto-upgrade to the foreground path. MUST stay false: the core never silently upgrades."
+        },
+        "backgroundPresentation": {
+          "type": "string",
+          "enum": ["behind", "minimized", "normal"],
+          "default": "behind",
+          "description": "Presentation in background mode: behind (normal but behind the current foreground window, recommended), minimized, or normal."
+        },
+        "restorePreviousForeground": {
+          "type": "boolean",
+          "default": true,
+          "description": "foregroundDemo: restore the previous foreground window when the demo finishes."
+        }
+      },
+      "additionalProperties": false
+    },
     "submenuAidPatterns": {
       "type": "array",
       "items": { "type": "string" },

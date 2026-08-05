@@ -18,6 +18,14 @@ import { evaluateExpect, type ExpectContext, type ExpectResult } from "./expect.
 import { extractReferenceHeads, resolvePlaceholdersEx, validateReferences, type PipeContext } from "./piping.js";
 import { estimateJsonBytes, isSensitiveFieldName, MAX_PIPELINE_RESULT_BYTES, MAX_STEP_RESULT_BYTES } from "./outputs.js";
 import { createRunId, saveRun, type RunSnapshot, type StepSnapshot } from "./runs.js";
+import {
+  backgroundUnsafeSteps,
+  pipelineInteractionReport,
+  pipelineNotBackgroundSafeError,
+  type InteractionMode,
+  type InteractionOptions,
+  type InteractionReport
+} from "./interaction.js";
 
 // ── Limits (spec section 23) ──
 
@@ -133,6 +141,9 @@ export type PipelineResult = {
   // Continuability of the saved run snapshot (continue_run preconditions).
   continuable: boolean;
   continuationReason: string | null;
+  // Aggregate interaction report (mode, foreground restore for
+  // foregroundDemo, honest foregroundChanged).
+  interaction?: InteractionReport;
 };
 
 // ── Static validation (shared by validate_steps and run-time preflight) ──
@@ -448,6 +459,17 @@ export type ExecutionContext = {
   // page/selection capture for run_steps pipelines that carry a profile in
   // their step args but no pack context.
   resolveProfile?: (profileId: string) => AppProfile | undefined;
+  // Resolve a pack's action contracts by profile id (background-policy
+  // preflight for pack-less run_steps pipelines).
+  resolvePackActions?: (profileId: string) => PackActions | undefined;
+  // Resolved interaction mode for this pipeline (explicit > workflow > pack
+  // default > auto). Background preflights the steps; foregroundDemo restores
+  // the previous foreground window at the end.
+  interactionMode?: InteractionMode;
+  interaction?: InteractionOptions & { foregroundBefore?: string };
+  // Restores a previous foreground window (foregroundDemo cleanup). Wired by
+  // index.ts to the windows module.
+  restoreForeground?: (previousForegroundHwnd?: string) => Promise<{ restored: boolean; foregroundHwnd: string; foregroundChanged: boolean }>;
   inputs?: Record<string, unknown>;
   autoContext?: { profile?: string; pid?: number; hwnd?: string; title?: string };
   expectDeps: ExpectContext;
@@ -1145,6 +1167,21 @@ export async function runPipeline(input: PipelineInput, ctx: ExecutionContext): 
     return pipelineFailure(runId, input, stepResults, exports, 0, undefined, { code: "INVALID_REFERENCES", message: refCheck.message }, [], warnings, undefined);
   }
 
+  // Background preflight: a pipeline that contains foregroundRequired steps
+  // (or global keyboard input) is refused BEFORE any step runs - never a
+  // mid-run foreground steal. bestEffort steps are allowed and surface their
+  // own runtime failures.
+  const backgroundPreflight = backgroundUnsafeSteps(input.steps, (profileId) => ctx.resolvePackActions?.(profileId), ctx.pack?.actions);
+  if (ctx.interactionMode === "background" && backgroundPreflight.length > 0) {
+    const err = pipelineNotBackgroundSafeError("background", backgroundPreflight);
+    return pipelineFailure(
+      runId, input, stepResults, exports, 0, undefined,
+      { code: "PIPELINE_NOT_BACKGROUND_SAFE", message: err.message, details: err.details },
+      [], warnings, undefined,
+      pipelineInteractionReport("background", { foregroundChanged: false, targetActivated: false })
+    );
+  }
+
   let stoppedAtIndex: number | null = null;
   let stopError: { code?: string; message: string; details?: unknown } | undefined;
 
@@ -1195,6 +1232,12 @@ export async function runPipeline(input: PipelineInput, ctx: ExecutionContext): 
         byId.set(step.id, exec.result);
         completedIds.push(step.id);
       }
+      // foregroundDemo: let the UI settle between steps (the caller asked for
+      // a visible, stable demo).
+      const stepDelayMs = ctx.interactionMode === "foregroundDemo" ? (ctx.interaction?.stepDelayMs ?? 0) : 0;
+      if (stepDelayMs > 0 && Date.now() + stepDelayMs <= deadline) {
+        await sleep(stepDelayMs);
+      }
       // Validate exports.
       const exportOutcome = applyExports(step, exec.result!, exports);
       stepExportValues.push(exportOutcome.values);
@@ -1221,6 +1264,63 @@ export async function runPipeline(input: PipelineInput, ctx: ExecutionContext): 
   const success = stoppedAtIndex === null;
   const restoreResults = await runRestore(input, success, captured, ctx, byId, byIndex, deadline);
   const finallyResults = await runFinally(input, ctx, pipeCtx, exports, deadline, warnings);
+
+  // foregroundDemo cleanup: restore the previous foreground window the launch
+  // saved (default restorePreviousForeground=true). Best-effort and honest:
+  // a failed restore is reported in the interaction metadata, never hidden.
+  let interaction: InteractionReport | undefined;
+  if (ctx.interactionMode === "foregroundDemo") {
+    const restorePrevious = ctx.interaction?.restorePreviousForeground ?? true;
+    const foregroundBefore = ctx.interaction?.foregroundBefore ?? firstStepForegroundBefore(stepResults);
+    if (restorePrevious && foregroundBefore && ctx.restoreForeground) {
+      try {
+        const restored = await ctx.restoreForeground(foregroundBefore);
+        interaction = pipelineInteractionReport("foregroundDemo", {
+          foregroundBefore,
+          foregroundAfter: restored.foregroundHwnd,
+          foregroundChanged: restored.foregroundChanged,
+          foregroundRestored: restored.restored,
+          targetActivated: true
+        });
+        if (!restored.restored) {
+          warnings.push("foregroundDemo: the previous foreground window could not be restored.");
+        }
+      } catch {
+        interaction = pipelineInteractionReport("foregroundDemo", {
+          foregroundBefore,
+          foregroundChanged: true,
+          foregroundRestored: false,
+          targetActivated: true
+        });
+        warnings.push("foregroundDemo: restoring the previous foreground window failed.");
+      }
+    } else {
+      interaction = pipelineInteractionReport("foregroundDemo", {
+        ...(foregroundBefore ? { foregroundBefore } : {}),
+        foregroundChanged: false,
+        foregroundRestored: restorePrevious ? undefined : true,
+        targetActivated: true
+      });
+    }
+  } else if (ctx.interactionMode === "background") {
+    interaction = pipelineInteractionReport("background", {
+      foregroundChanged: false,
+      targetActivated: false
+    });
+  } else {
+    // auto: reflect what actually happened across the steps.
+    const anyForegroundChanged = stepResults.some((s) => {
+      const r = s.result as { interaction?: InteractionReport } | undefined;
+      return r?.interaction?.foregroundChanged === true;
+    });
+    interaction = pipelineInteractionReport("auto", {
+      foregroundChanged: anyForegroundChanged,
+      targetActivated: stepResults.some((s) => {
+        const r = s.result as { interaction?: InteractionReport } | undefined;
+        return r?.interaction?.targetActivated === true;
+      })
+    });
+  }
 
   // Persist a MINIMAL continuable snapshot: per completed step only the
   // fields later steps reference + pipe-safe fields + that step's exports
@@ -1285,9 +1385,21 @@ export async function runPipeline(input: PipelineInput, ctx: ExecutionContext): 
     finallyResults,
     restoreResults,
     warnings,
+    ...(interaction ? { interaction } : {}),
     continuable: saved.continuable,
     continuationReason: saved.continuationReason
   };
+}
+
+// The previous foreground window saved by the first launch step of a
+// foregroundDemo pipeline (used when the pipeline itself had no outer launch).
+function firstStepForegroundBefore(stepResults: StepExecutionResult[]): string | undefined {
+  for (const exec of stepResults) {
+    if (!exec.success) continue;
+    const r = exec.result as { interaction?: InteractionReport } | undefined;
+    if (r?.interaction?.foregroundBefore) return r.interaction.foregroundBefore;
+  }
+  return undefined;
 }
 
 function pipelineFailure(
@@ -1300,7 +1412,8 @@ function pipelineFailure(
   error: { code?: string; message: string; details?: unknown },
   finallyResults: StepExecutionResult[],
   warnings: string[],
-  restoreResults: Array<{ key: string; success: boolean; message?: string; valueCaptured?: boolean }> | undefined
+  restoreResults: Array<{ key: string; success: boolean; message?: string; valueCaptured?: boolean }> | undefined,
+  interaction?: InteractionReport
 ): PipelineResult {
   return {
     schemaVersion: 1,
@@ -1318,6 +1431,7 @@ function pipelineFailure(
     finallyResults,
     restoreResults: restoreResults ?? [],
     warnings,
+    ...(interaction ? { interaction } : {}),
     continuable: false,
     continuationReason: null
   };
@@ -1777,6 +1891,22 @@ export async function continuePipeline(opts: ContinueOptions): Promise<PipelineR
   }
   if (fromIndex < 0 || fromIndex >= input.steps.length) {
     return fail(runId, "RUN_STATE_STALE", `Continuation index ${fromIndex} is out of range (0..${input.steps.length - 1}).`);
+  }
+
+  // Background preflight on the REMAINING steps (same rule as runPipeline):
+  // a background continuation never resumes into a foregroundRequired step.
+  if (opts.ctx.interactionMode === "background") {
+    const unsafe = backgroundUnsafeSteps(input.steps.slice(fromIndex), (profileId) => opts.ctx.resolvePackActions?.(profileId), opts.ctx.pack?.actions);
+    if (unsafe.length > 0) {
+      const err = pipelineNotBackgroundSafeError("background", unsafe);
+      return {
+        schemaVersion: 1, success: false, runId, status: "failed", total: input.steps.length, completed: 0,
+        stoppedAtIndex: null, completedSteps: [], steps: [], exports: {},
+        error: { code: "PIPELINE_NOT_BACKGROUND_SAFE", message: err.message, details: err.details },
+        finallyResults: [], restoreResults: [], warnings: [],
+        continuable: false, continuationReason: null
+      };
+    }
   }
 
   // Re-execute from the continuation point, reusing stored results for the
