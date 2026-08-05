@@ -1451,7 +1451,9 @@ async function finalizePipelineInteraction(
   const aggregate = aggregateInteractions([
     ...stepResults.map((s) => interactionOf(s.result)),
     ...finallyResults.map((s) => interactionOf(s.result)),
-    ...restoreResults.map((r) => interactionOf(r.interaction))
+    // RestoreResult carries the captured interaction directly; interactionOf
+    // extracts the `interaction` field from the containing object.
+    ...restoreResults.map((r) => interactionOf(r))
   ]);
 
   if (mode === "background" && foregroundChanged) {

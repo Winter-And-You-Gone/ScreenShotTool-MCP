@@ -358,3 +358,42 @@ test("background pipeline with background-safe finally runs to completion", asyn
   assert.equal(result.finallyResults[0]!.success, true);
   assert.equal(result.interaction?.requestedMode, "background");
 });
+
+test("restore-action interaction is aggregated into the pipeline report", async () => {
+  // The restore step's own dispatch result carries an interaction report
+  // (e.g. a background restore that moved the cursor / changed the
+  // foreground). It must reach the pipeline-level aggregate - the restore
+  // path was previously dropped because the already-extracted report was
+  // passed through the extractor again.
+  const result = await runPipeline(
+    {
+      steps: [{ id: "s", tool: "read_clipboard" }],
+      captureBefore: [
+        { saveAs: "originalValue", read: { tool: "ui_get", args: { selector: { automationId: "combo" } } } }
+      ],
+      restore: "always"
+    },
+    {
+      dispatch: async (tool) => {
+        if (tool === "ui_get") {
+          return { found: true, element: { automationId: "combo", value: "original", isPassword: false, valueProtected: false }, elapsedMs: 1 };
+        }
+        if (tool === "ui_action") {
+          return {
+            success: true, method: "ValuePattern", coordinateFallbackUsed: false, physicalCursorMoved: true, elapsedMs: 1,
+            interaction: { requestedMode: "background", effectiveMode: "background", foregroundChanged: true, targetActivated: false, physicalCursorMoved: true }
+          };
+        }
+        return { available: true, text: "x", length: 1, timestamp: "t" };
+      },
+      pack: { id: "fixture", actions: FOREGROUND_REQUIRED_ACTIONS, profile: PROFILE, version: "1" },
+      interactionMode: "background",
+      expectDeps: emptyExpectDeps
+    }
+  );
+  assert.equal(result.success, true);
+  assert.equal(result.restoreResults.length, 1);
+  assert.equal(result.restoreResults[0]!.success, true);
+  assert.equal(result.interaction?.physicalCursorMoved, true, "restore cursor movement must be aggregated");
+  assert.equal(result.interaction?.foregroundChangedDuringRun, true, "restore foreground change must be aggregated");
+});
