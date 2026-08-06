@@ -682,6 +682,59 @@ const appPackListOutput = withToolError(obj(
   ["packs"]
 ));
 
+const semanticPageSummary = obj(
+  {
+    id: str(),
+    displayName: str(),
+    aliases: arr(str()),
+    navigationControl: str(),
+    rootControl: str(),
+    scrollContainers: arr(str()),
+    components: arr(str()),
+    readyMarkers: arr(any())
+  },
+  ["id"]
+);
+
+const semanticSelectionGroup = obj(
+  {
+    id: str(),
+    role: str(),
+    parent: str(),
+    members: arr(str()),
+    selectionMode: str()
+  },
+  ["id", "members"]
+);
+
+const semanticComponentSummary = obj(
+  {
+    id: str(),
+    displayName: str(),
+    aliases: arr(str()),
+    page: str(),
+    role: str(),
+    rootControl: str(),
+    children: arr(str()),
+    mappingStatus: str(),
+    reason: str()
+  },
+  ["id"]
+);
+
+const semanticRelationship = obj(
+  {
+    control: str(),
+    page: str(),
+    parent: str(),
+    group: str(),
+    role: str(),
+    scrollContainer: str(),
+    postconditions: arr(any())
+  },
+  ["control"]
+);
+
 const appPackDescribeOutput = withToolError(obj(
   {
     pack: str(),
@@ -695,9 +748,35 @@ const appPackDescribeOutput = withToolError(obj(
     limitations: arr(str()),
     pipeSafe: any(),
     defaultInteractionMode: str(),
-    usageGuidance: any()
+    usageGuidance: any(),
+    // Semantic map (present when the pack declares pages.json/components.json
+    // and the caller requests them via include, or by default in compact mode).
+    pages: arr(semanticPageSummary),
+    selectionGroups: arr(semanticSelectionGroup),
+    components: arr(semanticComponentSummary),
+    relationships: arr(semanticRelationship)
   },
   ["pack", "displayName", "version", "source", "controls", "workflows"]
+));
+
+const semanticMatch = obj(
+  {
+    control: str(),
+    group: str(),
+    score: num(),
+    reason: str()
+  },
+  ["control", "score", "reason"]
+);
+
+const resolveSemanticControlOutput = withToolError(obj(
+  {
+    profile: str(),
+    query: str(),
+    matches: arr(semanticMatch),
+    suggestedPath: arr(str())
+  },
+  ["profile", "query", "matches"]
 ));
 
 const validationIssue = obj(
@@ -1106,11 +1185,20 @@ export const contracts: Record<string, ToolContract> = {
   },
   app_pack_describe: {
     name: "app_pack_describe",
-    description: "Describe a loaded App Pack: launch contract, logical controls, supported actions (incl. backgroundPolicy), visible workflows (incl. backgroundPolicy/foregroundRequiredSteps), defaultInteractionMode, model usage guidance (usageGuidance: preferred launch tool, target binding, recommended tool order, anti-patterns), known limitations, and pipe-safe examples. Call this once per pack before building a pipeline - everything a first-time model needs is here. Returns: pack, displayName, version, source, profile, controls[], actions[], workflows[], limitations[], pipeSafe, defaultInteractionMode, usageGuidance.",
+    description: "Describe a loaded App Pack: launch contract, logical controls, supported actions (incl. backgroundPolicy), visible workflows (incl. backgroundPolicy/foregroundRequiredSteps), defaultInteractionMode, model usage guidance (usageGuidance: preferred launch tool, target binding, recommended tool order, anti-patterns), known limitations, and pipe-safe examples. Also returns the pack's semantic map (pages/components/selectionGroups/relationships) when the pack declares pages.json/components.json - pass include:[...], page, and compact to shape the response. Call this once per pack before building a pipeline - everything a first-time model needs is here. Returns: pack, displayName, version, source, profile, controls[], actions[], workflows[], limitations[], pipeSafe, defaultInteractionMode, usageGuidance, pages[], selectionGroups[], components[], relationships[].",
     inputSchema: toolInputSchemas.app_pack_describe as unknown as JsonSchema,
     outputSchema: appPackDescribeOutput,
     schemaVersion: 1,
-    pipeSafeFields: ["pack", "controls", "workflows", "profile"],
+    pipeSafeFields: ["pack", "controls", "workflows", "profile", "pages", "components", "relationships"],
+    annotations: { readOnly: true, idempotent: true, retrySafe: true }
+  },
+  resolve_semantic_control: {
+    name: "resolve_semantic_control",
+    description: "Resolve a natural-language control description against a loaded App Pack's semantic map (pages.json/components.json + control aliases). Inputs: profile (pack id), query (e.g. '通道1 传感器配置'), optional page and within scopes. Returns ranked matches with the semantic group of each control plus a suggestedPath of logical control names (e.g. [sidebarTemperature, rd105Channel1Tab, rd105SensorConfigurationTab]) the caller can pass to profile_action. PURE RESOLUTION - performs no actions, moves nothing, and never triggers side effects; it only maps language to logical controls.",
+    inputSchema: toolInputSchemas.resolve_semantic_control as unknown as JsonSchema,
+    outputSchema: resolveSemanticControlOutput,
+    schemaVersion: 1,
+    pipeSafeFields: ["profile", "matches", "suggestedPath"],
     annotations: { readOnly: true, idempotent: true, retrySafe: true }
   },
   app_pack_validate: {

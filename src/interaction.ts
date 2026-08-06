@@ -184,6 +184,7 @@ const TOOL_BACKGROUND_POLICY: Record<string, BackgroundPolicy> = {
   // Pack / contract discovery.
   app_pack_list: "safe",
   app_pack_describe: "safe",
+  resolve_semantic_control: "safe",
   app_pack_validate: "safe",
   app_pack_reload: "safe",
   app_pack_probe: "bestEffort", // inspects a live app's UI

@@ -30,6 +30,9 @@ export type ExpectInput = PackDefaultExpect & {
   titleContains?: string;
   profile?: AppProfile;
   includeProcessPopups?: boolean;
+  // Local search depth for the postcondition target (pack-declared search
+  // scope). Never raises global query limits.
+  maxDepth?: number;
 };
 
 export type ExpectResult = {
@@ -74,15 +77,16 @@ export async function evaluateExpect(deps: ExpectContext, input: ExpectInput): P
     : { hwnd: input.hwnd, pid: input.pid, processName: input.processName, titleContains: input.titleContains };
 
   let lastObservation: unknown = null;
+  const localMaxDepth = input.maxDepth ?? 15;
   while (Date.now() - start < timeoutMs) {
     let state: UiElementState | null = null;
     let count = 0;
     if (condition === "countEquals") {
-      const q = await queryOrNull(deps, win, selectors[0]!, input.includeProcessPopups);
+      const q = await queryOrNull(deps, win, selectors[0]!, input.includeProcessPopups, localMaxDepth);
       count = q?.count ?? 0;
       lastObservation = { count };
     } else {
-      state = await firstMatch(deps, win, selectors, input.includeProcessPopups);
+      state = await firstMatch(deps, win, selectors, input.includeProcessPopups, localMaxDepth);
       lastObservation = state;
     }
 
@@ -139,13 +143,14 @@ async function firstMatch(
   deps: ExpectContext,
   win: { hwnd?: string | number; pid?: number; processName?: string; titleContains?: string },
   selectors: UiElementSelector[],
-  includeProcessPopups?: boolean
+  includeProcessPopups?: boolean,
+  localMaxDepth = 15
 ): Promise<UiElementState | null> {
   for (const selector of selectors) {
     try {
       const r = await deps.getUiElement({
         hwnd: win.hwnd, pid: win.pid, processName: win.processName, titleContains: win.titleContains,
-        selector, includeProcessPopups, timeoutMs: 8000
+        selector, includeProcessPopups, maxDepth: localMaxDepth, timeoutMs: 8000
       });
       if (r.found) return r.element;
     } catch (error) {
@@ -157,7 +162,7 @@ async function firstMatch(
         try {
           const q = await deps.queryUi({
             hwnd: win.hwnd, pid: win.pid, processName: win.processName, titleContains: win.titleContains,
-            selector, includeProcessPopups, maxResults: 1, timeoutMs: 8000
+            selector, includeProcessPopups, maxDepth: localMaxDepth, maxResults: 1, timeoutMs: 8000
           });
           if (q.elements.length > 0) return q.elements[0]!;
           return { automationId: "", name: "", controlType: "", className: "", frameworkId: "", processId: 0, nativeWindowHandle: "", enabled: true, offscreen: false, focusable: false, hasKeyboardFocus: false, isPassword: false, valueProtected: false, isReadOnly: null, boundingRect: null, runtimeId: [], patterns: [], value: null, rangeValue: null, minimum: null, maximum: null, smallChange: null, largeChange: null, toggleState: null, selected: null, expandCollapseState: null };
@@ -174,12 +179,13 @@ async function queryOrNull(
   deps: ExpectContext,
   win: { hwnd?: string | number; pid?: number; processName?: string; titleContains?: string },
   selector: UiElementSelector,
-  includeProcessPopups?: boolean
+  includeProcessPopups?: boolean,
+  localMaxDepth = 15
 ): Promise<QueryResult | null> {
   try {
     return await deps.queryUi({
       hwnd: win.hwnd, pid: win.pid, processName: win.processName, titleContains: win.titleContains,
-      selector, includeProcessPopups, maxDepth: 15, maxNodes: 2000, maxResults: 100, timeoutMs: 8000
+      selector, includeProcessPopups, maxDepth: localMaxDepth, maxNodes: 2000, maxResults: 100, timeoutMs: 8000
     });
   } catch {
     return null;

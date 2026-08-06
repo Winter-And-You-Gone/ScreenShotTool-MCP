@@ -26,6 +26,8 @@ export type PackManifest = {
   controlsFile?: string;
   actionsFile?: string;
   workflowsFile?: string;
+  pagesFile?: string;
+  componentsFile?: string;
   catalogVisibility?: CatalogVisibility;
   enabled?: boolean;
 };
@@ -66,6 +68,72 @@ export type PackProfile = {
 
 // 4.3 controls.json ---------------------------------------------------------
 
+// Declared per-control search scope for UIA queries. These are LOCAL bounds -
+// the core never raises global query limits because one deep control needs a
+// deeper walk. rootControl resolves to the logical control's first selector.
+export type PackSearchScope = {
+  rootControl?: string;
+  maxDepth?: number;
+  depthStrategy?: "fixed" | "auto";
+  maxResults?: number;
+};
+
+// Declared scroll relationship for deep controls. The generic ensureVisible
+// composite resolves the control, tries ScrollItemPattern first, then drives
+// the declared scrollContainer (RangeValue pattern or window-message wheel),
+// then re-resolves the control and verifies it is fully visible.
+export type PackVisibility = {
+  scrollContainer?: string;
+  strategies?: Array<"ScrollItemPattern" | "RangeValueScroll" | "WindowMessageWheel">;
+  margin?: number;
+};
+
+// Business-state postcondition reference. Unlike a raw selector, the control
+// is ALWAYS a logical pack control so the core can resolve it through the
+// profile and cross-validate it at pack load time.
+export type PackBusinessPostcondition = PackDefaultExpect & { profileControl: string };
+
+// Combined control-state requirement for selection-style actions. `any` /
+// `all` accept the same conditions as PackExpectCondition (selected,
+// toggleStateEquals, ...). controlState is about the CONTROL itself;
+// postconditions prove the business content switched.
+export type PackControlStateRequirement = {
+  any?: PackDefaultExpect[];
+  all?: PackDefaultExpect[];
+};
+
+export type PackFallbackMethod =
+  | "SelectionItemPattern"
+  | "TogglePattern"
+  | "InvokePattern"
+  | "WindowMessageElementClick"
+  | "KeyboardNavigation";
+
+export type PackFallbackPolicy = {
+  enabled?: boolean;
+  methods?: PackFallbackMethod[];
+  forbidden?: Array<"PhysicalMouse" | "GlobalKeyboard" | string>;
+};
+
+export type PackControlRole =
+  | "pageRoot"
+  | "navigation"
+  | "card"
+  | "tab"
+  | "toggle"
+  | "button"
+  | "input"
+  | "combo"
+  | "switch"
+  | "slider"
+  | "table"
+  | "tree"
+  | "scrollArea"
+  | "statusMarker"
+  | "contentMarker"
+  | "container"
+  | "other";
+
 export type PackControlEntry = {
   selectors: UiElementSelector[];
   // Confidence labels accepted in pack files ("stable"/"conditionally-stable"/
@@ -73,9 +141,34 @@ export type PackControlEntry = {
   confidence?: SelectorConfidence | "stable" | "conditionally-stable" | "fragile";
   description?: string;
   notes?: string;
+  // Semantic map metadata (general - never app-specific). See pages.json /
+  // components.json for the page/component/group graph.
+  aliases?: string[];
+  page?: string;
+  parent?: string;
+  // Semantic selection group id (declared in pages.json selectionGroups).
+  group?: string;
+  role?: PackControlRole;
+  // Local search bounds for this control (see PackSearchScope).
+  search?: PackSearchScope;
+  // Scroll relationship for the generic ensureVisible composite.
+  visibility?: PackVisibility;
+  // Control-state requirement (selected/toggleState...) used by
+  // ensureSelected IN ADDITION to the business postconditions below.
+  controlState?: PackControlStateRequirement;
+  // Business postconditions proving content switched. AND-combined
+  // (any/all semantics inside each entry); evaluated by ensureSelected
+  // together with controlState - UIA toggleState alone never proves content.
+  postconditions?: PackBusinessPostcondition[];
+  // Actions this control really supports (informational + validation).
+  supportedActions?: string[];
+  // Fallback chain for pattern failures. forbidden methods are validated at
+  // load time; PhysicalMouse/GlobalKeyboard may never be enabled by a pack.
+  fallbackPolicy?: PackFallbackPolicy;
   // Page-navigation group: controls in the same group are mutually exclusive
   // pages (e.g. sidebar nav). Used by state capture/restore to find the
-  // ACTUALLY selected page before a navigation action.
+  // ACTUALLY selected page before a navigation action. (Legacy - prefer the
+  // semantic `group` declared in pages.json; conflicts are validation errors.)
   selectionGroup?: string;
   // Menu-routing hints for composite actions. All optional; when absent the
   // core falls back to generic behavior. This is how app-specific menu
@@ -98,6 +191,63 @@ export type PackControlEntry = {
 
 export type PackControls = {
   controls: Record<string, PackControlEntry | UiElementSelector | UiElementSelector[]>;
+};
+
+// 4.3b pages.json -----------------------------------------------------------
+
+// A top-level page of the application: how to reach it, its root container,
+// content-level ready markers (page content visibility, NOT just a nav
+// toggle's selected state), scroll containers and its components.
+export type PackPage = {
+  id: string;
+  displayName?: string;
+  aliases?: string[];
+  // Navigation control (sidebar / nav button) that switches to this page.
+  navigationControl?: string;
+  // Root container of the page content.
+  rootControl?: string;
+  // Content-level readiness markers: at least one must be satisfiable for
+  // the page to count as ready (verified by postcondition conditions).
+  readyMarkers?: PackBusinessPostcondition[];
+  scrollContainers?: string[];
+  components?: string[];
+};
+
+// A mutually-exclusive selection group (channels, tabs, modes). The core
+// never hardcodes which member is "the" current one - the model picks the
+// member it wants; the group only proves the members are alternatives.
+export type PackSelectionGroup = {
+  id: string;
+  role?: string;
+  parent?: string;
+  members: string[];
+  selectionMode?: "single" | "multi";
+};
+
+export type PackPages = {
+  pages: PackPage[];
+  selectionGroups?: PackSelectionGroup[];
+};
+
+// 4.3c components.json ------------------------------------------------------
+
+// A visible card / region / component on a page, with its child controls.
+// Components map to real UI structure - NOT to natural-language tasks.
+export type PackComponent = {
+  id: string;
+  displayName?: string;
+  aliases?: string[];
+  page?: string;
+  role?: string;
+  rootControl?: string;
+  children?: string[];
+  // Third-priority mapping status for complex or low-frequency internals.
+  mappingStatus?: "full" | "partial";
+  reason?: string;
+};
+
+export type PackComponents = {
+  components: PackComponent[];
 };
 
 // 4.4 actions.json ----------------------------------------------------------
@@ -214,6 +364,8 @@ export type LoadedPack = {
   controls: PackControls;
   actions: PackActions;
   workflows: { workflows: PackWorkflow[] };
+  pages?: PackPages;
+  components?: PackComponents;
   // Absolute directory of the pack (never surfaced to MCP clients verbatim;
   // app_pack_list returns source labels only).
   dir: string;

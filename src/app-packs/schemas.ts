@@ -72,6 +72,8 @@ export const packManifestSchema = z.object({
   controlsFile: nonEmptyStr.optional(),
   actionsFile: nonEmptyStr.optional(),
   workflowsFile: nonEmptyStr.optional(),
+  pagesFile: nonEmptyStr.optional(),
+  componentsFile: nonEmptyStr.optional(),
   catalogVisibility: z.enum(["session", "hidden"]).optional().default("session"),
   enabled: z.boolean().optional().default(true)
 }).strict().refine(
@@ -113,30 +115,6 @@ export const packProfileSchema = z.object({
   "profile must resolve an executable (executableNames or executableEnv)"
 );
 
-export const packControlsSchema = z.object({
-  controls: z.record(
-    nonEmptyStr,
-    z.union([
-      packSelectorSchema,
-      z.array(packSelectorSchema).min(1).max(8),
-      z.object({
-        selectors: z.array(packSelectorSchema).min(1).max(8),
-        confidence: z.enum(["stable", "conditionally-stable", "fragile", "source-derived", "runtime-verified", "unsupported", "action-limited", "ambiguous"]).optional().default("source-derived"),
-        description: z.string().max(1024).optional(),
-        notes: z.string().max(4096).optional(),
-        selectionGroup: nonEmptyStr.optional(),
-        menu: z.object({
-          opensSubmenu: z.boolean().optional(),
-          command: z.boolean().optional(),
-          invokeMode: z.enum(["pattern", "keyboard-enter"]).optional(),
-          panelControl: nonEmptyStr.optional(),
-          sectionControl: nonEmptyStr.optional()
-        }).strict().optional()
-      }).strict()
-    ])
-  ).refine((v) => Object.keys(v).length <= 1000, "controls.json may define at most 1000 controls")
-}).strict();
-
 export const packExpectSchema = z.object({
   profileControl: nonEmptyStr.optional(),
   selector: packSelectorSchema.optional(),
@@ -163,6 +141,174 @@ export const packExpectSchema = z.object({
   (value) => value.condition !== "countEquals" || value.expectedCount !== undefined,
   "countEquals requires expectedCount"
 );
+
+// ── Semantic map schemas (pages.json / components.json) ──
+
+// Business postcondition: profileControl is REQUIRED (resolved through the
+// profile); a raw selector is not sufficient to prove business content.
+// Written as its own object schema (NOT packExpectSchema-based) so the output
+// type really has profileControl: string.
+const packBusinessPostconditionSchema: z.ZodType<import("./types.js").PackBusinessPostcondition> =
+  z.object({
+    profileControl: nonEmptyStr,
+    condition: z.enum([
+      "exists", "notExists", "visible", "hidden", "enabled", "disabled",
+      "valueEquals", "valueContains", "toggleStateEquals", "selected",
+      "notSelected", "expanded", "collapsed", "countEquals"
+    ]),
+    timeoutMs: optionalTimeout.optional().default(5000),
+    pollIntervalMs: optionalPoll.optional().default(150),
+    expectedValue: z.string().max(4000).optional(),
+    toggleState: z.enum(["On", "Off", "Indeterminate"]).optional(),
+    expectedCount: z.number().int().min(0).max(100).optional()
+  }).strict().refine(
+    (value) => !(["valueEquals", "valueContains"].includes(value.condition)) || value.expectedValue !== undefined,
+    "valueEquals/valueContains require expectedValue"
+  ).refine(
+    (value) => value.condition !== "toggleStateEquals" || value.toggleState !== undefined,
+    "toggleStateEquals requires toggleState"
+  ).refine(
+    (value) => value.condition !== "countEquals" || value.expectedCount !== undefined,
+    "countEquals requires expectedCount"
+  );
+
+// Control-state conditions apply to the control ITSELF - no profileControl
+// or selector references (unlike business postconditions which reference
+// content markers via profileControl).
+const packControlStateConditionSchema = z.object({
+  condition: z.enum([
+    "selected", "notSelected", "toggleStateEquals", "expanded", "collapsed",
+    "exists", "notExists", "visible", "hidden", "enabled", "disabled",
+    "valueEquals", "valueContains"
+  ]),
+  expectedValue: z.string().max(4000).optional(),
+  toggleState: z.enum(["On", "Off", "Indeterminate"]).optional()
+}).strict().refine(
+  (value) => !(["valueEquals", "valueContains"].includes(value.condition)) || value.expectedValue !== undefined,
+  "valueEquals/valueContains require expectedValue"
+).refine(
+  (value) => value.condition !== "toggleStateEquals" || value.toggleState !== undefined,
+  "toggleStateEquals requires toggleState"
+);
+
+const packControlStateRequirementSchema = z.object({
+  any: z.array(packControlStateConditionSchema).min(1).max(8).optional(),
+  all: z.array(packControlStateConditionSchema).min(1).max(8).optional()
+}).strict().refine(
+  (value) => value.any !== undefined || value.all !== undefined,
+  "controlState requires at least one of 'any' or 'all'"
+);
+
+const packSearchScopeSchema = z.object({
+  rootControl: nonEmptyStr.optional(),
+  maxDepth: z.number().int().min(1).max(48).optional(),
+  depthStrategy: z.enum(["fixed", "auto"]).optional(),
+  maxResults: z.number().int().min(1).max(200).optional()
+}).strict();
+
+const packVisibilitySchema = z.object({
+  scrollContainer: nonEmptyStr.optional(),
+  strategies: z.array(z.enum(["ScrollItemPattern", "RangeValueScroll", "WindowMessageWheel"])).min(1).max(3).optional(),
+  margin: z.number().int().min(0).max(256).optional()
+}).strict();
+
+const packFallbackPolicySchema = z.object({
+  enabled: z.boolean().optional().default(true),
+  methods: z.array(z.enum([
+    "SelectionItemPattern", "TogglePattern", "InvokePattern",
+    "WindowMessageElementClick", "KeyboardNavigation"
+  ])).min(1).max(6).optional(),
+  forbidden: z.array(z.enum(["PhysicalMouse", "GlobalKeyboard"])).max(2).optional()
+}).strict();
+
+const packControlRoleSchema = z.enum([
+  "pageRoot", "navigation", "card", "tab", "toggle", "button", "input",
+  "combo", "switch", "slider", "table", "tree", "scrollArea",
+  "statusMarker", "contentMarker", "container", "other"
+]);
+
+const packControlEntrySchema: z.ZodType<import("./types.js").PackControlEntry> = z.object({
+  selectors: z.array(packSelectorSchema).min(1).max(8),
+  confidence: z.enum(["stable", "conditionally-stable", "fragile", "source-derived", "runtime-verified", "unsupported", "action-limited", "ambiguous"]).optional().default("source-derived"),
+  description: z.string().max(1024).optional(),
+  notes: z.string().max(4096).optional(),
+  aliases: z.array(nonEmptyStr).max(32).optional(),
+  page: nonEmptyStr.optional(),
+  parent: nonEmptyStr.optional(),
+  group: nonEmptyStr.optional(),
+  role: packControlRoleSchema.optional(),
+  search: packSearchScopeSchema.optional(),
+  visibility: packVisibilitySchema.optional(),
+  controlState: packControlStateRequirementSchema.optional(),
+  postconditions: z.array(packBusinessPostconditionSchema).max(16).optional(),
+  supportedActions: z.array(nonEmptyStr).max(16).optional(),
+  fallbackPolicy: packFallbackPolicySchema.optional(),
+  selectionGroup: nonEmptyStr.optional(),
+  menu: z.object({
+    opensSubmenu: z.boolean().optional(),
+    command: z.boolean().optional(),
+    invokeMode: z.enum(["pattern", "keyboard-enter"]).optional(),
+    panelControl: nonEmptyStr.optional(),
+    sectionControl: nonEmptyStr.optional()
+  }).strict().optional()
+}).strict();
+
+export const packControlsSchema = z.object({
+  controls: z.record(
+    nonEmptyStr,
+    z.union([
+      packSelectorSchema,
+      z.array(packSelectorSchema).min(1).max(8),
+      packControlEntrySchema
+    ])
+  ).refine((v) => Object.keys(v).length <= 1000, "controls.json may define at most 1000 controls")
+}).strict();
+
+const packPageSchema = z.object({
+  id: z.string().regex(packIdPattern, "page id must match ^[a-z][a-z0-9._-]{0,63}$"),
+  displayName: z.string().max(128).optional(),
+  aliases: z.array(nonEmptyStr).max(32).optional(),
+  navigationControl: nonEmptyStr.optional(),
+  rootControl: nonEmptyStr.optional(),
+  readyMarkers: z.array(packBusinessPostconditionSchema).max(16).optional(),
+  scrollContainers: z.array(nonEmptyStr).max(16).optional(),
+  components: z.array(nonEmptyStr).max(64).optional()
+}).strict().refine(
+  (value) => value.displayName !== undefined || (value.aliases && value.aliases.length > 0),
+  "page requires displayName or at least one alias"
+);
+
+const packSelectionGroupSchema = z.object({
+  id: z.string().regex(packIdPattern, "selection group id must match ^[a-z][a-z0-9._-]{0,63}$"),
+  role: z.string().max(64).optional(),
+  parent: nonEmptyStr.optional(),
+  members: z.array(nonEmptyStr).min(2).max(64),
+  selectionMode: z.enum(["single", "multi"]).optional().default("single")
+}).strict();
+
+export const packPagesSchema: z.ZodType<import("./types.js").PackPages> = z.object({
+  pages: z.array(packPageSchema).min(1).max(128),
+  selectionGroups: z.array(packSelectionGroupSchema).max(128).optional()
+}).strict();
+
+const packComponentSchema = z.object({
+  id: z.string().regex(packIdPattern, "component id must match ^[a-z][a-z0-9._-]{0,63}$"),
+  displayName: z.string().max(128).optional(),
+  aliases: z.array(nonEmptyStr).max(32).optional(),
+  page: nonEmptyStr.optional(),
+  role: z.string().max(64).optional(),
+  rootControl: nonEmptyStr.optional(),
+  children: z.array(nonEmptyStr).max(128).optional(),
+  mappingStatus: z.enum(["full", "partial"]).optional().default("full"),
+  reason: z.string().max(512).optional()
+}).strict().refine(
+  (value) => value.mappingStatus !== "partial" || value.reason !== undefined,
+  "partial mapping requires a reason"
+);
+
+export const packComponentsSchema: z.ZodType<import("./types.js").PackComponents> = z.object({
+  components: z.array(packComponentSchema).min(1).max(256)
+}).strict();
 
 export const packActionsSchema = z.object({
   contracts: z.array(z.object({

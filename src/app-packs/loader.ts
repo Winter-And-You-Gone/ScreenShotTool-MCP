@@ -23,7 +23,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { z } from "zod";
 
-import { packActionsSchema, packControlsSchema, packManifestSchema, packProfileSchema, packWorkflowsSchema } from "./schemas.js";
+import { packActionsSchema, packComponentsSchema, packControlsSchema, packManifestSchema, packPagesSchema, packProfileSchema, packWorkflowsSchema } from "./schemas.js";
 import type { LoadedPack, PackSourceKind } from "./types.js";
 
 export type LoadIssue = {
@@ -190,6 +190,8 @@ async function loadPack(
   const controls = await readPackJson(packManifestJsonFileName(manifest.controlsFile, "controls.json"), root, issues, packControlsSchema);
   const actions = await readPackJson(packManifestJsonFileName(manifest.actionsFile, "actions.json"), root, issues, packActionsSchema);
   const workflows = await readPackJson(packManifestJsonFileName(manifest.workflowsFile, "workflows.json"), root, issues, packWorkflowsSchema);
+  const pages = await readPackJson(packManifestJsonFileName(manifest.pagesFile, "pages.json"), root, issues, packPagesSchema);
+  const components = await readPackJson(packManifestJsonFileName(manifest.componentsFile, "components.json"), root, issues, packComponentsSchema);
 
   if (issues.length > 0) {
     return { pack: null as unknown as LoadedPack, issues };
@@ -206,6 +208,8 @@ async function loadPack(
       controls: controls ?? { controls: {} },
       actions: actions ?? { contracts: [] },
       workflows: workflows ?? { workflows: [] },
+      ...(pages ? { pages } : {}),
+      ...(components ? { components } : {}),
       dir: root,
       source: sourceLabel,
       sourceKind,

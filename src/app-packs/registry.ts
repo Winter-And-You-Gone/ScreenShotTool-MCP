@@ -159,14 +159,33 @@ export function packToAppProfile(pack: LoadedPack): AppProfile {
     if (Array.isArray(raw)) {
       controls[name] = raw;
     } else if ("selectors" in raw && Array.isArray((raw as { selectors?: unknown[] }).selectors)) {
-      const entry = raw as { selectors: UiElementSelector[]; confidence?: string; notes?: string; description?: string; menu?: unknown; selectionGroup?: string };
+      const entry = raw as {
+        selectors: UiElementSelector[]; confidence?: string; notes?: string; description?: string; menu?: unknown; selectionGroup?: string;
+        aliases?: string[]; page?: string; parent?: string; group?: string; role?: string;
+        search?: unknown; visibility?: unknown; controlState?: unknown; postconditions?: unknown[];
+        supportedActions?: string[]; fallbackPolicy?: unknown;
+      };
       controls[name] = {
         selectors: entry.selectors,
         confidence: CONFIDENCE_MAP[entry.confidence ?? "source-derived"] ?? "source-derived",
         notes: entry.notes ?? entry.description,
         menu: entry.menu as ControlEntry["menu"],
-        selectionGroup: entry.selectionGroup
-      };
+        selectionGroup: entry.selectionGroup,
+        // Semantic map metadata carried through to the profile layer so
+        // composite actions (ensureSelected postconditions, ensureVisible
+        // scroll containers) can read them without touching pack files.
+        ...(entry.aliases ? { aliases: entry.aliases } : {}),
+        ...(entry.page ? { page: entry.page } : {}),
+        ...(entry.parent ? { parent: entry.parent } : {}),
+        ...(entry.group ? { group: entry.group } : {}),
+        ...(entry.role ? { role: entry.role } : {}),
+        ...(entry.search ? { search: entry.search as ControlEntry["search"] } : {}),
+        ...(entry.visibility ? { visibility: entry.visibility as ControlEntry["visibility"] } : {}),
+        ...(entry.controlState ? { controlState: entry.controlState as ControlEntry["controlState"] } : {}),
+        ...(entry.postconditions && entry.postconditions.length > 0 ? { postconditions: entry.postconditions as ControlEntry["postconditions"] } : {}),
+        ...(entry.supportedActions && entry.supportedActions.length > 0 ? { supportedActions: entry.supportedActions } : {}),
+        ...(entry.fallbackPolicy ? { fallbackPolicy: entry.fallbackPolicy as ControlEntry["fallbackPolicy"] } : {})
+      } as ControlEntry;
     } else {
       controls[name] = raw as UiElementSelector;
     }

@@ -33,6 +33,37 @@ export type ControlEntry = {
   // Page-navigation group (mutually exclusive pages). Used by state
   // capture/restore to determine the ACTUALLY selected page.
   selectionGroup?: string;
+  // Semantic map metadata carried from pages.json/components.json through the
+  // profile adapter. The composite actions read these (ensureSelected
+  // business postconditions, ensureVisible scroll containers, semantic
+  // resolution) - they never touch pack files at runtime.
+  aliases?: string[];
+  page?: string;
+  parent?: string;
+  group?: string;
+  role?: string;
+  search?: {
+    rootControl?: string;
+    maxDepth?: number;
+    depthStrategy?: "fixed" | "auto";
+    maxResults?: number;
+  };
+  visibility?: {
+    scrollContainer?: string;
+    strategies?: Array<"ScrollItemPattern" | "RangeValueScroll" | "WindowMessageWheel">;
+    margin?: number;
+  };
+  controlState?: {
+    any?: Array<{ profileControl?: string; condition: string; [key: string]: unknown }>;
+    all?: Array<{ profileControl?: string; condition: string; [key: string]: unknown }>;
+  };
+  postconditions?: Array<{ profileControl: string; condition: string; [key: string]: unknown }>;
+  supportedActions?: string[];
+  fallbackPolicy?: {
+    enabled?: boolean;
+    methods?: string[];
+    forbidden?: string[];
+  };
   // Menu-routing hints for composite actions (data-driven; expressed by App
   // Packs, interpreted by the generic profile layer - the core never knows
   // any specific app's menu structure).

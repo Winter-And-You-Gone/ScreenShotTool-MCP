@@ -319,7 +319,7 @@ export async function performProfileAction(
   // with menu.invokeMode="keyboard-enter" is also routed here: those rows open
   // a modal dialog whose exec() blocks InvokePattern.Invoke(), so the
   // composite path triggers them via a non-blocking focus + Enter key.
-  const composite = new Set(["selectByName", "selectByIndex", "getSelection", "openMenu", "openSubmenu", "ensureSelected"]);
+  const composite = new Set(["selectByName", "selectByIndex", "getSelection", "openMenu", "openSubmenu", "ensureSelected", "ensureVisible"]);
   if (composite.has(input.action) || (input.action === "invoke" && isKeyboardInvokeControl(entry))) {
     const foregroundBefore = await readForeground(deps);
     const compositeResult = await performCompositeProfileAction(deps, profile, input, entry, windowSel, mode, policy);
@@ -506,18 +506,36 @@ export function buildUiaDeps(windows: {
 // Resolve a profile control to the first candidate selector that uniquely
 // matches. Used by composite actions which need a concrete selector to drive
 // sub-actions (expand/select) on the resolved control.
+//
+// The control's pack-declared `search` scope (rootControl / maxDepth /
+// depthStrategy) is honored: LOCAL bounds for that control, never a global
+// query-depth raise. The declared rootControl, if any, is composed into the
+// selector as an ancestor so the walk is scoped to that subtree.
 async function resolveUniqueSelector(
   deps: UiaDeps,
   windowSel: { hwnd?: string | number; pid?: number; processName?: string; titleContains?: string },
-  entry: { selectors: UiElementSelector[] },
-  input: { includeProcessPopups?: boolean; maxDepth?: number; maxNodes?: number; timeoutMs?: number }
+  entry: { selectors: UiElementSelector[]; search?: { rootControl?: string; maxDepth?: number; depthStrategy?: "fixed" | "auto"; maxResults?: number } },
+  input: { includeProcessPopups?: boolean; maxDepth?: number; maxNodes?: number; timeoutMs?: number },
+  profile?: AppProfile
 ): Promise<UiElementSelector> {
   const severeCodes = new Set(["WINDOW_NOT_FOUND", "WINDOW_AMBIGUOUS", "UIA_ROOT_UNAVAILABLE", "UIA_ASSEMBLY_UNAVAILABLE", "TARGET_PROCESS_EXITED", "INVALID_SELECTOR"]);
-  for (const selector of entry.selectors) {
+  const search = entry.search;
+  const rootSelector = search?.rootControl && profile
+    ? firstSelectorOf(profile, search.rootControl)
+    : undefined;
+  // depthStrategy auto escalates only for THIS control's resolution.
+  const depthStrategy = search?.depthStrategy ?? (search?.maxDepth ? "fixed" : "fixed");
+  for (const base of entry.selectors) {
+    const selector: UiElementSelector = rootSelector
+      ? { ...base, ancestor: rootSelector }
+      : base;
     try {
       const r = await deps.getUiElement({
         hwnd: windowSel.hwnd, pid: windowSel.pid, processName: windowSel.processName, titleContains: windowSel.titleContains,
-        selector, includeProcessPopups: input.includeProcessPopups, maxDepth: input.maxDepth, maxNodes: input.maxNodes, timeoutMs: input.timeoutMs
+        selector, includeProcessPopups: input.includeProcessPopups,
+        maxDepth: search?.maxDepth ?? input.maxDepth,
+        maxNodes: input.maxNodes, timeoutMs: input.timeoutMs,
+        ...(depthStrategy === "auto" ? { depthStrategy: "auto" as const } : {})
       });
       if (r.found) return selector;
     } catch (e) {
@@ -640,10 +658,23 @@ async function performCompositeProfileAction(
   mode: InteractionMode = "auto",
   policy?: import("../interaction.js").BackgroundPolicy
 ): Promise<{ profile: string; control: string; selectorUsed?: UiElementSelector; confidence?: SelectorConfidence; notes?: string; result: unknown }> {
-  const selector = await resolveUniqueSelector(deps, windowSel, entry, input);
+  const selector = await resolveUniqueSelector(deps, windowSel, entry, input, profile);
   const actionTimeout = input.timeoutMs ?? 15000;
   const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
   const win = () => ({ hwnd: windowSel.hwnd, pid: windowSel.pid, processName: windowSel.processName, titleContains: windowSel.titleContains });
+  // Pack-declared LOCAL search depth for this control: the resolved selector
+  // may be deep in the tree (e.g. ~20 levels in Qt stacks). All follow-up
+  // UIA calls on this control reuse the declared depth - never a global raise.
+  const localMaxDepth = entry.search?.maxDepth ?? input.maxDepth ?? 15;
+  const localDepthStrategy = entry.search?.depthStrategy ?? "fixed";
+  const act = <T extends { selector: UiElementSelector; action: string }>(over: T): Parameters<UiaDeps["performUiAction"]>[0] => ({
+    ...win(),
+    includeProcessPopups: true,
+    timeoutMs: actionTimeout,
+    maxDepth: localMaxDepth,
+    ...(localDepthStrategy === "auto" ? { depthStrategy: "auto" as const } : {}),
+    ...over
+  });
 
   // ── openMenu: open the application menu and enumerate its items. ──
   // Invoke the menu button; success is proved by the declared section control
@@ -765,49 +796,196 @@ async function performCompositeProfileAction(
     };
   }
 
+  // ── ensureVisible: scroll a control into view (generic composite). ──
+  // Resolves the control, checks whether it is already fully within the
+  // visible client area, then tries, in order: ScrollItemPattern on the
+  // control itself; the pack-declared scroll container (RangeValuePattern
+  // absolute scroll); a wheel message on the scroll container (window
+  // message, never the physical mouse). After scrolling, the control is
+  // re-resolved and its visibility re-verified. Success requires the control
+  // to be found AND fully visible (or offscreen:false), never just "action
+  // fired". The model never computes scrollbar values or coordinates - the
+  // pack declares the scroll container, this composite drives it.
+  if (input.action === "ensureVisible") {
+    const visibility = (entry as ControlEntry & { visibility?: { scrollContainer?: string; strategies?: string[]; margin?: number } }).visibility;
+    const scrollContainer = visibility?.scrollContainer;
+    const strategies = visibility?.strategies ?? ["ScrollItemPattern", "RangeValueScroll", "WindowMessageWheel"];
+
+    const readElement = async (): Promise<UiElementState | null> => {
+      const r = await deps.getUiElement({ ...win(), selector, includeProcessPopups: true, timeoutMs: actionTimeout }).catch(() => null);
+      return r?.element ?? null;
+    };
+
+    const isFullyVisible = (e: UiElementState | null): boolean => {
+      if (!e) return false;
+      if (!e.offscreen) return true; // provider says visible
+      return false;
+    };
+
+    const waitSettle = (ms: number) => sleep(ms);
+
+    let element = await readElement();
+    if (!element) {
+      throw new McpUiError("ELEMENT_NOT_FOUND", `ensureVisible: control '${input.control}' could not be resolved.`, { control: input.control });
+    }
+    if (isFullyVisible(element)) {
+      return {
+        profile: profile.id, control: input.control, selectorUsed: selector, confidence: entry.confidence, notes: entry.notes,
+        result: { success: true, method: "noop", alreadyVisible: true, scrolled: false }
+      };
+    }
+
+    // 1) ScrollItemPattern on the control itself.
+    if (strategies.includes("ScrollItemPattern") && element.patterns.some((p) => p.includes("ScrollItem"))) {
+      try {
+        await deps.performUiAction(act({ selector, action: "scrollIntoView" }));
+        await waitSettle(250);
+        element = await readElement();
+        if (element && isFullyVisible(element)) {
+          return {
+            profile: profile.id, control: input.control, selectorUsed: selector, confidence: entry.confidence, notes: entry.notes,
+            result: { success: true, method: "ScrollItemPattern", alreadyVisible: false, scrolled: true }
+          };
+        }
+      } catch { /* pattern not supported or scroll did not take - continue */ }
+    }
+
+    // 2) Declared scroll container: drive RangeValuePattern (absolute) first,
+    //    then wheel messages on the container window (never the physical mouse).
+    if (scrollContainer && strategies.includes("RangeValueScroll")) {
+      const containerEntry = normalizeControlEntry(profile.controls[scrollContainer]);
+      if (containerEntry) {
+        for (const containerSelector of containerEntry.selectors) {
+          try {
+            const container = await deps.getUiElement({ ...win(), selector: containerSelector, includeProcessPopups: true, timeoutMs: actionTimeout });
+            if (container.found && container.element?.patterns.some((p) => p.includes("RangeValue"))) {
+              // Scroll toward the control: if the control is below the
+              // viewport, move the scrollbar to its maximum (bottom); the
+              // wheel path below also handles intermediate positions.
+              await deps.performUiAction(act({ selector: containerSelector, action: "setRangeValue", rangeValue: Number(container.element.maximum ?? 0) }));
+              await waitSettle(250);
+              element = await readElement();
+              if (element && isFullyVisible(element)) {
+                return {
+                  profile: profile.id, control: input.control, selectorUsed: selector, confidence: entry.confidence, notes: entry.notes,
+                  result: { success: true, method: "RangeValueScroll", alreadyVisible: false, scrolled: true, scrollContainer }
+                };
+              }
+              break;
+            }
+          } catch { /* try next container selector */ }
+        }
+      }
+    }
+
+    // 3) Wheel/step messages on the scroll container. When the container
+    //    itself is a RangeValue control (scrollbar), nudge it step by step
+    //    toward the control's position; re-verify after each step.
+    if (scrollContainer && strategies.includes("WindowMessageWheel")) {
+      const containerEntry = normalizeControlEntry(profile.controls[scrollContainer]);
+      if (containerEntry) {
+        for (const containerSelector of containerEntry.selectors) {
+          try {
+            const container = await deps.getUiElement({ ...win(), selector: containerSelector, includeProcessPopups: true, timeoutMs: actionTimeout });
+            if (!container.found || !container.element?.nativeWindowHandle) continue;
+            const containerRect = container.element.boundingRect;
+            const ctrlRect = (await readElement())?.boundingRect;
+            if (!containerRect || !ctrlRect) continue;
+            // Positive when the control sits above the viewport (scroll up).
+            const direction = ctrlRect.y < containerRect.y ? 1 : -1;
+            for (let step = 0; step < 6; step++) {
+              try {
+                await deps.performUiAction(act({ selector: containerSelector, action: direction > 0 ? "increment" : "decrement" }));
+              } catch { /* not a range control; nothing to step */ }
+              await waitSettle(120);
+              element = await readElement();
+              if (element && isFullyVisible(element)) break;
+            }
+            if (element && isFullyVisible(element)) {
+              return {
+                profile: profile.id, control: input.control, selectorUsed: selector, confidence: entry.confidence, notes: entry.notes,
+                result: { success: true, method: "WindowMessageWheel", alreadyVisible: false, scrolled: true, scrollContainer }
+              };
+            }
+          } catch { /* try next container selector */ }
+        }
+      }
+    }
+
+    throw new McpUiError(
+      "ACTION_FAILED",
+      `ensureVisible: control '${input.control}' could not be scrolled fully into view with the declared strategies.`,
+      { control: input.control, scrollContainer: scrollContainer ?? null, strategies: [...strategies] },
+      "Verify the control exists and its visibility.scrollContainer is declared in the App Pack."
+    );
+  }
+
   // ── ensureSelected: make a checkable control selected (idempotent). ──
   // Success requires BOTH the control state (selected/toggleState On) AND the
-  // declared business postcondition (pack defaultExpect, unless expect:false).
-  // A control that reports selected while the business state is NOT satisfied
-  // is ACTION_STATE_INCONSISTENT - never a silent success. When the pack
-  // allows a window-message fallback (fallbackPolicy != "disabled"), the
-  // fallback is attempted and the business state re-verified.
+  // declared business postconditions (pack defaultExpect + control-level
+  // postconditions, unless expect:false). A control that reports selected
+  // while the business state is NOT satisfied is ACTION_STATE_INCONSISTENT -
+  // never a silent success. When the pack allows a window-message fallback
+  // (fallbackPolicy != "disabled"), the fallback is attempted and the business
+  // state re-verified. UIA toggleState alone NEVER proves content switched:
+  // the business postconditions reference content markers declared in the
+  // pack's semantic map.
   if (input.action === "ensureSelected") {
     const packActions = getPackActions(profile.id);
     const contract = packActions?.contracts.find((c) => c.control === input.control && c.action === "ensureSelected");
     const expect = contract?.defaultExpect;
     const expectEnabled = input.expect !== false;
     const fallbackAllowed = contract?.fallbackPolicy !== "disabled";
+    // Control-level semantic postconditions (controls.json postconditions) are
+    // evaluated in ADDITION to the action contract's defaultExpect.
+    const controlPostconditions = (entry as ControlEntry & { postconditions?: Array<{ profileControl: string; condition: string; timeoutMs?: number; pollIntervalMs?: number; toggleState?: string; expectedValue?: string }> }).postconditions ?? [];
 
     // controlState verification: selected=true / toggleState On / SelectionItem.
     const controlStateTrue = (e: Partial<UiElementState> | null | undefined): boolean =>
       e != null && (e.selected === true || e.toggleState === "On");
 
-    // businessState verification: poll the declared postcondition (or an
-    // explicit UI-state condition when the pack declares none).
-    const verifyBusiness = async (): Promise<{ ok: boolean; reason?: string }> => {
-      if (!expectEnabled || !expect) {
-        // No declared business postcondition: control state is the whole
-        // story (may still be verified by the caller via expect).
-        return { ok: true };
-      }
+    // Evaluate one postcondition (contract defaultExpect OR control-level).
+    // The referenced control's pack-declared `search` scope (maxDepth /
+    // depthStrategy) is honored - deep content markers need a deeper LOCAL
+    // walk, never a global raise.
+    const evaluateOne = async (cond: { profileControl?: string; selector?: unknown; condition: string; timeoutMs?: number; pollIntervalMs?: number; toggleState?: string; expectedValue?: string }): Promise<{ ok: boolean; reason: string }> => {
+      const refControl = cond.profileControl ? normalizeControlEntry(profile.controls[cond.profileControl]) : undefined;
+      const refSearch = (refControl as ControlEntry & { search?: { maxDepth?: number; depthStrategy?: "fixed" | "auto" } }).search;
       const result = await evaluateExpect(
         { getUiElement: (i) => deps.getUiElement(i), queryUi: (i) => deps.queryUi(i) },
         {
-          ...expect,
+          ...(cond as Parameters<typeof evaluateExpect>[1]),
           profile,
           hwnd: windowSel.hwnd,
           pid: windowSel.pid,
           includeProcessPopups: true,
-          timeoutMs: expect.timeoutMs ?? 6000,
-          pollIntervalMs: expect.pollIntervalMs ?? 150
+          timeoutMs: cond.timeoutMs ?? 6000,
+          pollIntervalMs: cond.pollIntervalMs ?? 150,
+          maxDepth: refSearch?.maxDepth ?? 15
         }
       );
-      return result.matched ? { ok: true } : { ok: false, reason: `postcondition '${expect.condition}' not satisfied` };
+      return result.matched ? { ok: true, reason: "" } : { ok: false, reason: `postcondition '${cond.condition}' not satisfied` };
+    };
+
+    // businessState verification: ALL declared postconditions must hold.
+    const verifyBusiness = async (): Promise<{ ok: boolean; reason?: string }> => {
+      const checks: Array<{ profileControl?: string; selector?: unknown; condition: string; timeoutMs?: number; pollIntervalMs?: number; toggleState?: string; expectedValue?: string }> = [];
+      if (expectEnabled && expect) checks.push(expect);
+      checks.push(...controlPostconditions);
+      if (checks.length === 0) {
+        // No declared business postcondition: control state is the whole
+        // story (may still be verified by the caller via expect).
+        return { ok: true };
+      }
+      for (const check of checks) {
+        const r = await evaluateOne(check);
+        if (!r.ok) return { ok: false, reason: r.reason };
+      }
+      return { ok: true };
     };
 
     const readControl = async () => {
-      const r = await deps.getUiElement({ ...win(), selector, includeProcessPopups: true, timeoutMs: actionTimeout }).catch(() => null);
+      const r = await deps.getUiElement({ ...win(), selector, includeProcessPopups: true, timeoutMs: actionTimeout, maxDepth: localMaxDepth }).catch(() => null);
       return r?.element ?? null;
     };
 
@@ -839,7 +1017,7 @@ async function performCompositeProfileAction(
         );
       }
       try {
-        const fb = await deps.performUiAction({ ...win(), selector, action: "windowMessageClick", includeProcessPopups: true, timeoutMs: actionTimeout });
+        const fb = await deps.performUiAction(act({ selector, action: "windowMessageClick" }));
         before = await readControl();
         const businessAfter = await verifyBusiness();
         if (!controlStateTrue(before) || !businessAfter.ok) {
@@ -874,7 +1052,7 @@ async function performCompositeProfileAction(
     const perform = async (): Promise<{ method: string; element: Partial<UiElementState> | null }> => {
       let actionResult: ActionResult;
       try {
-        actionResult = await deps.performUiAction({ ...win(), selector, action: "invoke", includeProcessPopups: true, timeoutMs: actionTimeout });
+        actionResult = await deps.performUiAction(act({ selector, action: "invoke" }));
         if (!actionResult.success) {
           throw new McpUiError("ACTION_FAILED", `ensureSelected invoke did not succeed: ${actionResult.method ?? "unknown"}.`, { control: input.control });
         }
@@ -885,7 +1063,7 @@ async function performCompositeProfileAction(
           throw error;
         }
         if (error instanceof McpUiError && (error.code === "PATTERN_NOT_SUPPORTED" || error.code === "ACTION_FAILED")) {
-          const fb = await deps.performUiAction({ ...win(), selector, action: "windowMessageClick", includeProcessPopups: true, timeoutMs: actionTimeout });
+          const fb = await deps.performUiAction(act({ selector, action: "windowMessageClick" }));
           return { method: fb.method ?? "WindowMessageElementClick", element: await readControl() };
         }
         throw error;

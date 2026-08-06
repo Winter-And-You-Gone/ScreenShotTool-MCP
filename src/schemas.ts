@@ -457,7 +457,7 @@ export const profileActionSchema = z.object({
     "focus", "legacyDefaultAction", "click",
     "appendText", "clear", "selectAll", "getValue", "setChecked",
     "increment", "decrement",
-    "selectByName", "selectByIndex", "getSelection", "openMenu", "openSubmenu", "ensureSelected"
+    "selectByName", "selectByIndex", "getSelection", "openMenu", "openSubmenu", "ensureSelected", "ensureVisible"
   ]),
   ...windowSelectorFields,
   value: z.string().max(uiaValueMaxLen).optional(),
@@ -590,7 +590,22 @@ export type RunStepsStepInput = z.infer<typeof runStepsStepSchema>;
 
 export const appPackListSchema = z.object({}).strict();
 export const appPackDescribeSchema = z.object({
-  pack: z.string().min(1).max(128)
+  pack: z.string().min(1).max(128),
+  // Semantic-map sections to include (default: full map sections).
+  include: z.array(z.enum(["pages", "components", "controls", "relationships"])).min(1).max(8).optional(),
+  // Restrict the returned map to one page.
+  page: z.string().min(1).max(128).optional(),
+  // Compact mode: pages with navigationControl/components, controls with
+  // aliases+group+postconditions only - no selector arrays.
+  compact: z.boolean().optional().default(false)
+}).strict();
+
+export const resolveSemanticControlSchema = z.object({
+  profile: z.string().min(1).max(128),
+  page: z.string().min(1).max(128).optional(),
+  within: z.string().min(1).max(256).optional(),
+  query: z.string().min(1).max(512),
+  limit: z.number().int().min(1).max(20).optional().default(10)
 }).strict();
 export const appPackValidateSchema = z.object({
   pack: z.string().min(1).max(128).optional(),
@@ -673,6 +688,7 @@ export type ToolContractListInput = z.infer<typeof toolContractListSchema>;
 export type ToolContractDescribeInput = z.infer<typeof toolContractDescribeSchema>;
 export type AppPackListInput = z.infer<typeof appPackListSchema>;
 export type AppPackDescribeInput = z.infer<typeof appPackDescribeSchema>;
+export type ResolveSemanticControlInput = z.infer<typeof resolveSemanticControlSchema>;
 export type AppPackValidateInput = z.infer<typeof appPackValidateSchema>;
 export type AppPackProbeInput = z.infer<typeof appPackProbeSchema>;
 export type ValidateStepsInput = z.infer<typeof validateStepsSchema>;
@@ -710,6 +726,7 @@ export const toolZodSchemas: Record<string, z.ZodTypeAny> = {
   profile_launch: profileLaunchSchema,
   app_pack_list: appPackListSchema,
   app_pack_describe: appPackDescribeSchema,
+  resolve_semantic_control: resolveSemanticControlSchema,
   app_pack_validate: appPackValidateSchema,
   app_pack_reload: appPackReloadSchema,
   app_pack_probe: appPackProbeSchema,
@@ -1297,9 +1314,24 @@ export const toolInputSchemas = {
   app_pack_describe: {
     type: "object",
     properties: {
-      pack: { type: "string", minLength: 1, description: "Pack id from app_pack_list." }
+      pack: { type: "string", minLength: 1, description: "Pack id from app_pack_list." },
+      include: { type: "array", items: { type: "string", enum: ["pages", "components", "controls", "relationships"] }, description: "Semantic-map sections to include." },
+      page: { type: "string", minLength: 1, description: "Restrict the returned map to one page id." },
+      compact: { type: "boolean", default: false, description: "Compact mode: no selector arrays; aliases/groups/postconditions only." }
     },
     required: ["pack"],
+    additionalProperties: false
+  },
+  resolve_semantic_control: {
+    type: "object",
+    properties: {
+      profile: { type: "string", minLength: 1, description: "Pack/profile id." },
+      page: { type: "string", minLength: 1, description: "Optional page id to scope the search." },
+      within: { type: "string", minLength: 1, description: "Optional component or control id to scope the search." },
+      query: { type: "string", minLength: 1, description: "Natural-language control description (e.g. '通道1 传感器配置')." },
+      limit: { type: "integer", minimum: 1, maximum: 20, default: 10, description: "Max matches returned." }
+    },
+    required: ["profile", "query"],
     additionalProperties: false
   },
   app_pack_validate: {

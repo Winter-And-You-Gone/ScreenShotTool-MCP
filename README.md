@@ -156,9 +156,11 @@ $env:SCREENSHOT_MCP_APP_PACK_DIRS = "X:\Private\AppPacks;D:\Team\AppPacks"
 <pack-directory>/
 ├─ manifest.json    必选：id、版本、可见性、文件引用
 ├─ profile.json     必选：可执行文件、主窗口规则、启动与安全参数
-├─ controls.json    逻辑控件名 → UIA selector 候选
+├─ controls.json    逻辑控件名 → UIA selector 候选（含语义元数据、搜索作用域、滚动关系、业务后置条件）
 ├─ actions.json     控件+动作契约（幂等、可重试、defaultExpect）
 ├─ workflows.json   可复用命名工作流
+├─ pages.json       可选：页面语义地图（页面、导航入口、就绪标志、选择组）
+├─ components.json  可选：卡片/区域语义地图（组件、子控件、映射状态）
 └─ README.md        说明
 ```
 
@@ -203,6 +205,17 @@ $env:SCREENSHOT_MCP_APP_PACK_DIRS = "X:\Private\AppPacks;D:\Team\AppPacks"
 - `id` 必须匹配 `^[a-z][a-z0-9._-]{0,63}$`，与 profile.json 一致。
 - `catalogVisibility`：`session`（对客户端可见）/ `hidden`（知道 id 可调用，不列出）。`internal` 已移除（无组合引擎，internal 不可达）。
 - selector 支持 `automationId` / `name` / `controlType` / `className` / `frameworkId` + `match`（exact/contains/regex）+ `ancestor` / `path` / `index`。
+
+### 语义地图（pages.json / components.json）
+
+声明了 `pages.json` / `components.json` 的 Pack 会获得**语义发现**能力：模型先取紧凑地图，再通过通用工具组合动作，而不是为每个任务写 Workflow。
+
+- **页面**：导航入口（`navigationControl`）、页面根（`rootControl`）、**内容级就绪标志**（`readyMarkers`，验证页面内容可见而非仅按钮选中态）、滚动容器。
+- **选择组**：互斥的通道/标签/模式（`selectionGroups`，成员引用控件 id）。
+- **组件/卡片**：真实 UI 结构（`components`），带根控件、子控件和映射状态（`mappingStatus: "partial"` + `reason`）。
+- **控件语义元数据**（controls.json 条目）：`aliases`（自然语言别名）、`page` / `parent` / `group`、`role`、`search`（**局部**搜索作用域与深度，绝不全局提升）、`visibility`（所属滚动容器与滚动策略，供通用 `ensureVisible`）、`controlState`（控件自身状态）、`postconditions`（**业务后置条件**：引用内容标志控件，`ensureSelected` 必须同时满足控件状态与业务状态——UIA toggleState 单独不能证明内容已切换）、`supportedActions`、`fallbackPolicy`（禁止物理鼠标/全局键盘）。
+
+发现工具：`app_pack_describe`（`include`/`page`/`compact` 参数返回语义地图）、`resolve_semantic_control`（自然语言 → 逻辑控件路径，纯解析不执行动作）。
 - confidence 支持 `stable` / `conditionally-stable` / `fragile` / `source-derived` / `runtime-verified` / `unsupported` / `action-limited`。
 - 菜单类控件用 `menu` hints 声明：`opensSubmenu`（键盘 Right 打开子菜单）、`invokeMode:"keyboard-enter"`（模态对话框命令的非阻塞触发）、`panelControl`（接收键盘事件的菜单面板窗口）、`sectionControl`（openMenu 枚举 section 的 selector）。
 

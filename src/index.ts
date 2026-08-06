@@ -217,6 +217,12 @@ async function appPackListTool(_args: unknown, _runtime: RuntimeModules) {
   return { packs };
 }
 
+async function resolveSemanticControlTool(args: unknown, _runtime: RuntimeModules) {
+  const input = args as import("./schemas.js").ResolveSemanticControlInput;
+  const { resolveSemanticControl } = await import("./app-packs/semantics.js");
+  return resolveSemanticControl(input);
+}
+
 async function appPackDescribeTool(args: unknown, runtime: RuntimeModules) {
   const input = args as import("./schemas.js").AppPackDescribeInput;
   const pack = packRegistry.getPack(input.pack);
@@ -224,18 +230,25 @@ async function appPackDescribeTool(args: unknown, runtime: RuntimeModules) {
     throw new McpUiError("PACK_NOT_FOUND", `No App Pack with id '${input.pack}' is loaded.`, { pack: input.pack, loaded: packRegistry.listPacks("all").map((p) => p.manifest.id) });
   }
   const profile = getAppProfile(pack.manifest.id)!;
+  const p = pack; // stable non-undefined reference for narrowing across awaits
+
+  const include = input.include ?? ["pages", "components", "relationships"];
+  const compact = input.compact === true;
 
   const controls = Object.entries(pack.controls.controls).map(([name, raw]) => {
     const selectors = Array.isArray(raw) ? raw
       : "selectors" in raw && Array.isArray((raw as { selectors?: unknown[] }).selectors)
         ? (raw as { selectors: unknown[] }).selectors
         : [raw];
-    const entry = raw as { confidence?: string; description?: string; notes?: string; menu?: unknown };
+    const entry = raw as { confidence?: string; description?: string; notes?: string; menu?: unknown; page?: string; group?: string; role?: string };
     return {
       name,
       selectorCount: selectors.length,
       confidence: entry.confidence ?? "source-derived",
       description: entry.description ?? entry.notes ?? "",
+      ...(entry.page ? { page: entry.page } : {}),
+      ...(entry.group ? { group: entry.group } : {}),
+      ...(entry.role ? { role: entry.role } : {}),
       ...(entry.menu ? { menu: entry.menu } : {})
     };
   });
@@ -288,6 +301,107 @@ async function appPackDescribeTool(args: unknown, runtime: RuntimeModules) {
       ui_wait: ["matched", "timedOut"]
     },
     defaultInteractionMode: pack.profile.interaction?.defaultMode ?? "auto",
+    // Generic model usage guidance - NEVER app-specific (no control names).
+    // Returned by every pack so first-time clients pick the right tool, bind
+    // the right target, and avoid anti-patterns.
+    usageGuidance: {
+      preferredLaunchTool: "profile_launch",
+      preferredTargetBinding: "targetRef",
+      recommendedOrder: [
+        "profile_launch",
+        "profile_action",
+        "scoped ui_query",
+        "ui_catalog",
+        "ui_inspect_tree"
+      ],
+      antiPatterns: [
+        "Do not use launch_app when this pack is available.",
+        "Do not enumerate the full UI tree before trying profile controls.",
+        "Do not manually convert screen coordinates to window coordinates.",
+        "Do not infer a process crash only because no window is currently found.",
+        "Do not reuse an old hwnd after the window was recreated; pass the targetRef."
+      ]
+    }
+  };
+
+  // Semantic map (pages/components/selectionGroups/relationships) when the
+  // pack declares pages.json/components.json and the caller asks for them.
+  if (p.pages || p.components) {
+    const { describeSemanticMap } = await import("./app-packs/semantics.js");
+    const map = describeSemanticMap(p, include, input.page, compact);
+    const out = {
+      pack: p.manifest.id,
+      displayName: p.manifest.displayName,
+      version: p.manifest.version,
+      source: p.source,
+      profile: {
+        executableNames: p.profile.executableNames,
+        executableEnv: p.profile.executableEnv,
+        mainWindow: p.profile.mainWindow,
+        launch: p.profile.launch,
+        security: p.profile.security,
+        interaction: p.profile.interaction
+      },
+      controls,
+      actions,
+      workflows,
+      limitations,
+      pipeSafe: {
+        profile_launch: ["pid", "hwnd", "title", "interaction"],
+        profile_action: ["result", "selectorUsed", "interaction"],
+        ui_wait: ["matched", "timedOut"]
+      },
+      defaultInteractionMode: p.profile.interaction?.defaultMode ?? "auto",
+      usageGuidance: {
+        preferredLaunchTool: "profile_launch",
+        preferredTargetBinding: "targetRef",
+        recommendedOrder: [
+          "profile_launch",
+          "profile_action",
+          "scoped ui_query",
+          "ui_catalog",
+          "ui_inspect_tree"
+        ],
+        antiPatterns: [
+          "Do not use launch_app when this pack is available.",
+          "Do not enumerate the full UI tree before trying profile controls.",
+          "Do not manually convert screen coordinates to window coordinates.",
+          "Do not infer a process crash only because no window is currently found.",
+          "Do not reuse an old hwnd after the window was recreated; pass the targetRef."
+        ]
+      }
+    };
+    return {
+      ...out,
+      ...(include.includes("pages") ? { pages: map.pages } : {}),
+      ...(include.includes("pages") ? { selectionGroups: map.selectionGroups } : {}),
+      ...(include.includes("components") ? { components: map.components } : {}),
+      ...(include.includes("relationships") || include.includes("controls") ? { relationships: map.relationships } : {})
+    };
+  }
+  return {
+    pack: p.manifest.id,
+    displayName: p.manifest.displayName,
+    version: p.manifest.version,
+    source: p.source,
+    profile: {
+      executableNames: p.profile.executableNames,
+      executableEnv: p.profile.executableEnv,
+      mainWindow: p.profile.mainWindow,
+      launch: p.profile.launch,
+      security: p.profile.security,
+      interaction: p.profile.interaction
+    },
+    controls,
+    actions,
+    workflows,
+    limitations,
+    pipeSafe: {
+      profile_launch: ["pid", "hwnd", "title", "interaction"],
+      profile_action: ["result", "selectorUsed", "interaction"],
+      ui_wait: ["matched", "timedOut"]
+    },
+    defaultInteractionMode: p.profile.interaction?.defaultMode ?? "auto",
     // Generic model usage guidance - NEVER app-specific (no control names).
     // Returned by every pack so first-time clients pick the right tool, bind
     // the right target, and avoid anti-patterns.
@@ -1019,6 +1133,8 @@ async function dispatchToolValue(
       return appPackListTool(input, runtime);
     case "app_pack_describe":
       return appPackDescribeTool(input, runtime);
+    case "resolve_semantic_control":
+      return resolveSemanticControlTool(input, runtime);
     case "app_pack_validate":
       return appPackValidateTool(input, runtime);
     case "app_pack_reload":
