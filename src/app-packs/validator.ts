@@ -436,12 +436,15 @@ function validateSensitiveData(
   }
   // Path-aware sensitive-value scan (see src/app-packs/sensitive.ts):
   //   - scans ONLY positions that can carry executable literals
-  //     (workflow steps/finally/captureBefore args, expect/retry,
-  //     nested inputSchema defaults/examples/const/enum, action
-  //     defaultExpect values, free profile values),
+  //     (workflow top-level captureBefore + steps/finally args +
+  //     captureBefore args, expect/retry, nested inputSchema
+  //     defaults/examples/const/enum, action defaultExpect values),
   //   - never flags identifiers (selector/control metadata only),
-  //     explicit environment-variable-NAME fields (executableEnv), or
-  //     ${...} variable references.
+  //     valid environment-variable-NAME fields (executableEnv /
+  //     envName / ... with a valid env-name value), or ${...} variable
+  //     references,
+  //   - does NOT blind-scan the whole profile: identity/display/window/
+  //     process metadata is schema-validated, not a credential position.
   // Findings carry the SOURCE FILE, exact paths and REDACTED previews -
   // the raw value is never echoed into warnings.
   const sensitive = scanSensitiveValues({

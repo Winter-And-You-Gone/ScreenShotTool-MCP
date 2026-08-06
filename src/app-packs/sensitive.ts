@@ -1,11 +1,21 @@
 // Path-aware sensitive-value scanning for App Packs.
 //
 // The validator warns about LIKELY hard-coded credentials in executable
-// argument positions (workflow steps/finally/captureBefore args, workflow
-// inputSchema defaults/examples/const/enum - including NESTED schemas,
-// action literal arguments) and in free profile values. It must NOT flag
-// identifiers: control ids, automationId selectors, aliases, display names,
-// or EXPLICIT environment-variable-name fields (executableEnv etc).
+// argument positions:
+//   - workflow TOP-LEVEL captureBefore[].read.args, steps/finally
+//     args + captureBefore[].read.args, expect, retry
+//   - workflow inputSchema defaults/examples/const/enum (NESTED schemas)
+//   - action literal arguments (defaultExpect.expectedValue)
+//   - profile.executableEnv (the ONLY profile field that carries an
+//     environment-variable NAME; all other profile fields are identity/
+//     display metadata validated by schema, not scanned as credential
+//     positions)
+//
+// It must NOT flag identifiers: control ids, automationId selectors, aliases,
+// display names, or EXPLICIT environment-variable-name fields whose VALUE is
+// a valid environment-variable name (executableEnv / envName / envVar / ...).
+// An env-name FIELD does not exempt a non-env-name VALUE: "envName" carrying
+// "Bearer abcdef123456" is a hard-coded credential, not a variable name.
 //
 // Reference syntax: the ONLY formally supported non-literal reference form
 // is the App Pack pipeline's ${...} syntax (${env.X}, ${inputs.x},
@@ -65,8 +75,16 @@ export type SensitiveClassification =
   | { kind: "likely_sensitive_literal"; reason: string };
 
 // Field names that EXPLICITLY represent an environment-variable NAME
-// (never a credential value), regardless of the value's shape.
+// (never a credential value). The FIELD semantic alone is not enough: the
+// VALUE must also be a valid environment-variable name (ENV_NAME_VALUE_RE)
+// before the exemption applies.
 const ENV_NAME_FIELD_RE = /^(executableEnv|environmentVariable|environmentVariables|envName|envVar|envKey)$/i;
+
+// Strict environment-variable name shape (stable, bounded: 1..128 chars,
+// [A-Za-z_][A-Za-z0-9_]* - leading digit rejected). An env-name FIELD
+// carrying "Bearer abcdef123456" is NOT a variable name and stays a
+// credential candidate.
+const ENV_NAME_VALUE_RE = /^[A-Za-z_][A-Za-z0-9_]{0,127}$/;
 
 // The ONLY supported reference syntax: ${...} pipeline placeholders.
 const REFERENCE_RE = /^\$\{[^}]+\}$/;
@@ -120,9 +138,11 @@ export function classifyStringAtPath(
 ): SensitiveClassification {
   const leaf = String(pathSegments[pathSegments.length - 1] ?? "");
 
-  // 1) Explicit environment-variable-NAME fields: never a credential value,
-  //    regardless of value shape (MY_APP_TOKEN / RTK_PASSWORD / ...).
-  if (ENV_NAME_FIELD_RE.test(leaf)) {
+  // 1) Explicit environment-variable-NAME field whose VALUE is a valid
+  //    environment-variable name (MY_APP_TOKEN / RTK_PASSWORD / ...). The
+  //    field name never exempts an arbitrary literal: "envName" carrying
+  //    "Bearer abcdef123456" proceeds to the credential-shape checks.
+  if (ENV_NAME_FIELD_RE.test(leaf) && ENV_NAME_VALUE_RE.test(value.trim())) {
     return { kind: "environment_variable_name" };
   }
 
@@ -176,10 +196,14 @@ export function classifyStringAtPath(
 // ── Whitelist scan roots ──
 
 export type SensitiveScanInput = {
+  // Profile identity/display/window/process metadata is validated by schema
+  // and NOT scanned as a credential position. The only profile field that
+  // can carry an executable-level value is executableEnv - an env NAME.
   profile: unknown;
   workflows: Array<{
     id?: string;
     inputSchema?: { properties?: Record<string, unknown> };
+    captureBefore?: Array<{ read?: { args?: Record<string, unknown> } }>;
     steps: Array<{ args: Record<string, unknown>; captureBefore?: { read?: { args?: Record<string, unknown> } }; expect?: unknown; retry?: unknown }>;
     finally?: Array<{ args: Record<string, unknown>; captureBefore?: { read?: { args?: Record<string, unknown> } }; expect?: unknown; retry?: unknown }>;
   }>;
@@ -308,13 +332,39 @@ export function scanSensitiveValues(input: SensitiveScanInput): SensitiveScanRes
   const findings: SensitiveFinding[] = [];
   schemaNodeBudget = 0;
 
-  // Profile free values (explicit env-name fields excluded by rule 1).
-  walkValue(input.profile, ["profile"], "profile_value", "profile.json", findings);
+  // Profile: NO blind walk of the whole profile object. Identity/display/
+  // window/process metadata (id, displayName, executableNames, processNames,
+  // mainWindow.title, titleContains, submenuAidPatterns, ...) is validated by
+  // schema and is not a credential position. The only profile field carrying
+  // an executable-level value is executableEnv, and it is an env NAME -
+  // classified by rule 1 (env-name field + valid env-name value). Scanning
+  // only that field keeps "sk-tool.exe" / "Token Manager" / "Bearer
+  // Diagnostics" free of false positives.
+  const executableEnv = (input.profile as { executableEnv?: unknown } | null | undefined)?.executableEnv;
+  if (typeof executableEnv === "string") {
+    const cls = classifyStringAtPath(["profile", "executableEnv"], executableEnv, "profile_value");
+    if (cls.kind === "likely_sensitive_literal") {
+      findings.push({
+        file: "profile.json",
+        path: "profile.executableEnv",
+        reason: cls.reason,
+        redactedPreview: redactSensitiveValue(executableEnv),
+        context: "profile_value"
+      });
+    }
+  }
 
   // Workflow executable positions.
   for (let wi = 0; wi < input.workflows.length; wi++) {
     const wf = input.workflows[wi]!;
     const wfPath = ["workflows", wf.id ?? wi];
+    // Workflow-level captureBefore (schema: workflows[].captureBefore[]).
+    for (let ci = 0; ci < (wf.captureBefore ?? []).length; ci++) {
+      const capture = wf.captureBefore![ci]!;
+      if (capture.read?.args) {
+        walkValue(capture.read.args, [...wfPath, "captureBefore", ci, "read", "args"], "workflow_args", "workflows.json", findings);
+      }
+    }
     for (let si = 0; si < wf.steps.length; si++) {
       const step = wf.steps[si]!;
       walkValue(step.args, [...wfPath, "steps", si, "args"], "workflow_args", "workflows.json", findings);

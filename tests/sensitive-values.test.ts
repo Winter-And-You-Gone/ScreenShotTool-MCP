@@ -169,11 +169,22 @@ test("classify: ALL_CAPS literal under sensitive field in workflow_args WARNS (n
   assert.equal(cls.kind, "likely_sensitive_literal");
 });
 
-test("classify: executableEnv is an environment-variable NAME regardless of value shape", () => {
-  const cls = classifyStringAtPath(segs("profile.executableEnv"), "MY_APP_TOKEN", "profile_value");
-  assert.equal(cls.kind, "environment_variable_name");
-  const cls2 = classifyStringAtPath(segs("profile.environmentVariable"), "RTK_PASSWORD", "profile_value");
-  assert.equal(cls2.kind, "environment_variable_name");
+test("classify: env-name fields exempt ONLY valid env-name values", () => {
+  const valid = classifyStringAtPath(segs("profile.executableEnv"), "MY_APP_TOKEN", "profile_value");
+  assert.equal(valid.kind, "environment_variable_name");
+  const valid2 = classifyStringAtPath(segs("profile.environmentVariable"), "RTK_PASSWORD", "profile_value");
+  assert.equal(valid2.kind, "environment_variable_name");
+  // The same FIELD carrying a non-env-name literal is a credential candidate.
+  const bearer = classifyStringAtPath(segs("workflows.w.steps[0].args.envName"), "Bearer abcdef123456", "workflow_args");
+  assert.equal(bearer.kind, "likely_sensitive_literal");
+  const url = classifyStringAtPath(segs("workflows.w.steps[0].args.envVar"), "https://user:pass@example.com", "workflow_args");
+  assert.equal(url.kind, "likely_sensitive_literal");
+  const upper = classifyStringAtPath(segs("workflows.w.steps[0].args.envKey"), "PASSWORD=literal-secret", "workflow_args");
+  assert.equal(upper.kind, "likely_sensitive_literal");
+  // Invalid env-name shape without a secret shape is ordinary text, never a
+  // false "environment_variable_name" exemption.
+  const spaced = classifyStringAtPath(segs("workflows.w.steps[0].args.envName"), "not a valid env name", "workflow_args");
+  assert.equal(spaced.kind, "ordinary_text");
 });
 
 test("classify: ${...} reference is safe in any context", () => {
@@ -387,14 +398,17 @@ test("no-warn: inputSchema description/title are never scanned", () => {
 });
 
 test("file: findings carry the correct source file", async () => {
+  // Profile scanning is restricted to executableEnv (an env NAME); a literal
+  // that is NOT a valid env name still warns with file profile.json.
   const profileOnly: SensitiveScanInput = {
-    profile: { apiToken: "PROFILELITERAL" },
+    profile: { executableEnv: "Bearer PROFILELITERALTOKEN" },
     workflows: [],
     actions: []
   };
   const pf = scanSensitiveValues(profileOnly).findings;
   assert.equal(pf.length, 1);
   assert.equal(pf[0]!.file, "profile.json");
+  assert.equal(pf[0]!.path, "profile.executableEnv");
 
   const wfOnly: SensitiveScanInput = {
     profile: {},
@@ -433,4 +447,111 @@ test("redaction: no raw value in serialized findings for all new cases", () => {
   for (const f of result.findings) {
     assert.ok(!f.redactedPreview.includes("SUPERSECRET123"));
   }
+});
+
+// ── edge: workflow TOP-LEVEL captureBefore ──
+
+test("warn: workflow top-level captureBefore.read.args literal secret", () => {
+  const input: SensitiveScanInput = {
+    profile: {},
+    workflows: [{
+      id: "configure",
+      steps: [],
+      captureBefore: [{
+        saveAs: "state",
+        read: { tool: "ui_get", args: { password: "literal-secret" } }
+      }]
+    }],
+    actions: []
+  };
+  const result = scanSensitiveValues(input);
+  assert.equal(result.findings.length, 1);
+  const f = result.findings[0]!;
+  assert.equal(f.file, "workflows.json");
+  assert.equal(f.context, "workflow_args");
+  assert.equal(f.path, "workflows.configure.captureBefore[0].read.args.password");
+  assert.ok(!JSON.stringify(result).includes("literal-secret"), "finding must not leak the raw secret");
+});
+
+test("warn: top-level captureBefore warns alongside step-level captureBefore", () => {
+  const input: SensitiveScanInput = {
+    profile: {},
+    workflows: [{
+      id: "configure",
+      captureBefore: [{
+        saveAs: "before",
+        read: { tool: "ui_get", args: { token: "TOPLEVELTOKEN123" } }
+      }],
+      steps: [{
+        tool: "profile_action",
+        args: { control: "x", action: "invoke" },
+        captureBefore: { saveAs: "step", read: { tool: "ui_get", args: { token: "STEPLEVELTOKEN123" } } }
+      }],
+      finally: [{
+        tool: "send_key",
+        args: { key: "esc" },
+        captureBefore: { saveAs: "fin", read: { tool: "ui_get", args: { token: "FINALLYTOKEN123" } } }
+      }]
+    }],
+    actions: []
+  };
+  const result = scanSensitiveValues(input);
+  const paths = result.findings.map((f) => f.path);
+  assert.ok(paths.includes("workflows.configure.captureBefore[0].read.args.token"), JSON.stringify(paths));
+  assert.ok(paths.includes("workflows.configure.steps[0].captureBefore.read.args.token"), JSON.stringify(paths));
+  assert.ok(paths.includes("workflows.configure.finally[0].captureBefore.read.args.token"), JSON.stringify(paths));
+});
+
+// ── edge: profile metadata is NOT blind-scanned ──
+
+test("no-warn: profile identity/window/process metadata is not a credential position", () => {
+  const input: SensitiveScanInput = {
+    profile: {
+      id: "sk-tool",
+      displayName: "Bearer Diagnostics",
+      executableNames: ["sk-tool.exe"],
+      processNames: ["token-agent"],
+      mainWindow: { title: "Token Manager", className: "PasswordWindowClass" },
+      titleContains: ["Token"],
+      submenuAidPatterns: ["^token-"]
+    },
+    workflows: [],
+    actions: []
+  };
+  const result = scanSensitiveValues(input);
+  assert.deepEqual(result.findings, [], "profile metadata must not produce findings: " + JSON.stringify(result.findings));
+});
+
+// ── edge: env-name exemption validates VALUE format ──
+
+test("no-warn: env-name fields with valid env-name VALUES stay exempt", () => {
+  const input: SensitiveScanInput = {
+    profile: { executableEnv: "MY_APP_TOKEN" },
+    workflows: [{ id: "w", steps: [{ tool: "type_text", args: { envName: "API_TOKEN", envVar: "RTK_PASSWORD" } }] }],
+    actions: []
+  };
+  assert.deepEqual(scan(input), []);
+});
+
+test("warn: env-name fields carrying credential literals are flagged", () => {
+  const cases: Array<[Record<string, string>, string]> = [
+    [{ envName: "Bearer literal-token" }, "envName"],
+    [{ envVar: "https://user:pass@example.com" }, "envVar"],
+    [{ envKey: "password=literal-secret" }, "envKey"]
+  ];
+  for (const [args, field] of cases) {
+    const input = workflowWithArgs(args);
+    const result = scanSensitiveValues(input);
+    const f = result.findings.find((x) => x.path === `workflows.configure.steps[0].args.${field}`);
+    assert.ok(f, `envName field '${field}' with credential literal must warn, got ${JSON.stringify(result.findings.map((x) => x.path))}`);
+    assert.equal(f!.context, "workflow_args");
+    assert.equal(f!.file, "workflows.json");
+    assert.ok(!JSON.stringify(result).includes(args[field]!), "raw value must not leak");
+  }
+});
+
+test("no-warn: invalid env-name value without secret shape is ordinary text, not exempted", () => {
+  const input = workflowWithArgs({ envName: "not a valid env name" });
+  const result = scanSensitiveValues(input);
+  assert.deepEqual(result.findings, []);
 });
