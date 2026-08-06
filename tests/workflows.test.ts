@@ -1,6 +1,7 @@
 // Unit tests for the workflow system (src/app-packs/workflows.ts):
-// catalog visibility, input validation, internal workflows, and execution
-// through the pipeline engine with a mocked dispatch.
+// catalog visibility (session listed, hidden callable by id), input
+// validation, and execution through the pipeline engine with a mocked
+// dispatch.
 import assert from "node:assert/strict";
 import test from "node:test";
 
@@ -33,6 +34,10 @@ function makePack(overrides: Partial<LoadedPack> = {}): LoadedPack {
           id: "hidden_wf",
           visibility: "hidden",
           steps: [{ tool: "read_clipboard", args: {} }]
+        },
+        {
+          id: "default_wf",
+          steps: [{ tool: "read_clipboard", args: {} }]
         }
       ]
     },
@@ -45,14 +50,17 @@ function makePack(overrides: Partial<LoadedPack> = {}): LoadedPack {
   };
 }
 
-test("listWorkflows respects visibility", () => {
+test("workflow_catalog lists session workflows only; hidden stays callable by exact id", () => {
   const pack = makePack();
   const visible = listWorkflows(pack);
   const ids = visible.map((w) => w.id);
-  assert.ok(ids.includes("public_wf"));
-  assert.ok(ids.includes("hidden_wf"), "hidden workflows appear in the catalog (flagged)");
-  const hidden = visible.find((w) => w.id === "hidden_wf");
-  assert.equal(hidden?.visibility, "hidden");
+  assert.ok(ids.includes("public_wf"), "session workflows appear in the catalog");
+  assert.ok(ids.includes("default_wf"), "workflows without visibility default to session and appear in the catalog");
+  assert.ok(!ids.includes("hidden_wf"), "hidden workflows must NOT appear in the catalog");
+
+  // hidden workflows remain resolvable and runnable by exact id.
+  assert.ok(getWorkflow(pack, "hidden_wf"), "getWorkflow must still find hidden workflows by id");
+  assert.equal(getWorkflow(pack, "hidden_wf")!.visibility, "hidden");
 });
 
 test("getWorkflow finds by id", () => {
@@ -156,6 +164,30 @@ test("runWorkflow executes steps and returns exports + runId", async () => {
   assert.equal(result.exports.text, "wf-marker");
   assert.match(result.runId, /^run_/);
   assert.equal(result.completedSteps.length, 1);
+});
+
+test("runWorkflow still executes a hidden workflow resolved by exact id", async () => {
+  const pack = makePack();
+  const wf = getWorkflow(pack, "hidden_wf");
+  assert.ok(wf, "hidden workflows are resolvable by exact id");
+  const result = await runWorkflow({
+    pack,
+    workflow: wf!,
+    inputs: {},
+    profile: { id: "fixture", displayName: "F", processNames: [], controls: {} },
+    ctx: {
+      dispatch: async (tool) => {
+        assert.equal(tool, "read_clipboard");
+        return { available: true, text: "hidden-ran", length: 9, timestamp: "t" };
+      },
+      expectDeps: {
+        getUiElement: async () => ({ found: false, element: null, elapsedMs: 1 }),
+        queryUi: async () => ({ found: false, count: 0, elements: [], truncated: false, visitedNodes: 0, elapsedMs: 1 })
+      }
+    }
+  });
+  assert.equal(result.success, true, "hidden is not rejected at run time");
+  assert.equal(result.steps.length, 1, "the hidden workflow's step executes");
 });
 
 test("runWorkflow rejects unknown tools before execution", async () => {

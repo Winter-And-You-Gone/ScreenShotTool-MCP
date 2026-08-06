@@ -98,16 +98,23 @@ export class AppPackRegistry {
         const tc = target.titleContains.toLowerCase();
         if ((profile.titleContains ?? []).some((t) => tc.includes(t.toLowerCase()))) return pack;
         if (profile.mainWindow?.title) {
-          const t = profile.mainWindow.title.toLowerCase();
           if (profile.mainWindow.titleMatch === "regex") {
             try {
-              // Case-insensitive via the flag ONLY - never by lowercasing the
-              // pattern source (a lowercased character class like [A-Z] or a
-              // case-sensitive escape would silently change semantics).
-              if (new RegExp(t, "i").test(target.titleContains)) return pack;
-            } catch { /* ignore */ }
-          } else if (t.includes(tc) || tc.includes(t)) {
-            return pack;
+              // REGEX SOURCE IS NEVER MODIFIED: the original pattern is
+              // passed verbatim to RegExp (case-insensitive via the "i" flag
+              // ONLY). Lowercasing the source first would silently change
+              // character classes ([A-Z] -> [a-z]), Unicode escapes and
+              // user-visible escapes. An invalid regex never crashes the
+              // server - the pack simply does not match by title.
+              if (new RegExp(profile.mainWindow.title, "i").test(target.titleContains)) return pack;
+            } catch { /* invalid regex: no title match, never crash */ }
+          } else {
+            // Plain contains/exact matching stays case-insensitive by
+            // normalizing BOTH sides (safe for plain text, unlike regex).
+            const t = profile.mainWindow.title.toLowerCase();
+            if (t.includes(tc) || tc.includes(t)) {
+              return pack;
+            }
           }
         }
       }

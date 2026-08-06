@@ -37,6 +37,10 @@ export type WorkflowCatalogEntry = {
 
 export function listWorkflows(pack: LoadedPack): WorkflowCatalogEntry[] {
   return pack.workflows.workflows
+    // Catalog semantics: session (or unset -> session) workflows appear in
+    // workflow_catalog; hidden workflows are callable by exact id via
+    // getWorkflow/run_workflow but are NOT listed.
+    .filter((w) => (w.visibility ?? "session") === "session")
     .map((w) => {
       // The catalog's background capability MUST be computed with the SAME
       // logic the runtime uses (backgroundUnsafePipelineSteps: main steps AND

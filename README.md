@@ -196,6 +196,7 @@ $env:SCREENSHOT_MCP_APP_PACK_DIRS = "X:\Private\AppPacks;D:\Team\AppPacks"
 - Pack 的 `defaultExpect` 自动生效；步骤可引用前序步骤：`${launch.pid}`。
 - 返回 `runId`、命名步骤结果、`exports`、`finallyResults`。
 - `internal` 可见性**已移除**（没有组合引擎时 internal 工作流不可达）：`visibility` 只接受 `session` / `hidden`；声明 `internal` 的 Pack 在加载时被拒绝。
+- Workflow `visibility` 语义：`session`（默认）出现在 `workflow_catalog` 且可直接调用；`hidden` **不出现在** `workflow_catalog`，但知道准确 Pack ID + Workflow ID 时仍可通过 `run_workflow` 调用。
 
 ## profile_run_steps
 

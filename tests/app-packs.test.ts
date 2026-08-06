@@ -337,3 +337,69 @@ test("no executable content: only JSON files are ever read", async () => {
   const payload = await readFile(path.join(packDir, "payload.ps1"), "utf8");
   assert.equal(payload, "Invoke-Expression evil", "pack files are never executed");
 });
+
+// ── mainWindow regex source preservation ──
+//
+// The pattern is "^İ$" (U+0130 LATIN CAPITAL LETTER I WITH DOT ABOVE). This
+// is a DISCRIMINATING case for source lowercasing: "İ".toLowerCase() folds
+// to "i̇" (TWO characters: i + combining dot above), so a lowercased source
+// ("^i̇$") no longer matches the target "İ" - while the ORIGINAL source
+// matches it (the "i" flag folds the real İ). Plain [A-Z]-style cases would
+// NOT work: the "i" flag already folds character classes, and escape
+// sequences like İ contain no letters to lowercase.
+
+const REGEX_PACK_MANIFEST = {
+  schemaVersion: 1,
+  id: "regex-app",
+  displayName: "Regex App",
+  version: "1.0.0"
+};
+
+const REGEX_PACK_PROFILE = {
+  id: "regex-app",
+  executableNames: ["RegexApp.exe"],
+  mainWindow: { title: "^İ$", titleMatch: "regex", frameworkId: "Qt" }
+};
+
+test("regex match uses the ORIGINAL pattern source (never lowercased before RegExp)", async () => {
+  const dir = await makeTempDir();
+  await writePack(dir, "regex-app", {
+    "manifest.json": REGEX_PACK_MANIFEST,
+    "profile.json": REGEX_PACK_PROFILE
+  });
+  const reg = new AppPackRegistry();
+  await reg.load(dir, [], false);
+  // The original "^İ$" source matches "İ". A lowercased source would have
+  // become "^i̇$" (the two-character fold of İ), which does NOT match "İ" -
+  // so this assertion fails iff the source was modified before RegExp.
+  assert.ok(reg.findPackForTarget({ titleContains: "İ" }), "the original İ source must match target 'İ'");
+  // The anchored pattern does not match unrelated text.
+  assert.equal(reg.findPackForTarget({ titleContains: "a" }), undefined, "the anchored İ pattern must not match 'a'");
+});
+
+test("non-regex title matching stays case-insensitive (plain string normalization)", async () => {
+  const dir = await makeTempDir();
+  await writePack(dir, "regex-app", {
+    "manifest.json": REGEX_PACK_MANIFEST,
+    "profile.json": { ...REGEX_PACK_PROFILE, mainWindow: { title: "VaporView", titleMatch: "contains" } }
+  });
+  const reg = new AppPackRegistry();
+  await reg.load(dir, [], false);
+  // Plain contains matching normalizes both sides and is case-insensitive.
+  assert.ok(reg.findPackForTarget({ titleContains: "vaporview" }), "lowercase target matches mixed-case plain title");
+  assert.ok(reg.findPackForTarget({ titleContains: "VAPORVIEW" }), "uppercase target matches mixed-case plain title");
+});
+
+test("an invalid regex never crashes title matching; the pack simply does not match by title", async () => {
+  const dir = await makeTempDir();
+  await writePack(dir, "regex-app", {
+    "manifest.json": REGEX_PACK_MANIFEST,
+    "profile.json": { ...REGEX_PACK_PROFILE, mainWindow: { title: "[unclosed", titleMatch: "regex" } }
+  });
+  const reg = new AppPackRegistry();
+  await reg.load(dir, [], false);
+  // Invalid pattern: no crash, no match by title (the server keeps running
+  // and other lookup paths still work).
+  assert.equal(reg.findPackForTarget({ titleContains: "anything" }), undefined, "invalid regex yields no title match");
+  assert.ok(reg.findPackForTarget({ processName: "RegexApp.exe" }), "processName lookups still work after an invalid regex");
+});
