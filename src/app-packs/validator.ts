@@ -19,6 +19,7 @@
 import type { ToolContract } from "../contracts.js";
 import { getContract } from "../contracts.js";
 import { isSensitiveFieldName } from "../outputs.js";
+import { extractReferenceHeads } from "../piping.js";
 import type { LoadedPack, PackWorkflow, PackWorkflowStep } from "./types.js";
 
 export type ValidationIssue = {
@@ -226,54 +227,70 @@ function validateStep(
     return;
   }
 
-  // Step ids referenced by ${id.path} must be earlier steps.
-  const refs = collectPlaceholderHeads(step.args);
-  for (const refHead of refs) {
-    if (refHead === "pack") continue; // ${pack.id} is server-injected
-    if (refHead === "inputs") continue; // ${inputs.x} from workflow inputs
+  // UNIFIED reference scanning: every place a ${...} placeholder can appear
+  // (args, expect, captureBefore.read.args, finally, restore reads) is
+  // scanned with the SAME reference parser the pipeline uses
+  // (extractReferenceHeads) - never a second ad-hoc regex.
+  const scan = (value: unknown, path: string): void => {
+    for (const ref of extractReferenceHeads(value)) {
+      checkReference(ref.head, ref.tail, path);
+    }
+  };
+  const checkReference = (refHead: string, tail: string[], path: string): void => {
+    if (refHead === "pack") return; // ${pack.id} is server-injected
+    if (refHead === "inputs") return; // ${inputs.x} from workflow inputs
     if (/^\d+$/.test(refHead)) {
       const n = Number(refHead);
       if (n >= index && index >= 0) {
         errors.push({
-          file: "workflows.json", path: where("args"), code: "FORWARD_REFERENCE",
+          file: "workflows.json", path, code: "FORWARD_REFERENCE",
           message: `Step references ${refHead} which is not an earlier step (index ${index}).`,
           suggestion: "Steps may only reference earlier steps."
         });
+      } else if (n < index && index >= 0) {
+        checkOutputPath(refHead, tail, path);
       }
-      continue;
+      return;
     }
     const refIndex = stepIndex.get(refHead);
     if (refIndex === undefined) {
       errors.push({
-        file: "workflows.json", path: where("args"), code: "UNKNOWN_STEP_REFERENCE",
+        file: "workflows.json", path, code: "UNKNOWN_STEP_REFERENCE",
         message: `Step references '${refHead}' which is not a step id in this workflow.`,
         suggestion: "Use an earlier step's id, a numeric index, ${pack.id}, or ${inputs.x}."
       });
     } else if (refIndex >= index && index >= 0) {
       errors.push({
-        file: "workflows.json", path: where("args"), code: "FORWARD_REFERENCE",
+        file: "workflows.json", path, code: "FORWARD_REFERENCE",
         message: `Step references '${refHead}' (step ${refIndex}) which is not before step ${index}.`,
         suggestion: "Steps may only reference earlier steps."
       });
     } else {
       // Validate that the referenced field exists in the referenced tool's
       // outputSchema.
-      const refStep = workflow.steps[refIndex];
-      const refContract = refStep ? getContract(refStep.tool) : undefined;
-      if (refContract && refIndex >= 0) {
-        const tail = collectPlaceholderPaths(step.args, refHead);
-        for (const t of tail) {
-          if (t.length > 0 && !fieldExistsInSchema(refContract, t)) {
-            errors.push({
-              file: "workflows.json", path: where("args"), code: "UNKNOWN_OUTPUT_PATH",
-              message: `Output path '${[refHead, ...t].join(".")}' does not exist in ${refStep?.tool ?? "?"}'s output schema.`,
-              suggestion: suggestionForField(refContract, t)
-            });
-          }
-        }
-      }
+      checkOutputPath(refHead, tail, path);
     }
-  }
+  };
+  const checkOutputPath = (refHead: string, tail: string[], path: string): void => {
+    const refIndex = /^\d+$/.test(refHead) ? Number(refHead) : stepIndex.get(refHead);
+    if (refIndex === undefined || refIndex < 0) return;
+    const refStep = workflow.steps[refIndex];
+    const refContract = refStep ? getContract(refStep.tool) : undefined;
+    if (refContract && tail.length > 0 && !fieldExistsInSchema(refContract, tail)) {
+      errors.push({
+        file: "workflows.json", path, code: "UNKNOWN_OUTPUT_PATH",
+        message: `Output path '${[refHead, ...tail].join(".")}' does not exist in ${refStep?.tool ?? "?"}'s output schema.`,
+        suggestion: suggestionForField(refContract, tail)
+      });
+    }
+  };
+
+  scan(step.args, where("args"));
+  scan(step.expect, where("expect"));
+  scan(step.captureBefore?.read?.args, where("captureBefore.read.args"));
+  // Retry policies carry no references (only error codes), but scanning the
+  // whole step object is harmless and future-proof.
+  scan(step.retry, where("retry"));
 
   // Exports: paths must exist in the step tool's outputSchema, names must not
   // be sensitive.
@@ -318,44 +335,6 @@ function validateStep(
 }
 
 // ── helpers ──
-
-function collectPlaceholderHeads(args: unknown): string[] {
-  const heads = new Set<string>();
-  walk(args);
-  return [...heads];
-
-  function walk(v: unknown): void {
-    if (typeof v === "string") {
-      for (const m of v.matchAll(/\$\{([A-Za-z0-9_]+)(?:\.[\w.]+)*\}/g)) {
-        heads.add(m[1]!);
-      }
-    } else if (Array.isArray(v)) {
-      v.forEach(walk);
-    } else if (v && typeof v === "object") {
-      Object.values(v).forEach(walk);
-    }
-  }
-}
-
-function collectPlaceholderPaths(args: unknown, head: string): string[][] {
-  const paths: string[][] = [];
-  walk(args);
-  return paths;
-
-  function walk(v: unknown): void {
-    if (typeof v === "string") {
-      for (const m of v.matchAll(/\$\{([A-Za-z0-9_]+)(\.[\w.]+)*\}/g)) {
-        if (m[1] === head && m[2]) {
-          paths.push(m[2]!.slice(1).split("."));
-        }
-      }
-    } else if (Array.isArray(v)) {
-      v.forEach(walk);
-    } else if (v && typeof v === "object") {
-      Object.values(v).forEach(walk);
-    }
-  }
-}
 
 // Best-effort field existence check against a JSON Schema: returns true when
 // the schema does not declare properties (can't verify), or the field exists.

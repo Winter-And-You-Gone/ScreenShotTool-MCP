@@ -251,20 +251,30 @@ test("visibility is respected by the registry", async () => {
     "manifest.json": { ...VALID_MANIFEST, id: "hidden-app", catalogVisibility: "hidden" },
     "profile.json": { ...VALID_PROFILE, id: "hidden-app" }
   });
-  await writePack(dir, "internal-app", {
-    "manifest.json": { ...VALID_MANIFEST, id: "internal-app", catalogVisibility: "internal" },
-    "profile.json": { ...VALID_PROFILE, id: "internal-app" }
+  await writePack(dir, "session-app", {
+    "manifest.json": { ...VALID_MANIFEST, id: "session-app" },
+    "profile.json": { ...VALID_PROFILE, id: "session-app" }
   });
   const reg = new AppPackRegistry();
   await reg.load(dir, [], false);
   const session = reg.listPacks("session").map((p) => p.manifest.id);
   assert.ok(!session.includes("hidden-app"), "hidden packs are not listed");
-  assert.ok(!session.includes("internal-app"), "internal packs are not listed");
+  assert.ok(session.includes("session-app"));
   const all = reg.listPacks("all").map((p) => p.manifest.id);
   assert.ok(all.includes("hidden-app"));
-  assert.ok(all.includes("internal-app"));
   // Known ids remain callable.
   assert.ok(reg.getPack("hidden-app"));
+});
+
+test("'internal' visibility is rejected by the loader (no composition engine)", async () => {
+  const dir = await makeTempDir();
+  await writePack(dir, "internal-app", {
+    "manifest.json": { ...VALID_MANIFEST, id: "internal-app", catalogVisibility: "internal" },
+    "profile.json": { ...VALID_PROFILE, id: "internal-app" }
+  });
+  const result = await loadAllPacks(dir, [], false);
+  assert.equal(result.packs.length, 0, "an internal-visibility pack must not load");
+  assert.ok(result.issues.some((i) => i.code === "MANIFEST_INVALID"), `expected MANIFEST_INVALID, got ${result.issues.map((i) => i.code).join(",")}`);
 });
 
 test("reload is atomic: a failing reload keeps the previous config", async () => {

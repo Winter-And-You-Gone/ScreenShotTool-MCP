@@ -11,7 +11,7 @@ import { runPipeline, type ExecutionContext, type PipelineInput, type PipelineRe
 import { McpUiError } from "../uia/results.js";
 import { getContract } from "../contracts.js";
 import {
-  backgroundUnsafeSteps,
+  backgroundUnsafePipelineSteps,
   stepBackgroundPolicy,
   type BackgroundPolicy,
   type InteractionMode,
@@ -35,12 +35,16 @@ export type WorkflowCatalogEntry = {
   foregroundRequiredSteps: Array<{ stepId?: string; backgroundPolicy: BackgroundPolicy; suggestedMode: "foregroundDemo" }>;
 };
 
-export function listWorkflows(pack: LoadedPack, includeInternal = false): WorkflowCatalogEntry[] {
+export function listWorkflows(pack: LoadedPack): WorkflowCatalogEntry[] {
   return pack.workflows.workflows
-    .filter((w) => includeInternal || (w.visibility ?? "session") !== "internal")
     .map((w) => {
-      const unsafe = backgroundUnsafeSteps(w.steps, () => undefined, pack.actions);
-      const policies = w.steps.map((s) => stepBackgroundPolicy(pack.actions, s));
+      // The catalog's background capability MUST be computed with the SAME
+      // logic the runtime uses (backgroundUnsafePipelineSteps: main steps AND
+      // finally), so workflow_catalog and the background preflight can never
+      // disagree.
+      const unsafe = backgroundUnsafePipelineSteps(w.steps, w.finally ?? [], () => undefined, pack.actions);
+      const allSteps = [...w.steps, ...(w.finally ?? [])];
+      const policies = allSteps.map((s) => stepBackgroundPolicy(pack.actions, s));
       const backgroundPolicy: BackgroundPolicy = unsafe.length > 0
         ? "foregroundRequired"
         : policies.some((p) => p === "bestEffort")
@@ -57,6 +61,7 @@ export function listWorkflows(pack: LoadedPack, includeInternal = false): Workfl
         backgroundPolicy,
         foregroundRequiredSteps: unsafe.map((s) => ({
           ...(s.stepId ? { stepId: s.stepId } : {}),
+          ...(s.section ? { section: s.section } : {}),
           backgroundPolicy: s.backgroundPolicy,
           suggestedMode: s.suggestedMode
         }))
@@ -68,28 +73,25 @@ export function getWorkflow(pack: LoadedPack, id: string): PackWorkflow | undefi
   return pack.workflows.workflows.find((w) => w.id === id);
 }
 
-// Validate workflow inputs against its inputSchema (a simple object schema).
-export function validateWorkflowInputs(workflow: PackWorkflow, inputs: unknown): string[] {
-  const errors: string[] = [];
-  const schema = workflow.inputSchema ?? { type: "object", properties: {}, required: [] as string[], additionalProperties: false };
+// Validate workflow inputs against its inputSchema using the SAME structural
+// JSON-Schema subset validator as the tool output contracts (type / required /
+// enum / minimum / maximum / minLength / maxLength / pattern / nested objects
+// / arrays / additionalProperties). There is no separate hand-written
+// workflow-validator; the error shape mirrors the output validator's
+// ({path, message}) so clients can map failures to input fields.
+import { validateAgainstSchema } from "../outputs.js";
+import type { JsonSchema } from "../contracts.js";
+
+export type WorkflowInputValidationError = { path: string; message: string };
+
+export function validateWorkflowInputs(workflow: PackWorkflow, inputs: unknown): WorkflowInputValidationError[] {
+  const schema = (workflow.inputSchema ?? { type: "object", properties: {}, required: [] as string[], additionalProperties: false }) as unknown as JsonSchema;
   if (inputs === undefined || inputs === null || typeof inputs !== "object" || Array.isArray(inputs)) {
-    return ["inputs must be an object"];
+    return [{ path: "inputs", message: "Expected an object" }];
   }
-  const record = inputs as Record<string, unknown>;
-  for (const key of schema.required ?? []) {
-    if (record[key] === undefined) {
-      errors.push(`Missing required input '${key}'.`);
-    }
-  }
-  if (schema.additionalProperties === false) {
-    const known = new Set(Object.keys(schema.properties ?? {}));
-    for (const key of Object.keys(record)) {
-      if (!known.has(key)) {
-        errors.push(`Unknown input '${key}' (additionalProperties=false).`);
-      }
-    }
-  }
-  return errors;
+  const check = validateAgainstSchema(inputs, schema);
+  if (check.ok) return [];
+  return check.errors;
 }
 
 export type RunWorkflowOptions = {
@@ -97,27 +99,30 @@ export type RunWorkflowOptions = {
   workflow: PackWorkflow;
   inputs: Record<string, unknown>;
   profile: import("../profiles/types.js").AppProfile;
-  dispatch: ExecutionContext["dispatch"];
-  expectDeps: ExecutionContext["expectDeps"];
-  autoContext?: ExecutionContext["autoContext"];
-  // Resolved interaction mode (explicit > workflow > pack default > auto).
-  interactionMode?: InteractionMode;
-  interaction?: InteractionOptions & { foregroundBefore?: string };
-  restoreForeground?: ExecutionContext["restoreForeground"];
+  // The full pipeline ExecutionContext (dispatch, pack, expectDeps, and the
+  // resolved interaction context), built by the SINGLE context factory in
+  // index.ts. runWorkflow itself never hand-assembles context.
+  ctx: ExecutionContext;
 };
 
 export async function runWorkflow(opts: RunWorkflowOptions): Promise<PipelineResult> {
-  const { pack, workflow, inputs } = opts;
+  const { pack, workflow, inputs, ctx } = opts;
 
   const inputErrors = validateWorkflowInputs(workflow, inputs);
   if (inputErrors.length > 0) {
-    throw new McpUiError("INVALID_WORKFLOW_INPUTS", `Workflow '${workflow.id}' inputs are invalid: ${inputErrors.join(" ")}`, { workflow: workflow.id, errors: inputErrors });
+    throw new McpUiError(
+      "WORKFLOW_INPUT_INVALID",
+      `Workflow '${workflow.id}' inputs are invalid (${inputErrors.length} error(s)).`,
+      { workflow: workflow.id, validationErrors: inputErrors.slice(0, 20) }
+    );
   }
 
-  // Internal workflows can only be invoked from within the pack's own
-  // workflows (enforced here: direct run_workflow calls are rejected).
-  if ((workflow.visibility ?? "session") === "internal") {
-    throw new McpUiError("WORKFLOW_INTERNAL", `Workflow '${workflow.id}' is marked internal; it can only be invoked by another workflow of pack '${pack.manifest.id}'.`, { workflow: workflow.id, pack: pack.manifest.id });
+  // "internal" visibility was removed from the pack schema (no composition
+  // engine), so an unreachable internal workflow is impossible by
+  // construction. The guard remains as a runtime backstop for packs created
+  // by older server versions that still carry the declaration.
+  if ((workflow.visibility as string) === "internal") {
+    throw new McpUiError("WORKFLOW_INTERNAL", `Workflow '${workflow.id}' is marked internal; internal workflows were removed (no composition engine). Remove the visibility declaration from workflows.json.`, { workflow: workflow.id, pack: pack.manifest.id });
   }
 
   // Cross-check every workflow step tool against the contract table.
@@ -144,14 +149,5 @@ export async function runWorkflow(opts: RunWorkflowOptions): Promise<PipelineRes
     maxTotalMs: 120_000
   };
 
-  return runPipeline(pipelineInput, {
-    dispatch: opts.dispatch,
-    pack: { id: pack.manifest.id, actions: pack.actions, profile: opts.profile, version: pack.manifest.version },
-    inputs,
-    autoContext: opts.autoContext,
-    expectDeps: opts.expectDeps,
-    interactionMode: opts.interactionMode,
-    interaction: opts.interaction,
-    restoreForeground: opts.restoreForeground
-  });
+  return runPipeline(pipelineInput, ctx);
 }

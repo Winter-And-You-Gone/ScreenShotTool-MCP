@@ -19,6 +19,12 @@ export type JsonSchema = {
   anyOf?: JsonSchema[];
   description?: string;
   additionalProperties?: boolean;
+  // The validated subset (workflow inputSchemas + output contracts).
+  minimum?: number;
+  maximum?: number;
+  minLength?: number;
+  maxLength?: number;
+  pattern?: string;
 };
 
 export type ToolAnnotations = {

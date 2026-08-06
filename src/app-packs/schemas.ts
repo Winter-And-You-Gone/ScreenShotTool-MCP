@@ -72,7 +72,7 @@ export const packManifestSchema = z.object({
   controlsFile: nonEmptyStr.optional(),
   actionsFile: nonEmptyStr.optional(),
   workflowsFile: nonEmptyStr.optional(),
-  catalogVisibility: z.enum(["session", "hidden", "internal"]).optional().default("session"),
+  catalogVisibility: z.enum(["session", "hidden"]).optional().default("session"),
   enabled: z.boolean().optional().default(true)
 }).strict().refine(
   (value) => value.enabled !== false,
@@ -215,7 +215,7 @@ export const packWorkflowsSchema = z.object({
     safe: z.boolean().optional().default(false),
     tested: z.boolean().optional().default(false),
     restoresState: z.boolean().optional().default(false),
-    visibility: z.enum(["session", "hidden", "internal"]).optional().default("session"),
+    visibility: z.enum(["session", "hidden"]).optional().default("session"),
     interactionMode: interactionModeSchema.optional(),
     inputSchema: z.object({
       type: z.literal("object").optional().default("object"),

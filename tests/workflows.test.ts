@@ -33,11 +33,6 @@ function makePack(overrides: Partial<LoadedPack> = {}): LoadedPack {
           id: "hidden_wf",
           visibility: "hidden",
           steps: [{ tool: "read_clipboard", args: {} }]
-        },
-        {
-          id: "internal_wf",
-          visibility: "internal",
-          steps: [{ tool: "read_clipboard", args: {} }]
         }
       ]
     },
@@ -56,7 +51,6 @@ test("listWorkflows respects visibility", () => {
   const ids = visible.map((w) => w.id);
   assert.ok(ids.includes("public_wf"));
   assert.ok(ids.includes("hidden_wf"), "hidden workflows appear in the catalog (flagged)");
-  assert.ok(!ids.includes("internal_wf"), "internal workflows are not listed");
   const hidden = visible.find((w) => w.id === "hidden_wf");
   assert.equal(hidden?.visibility, "hidden");
 });
@@ -67,19 +61,46 @@ test("getWorkflow finds by id", () => {
   assert.equal(getWorkflow(pack, "missing"), undefined);
 });
 
-test("validateWorkflowInputs enforces required and unknown inputs", () => {
+test("validateWorkflowInputs enforces required, unknown, enum and nested types", () => {
   const pack = makePack();
-  const wf = { ...getWorkflow(pack, "public_wf")!, inputSchema: { type: "object", properties: { text: {} }, required: ["text"], additionalProperties: false } };
-  assert.deepEqual(validateWorkflowInputs(wf, { text: "x" }), []);
-  assert.ok(validateWorkflowInputs(wf, {}).some((e) => e.includes("text")));
-  assert.ok(validateWorkflowInputs(wf, { text: "x", extra: 1 }).some((e) => e.includes("extra")));
+  const wf = {
+    ...getWorkflow(pack, "public_wf")!,
+    inputSchema: {
+      type: "object",
+      properties: {
+        text: { type: "string", minLength: 2 },
+        mode: { type: "string", enum: ["fast", "slow"] },
+        count: { type: "integer", minimum: 1 },
+        tags: { type: "array", items: { type: "string" } },
+        nested: { type: "object", properties: { depth: { type: "integer" } }, required: ["depth"] }
+      },
+      required: ["text"],
+      additionalProperties: false
+    }
+  };
+  assert.deepEqual(validateWorkflowInputs(wf, { text: "xy", mode: "fast", count: 2, tags: ["a"], nested: { depth: 1 } }), []);
+  // Missing required (the message names the field).
+  assert.ok(validateWorkflowInputs(wf, {}).some((e) => e.message.includes("text")));
+  // Unknown input (additionalProperties=false) - reported at the root with
+  // the field name in the message.
+  assert.ok(validateWorkflowInputs(wf, { text: "xy", extra: 1 }).some((e) => e.message.includes("extra")));
+  // enum violation.
+  assert.ok(validateWorkflowInputs(wf, { text: "xy", mode: "turbo" }).some((e) => e.path.includes("mode")));
+  // type violation (count must be an integer).
+  assert.ok(validateWorkflowInputs(wf, { text: "xy", count: "2" }).some((e) => e.path.includes("count")));
+  // minimum violation.
+  assert.ok(validateWorkflowInputs(wf, { text: "xy", count: 0 }).some((e) => e.path.includes("count")));
+  // Nested required.
+  assert.ok(validateWorkflowInputs(wf, { text: "xy", nested: {} }).some((e) => e.message.includes("depth")));
+  // Array item type.
+  assert.ok(validateWorkflowInputs(wf, { text: "xy", tags: [1] }).some((e) => e.path.includes("tags")));
 });
 
-test("runWorkflow rejects internal workflows", async () => {
+test("runWorkflow rejects a legacy 'internal' workflow (visibility removed from the schema)", async () => {
   const pack = makePack();
-  const wf = getWorkflow(pack, "internal_wf")!;
+  const wf = { ...getWorkflow(pack, "public_wf")!, visibility: "internal" as never };
   await assert.rejects(
-    () => runWorkflow({ pack, workflow: wf, inputs: {}, profile: {} as never, dispatch: async () => ({}), expectDeps: {} as never }),
+    () => runWorkflow({ pack, workflow: wf, inputs: {}, profile: {} as never, ctx: { dispatch: async () => ({}), expectDeps: {} as never } }),
     (error: unknown) => {
       assert.ok(error instanceof McpUiError);
       assert.equal(error.code, "WORKFLOW_INTERNAL");
@@ -88,7 +109,7 @@ test("runWorkflow rejects internal workflows", async () => {
   );
 });
 
-test("runWorkflow rejects invalid inputs before execution", async () => {
+test("runWorkflow rejects invalid inputs before execution with WORKFLOW_INPUT_INVALID", async () => {
   const pack = makePack();
   const wf = { ...getWorkflow(pack, "public_wf")!, inputSchema: { type: "object", properties: { text: {} }, required: ["text"], additionalProperties: false } };
   let dispatched = 0;
@@ -96,12 +117,16 @@ test("runWorkflow rejects invalid inputs before execution", async () => {
     () => runWorkflow({
       pack, workflow: wf, inputs: {},
       profile: { id: "fixture", displayName: "F", processNames: [], controls: {} },
-      dispatch: async () => { dispatched++; return {}; },
-      expectDeps: { getUiElement: async () => ({ found: false, element: null, elapsedMs: 1 }), queryUi: async () => ({ found: false, count: 0, elements: [], truncated: false, visitedNodes: 0, elapsedMs: 1 }) }
+      ctx: {
+        dispatch: async () => { dispatched++; return {}; },
+        expectDeps: { getUiElement: async () => ({ found: false, element: null, elapsedMs: 1 }), queryUi: async () => ({ found: false, count: 0, elements: [], truncated: false, visitedNodes: 0, elapsedMs: 1 }) }
+      }
     }),
     (error: unknown) => {
       assert.ok(error instanceof McpUiError);
-      assert.equal(error.code, "INVALID_WORKFLOW_INPUTS");
+      assert.equal(error.code, "WORKFLOW_INPUT_INVALID");
+      const details = error.details as { validationErrors?: Array<{ path: string }> };
+      assert.ok(Array.isArray(details?.validationErrors), "structured validationErrors are returned");
       return true;
     }
   );
@@ -116,13 +141,15 @@ test("runWorkflow executes steps and returns exports + runId", async () => {
     workflow: wf,
     inputs: {},
     profile: { id: "fixture", displayName: "F", processNames: [], controls: {} },
-    dispatch: async (tool) => {
-      assert.equal(tool, "read_clipboard");
-      return { available: true, text: "wf-marker", length: 9, timestamp: "t" };
-    },
-    expectDeps: {
-      getUiElement: async () => ({ found: false, element: null, elapsedMs: 1 }),
-      queryUi: async () => ({ found: false, count: 0, elements: [], truncated: false, visitedNodes: 0, elapsedMs: 1 })
+    ctx: {
+      dispatch: async (tool) => {
+        assert.equal(tool, "read_clipboard");
+        return { available: true, text: "wf-marker", length: 9, timestamp: "t" };
+      },
+      expectDeps: {
+        getUiElement: async () => ({ found: false, element: null, elapsedMs: 1 }),
+        queryUi: async () => ({ found: false, count: 0, elements: [], truncated: false, visitedNodes: 0, elapsedMs: 1 })
+      }
     }
   });
   assert.equal(result.success, true);
@@ -135,7 +162,7 @@ test("runWorkflow rejects unknown tools before execution", async () => {
   const pack = makePack();
   const wf = { ...getWorkflow(pack, "public_wf")!, steps: [{ id: "a", tool: "not_a_tool", args: {} }] };
   await assert.rejects(
-    () => runWorkflow({ pack, workflow: wf, inputs: {}, profile: {} as never, dispatch: async () => ({}), expectDeps: {} as never }),
+    () => runWorkflow({ pack, workflow: wf, inputs: {}, profile: {} as never, ctx: { dispatch: async () => ({}), expectDeps: {} as never } }),
     (error: unknown) => {
       assert.ok(error instanceof McpUiError);
       assert.equal(error.code, "UNKNOWN_TOOL");
@@ -157,13 +184,17 @@ test("workflow ${pack.id} is injected server-side", async () => {
     workflow: wf,
     inputs: {},
     profile: { id: "fixture", displayName: "F", processNames: [], controls: {} },
-    dispatch: async (tool, args) => {
-      assert.equal((args as { tag?: string }).tag, "fixture");
-      return { available: true, text: (args as { tag?: string }).tag ?? "", length: 1, timestamp: "t" };
-    },
-    expectDeps: {
-      getUiElement: async () => ({ found: false, element: null, elapsedMs: 1 }),
-      queryUi: async () => ({ found: false, count: 0, elements: [], truncated: false, visitedNodes: 0, elapsedMs: 1 })
+    ctx: {
+      pack: { id: "fixture", actions: { contracts: [] }, profile: { id: "fixture", displayName: "F", processNames: [], controls: {} }, version: "1.0.0" },
+      dispatch: async (tool, args) => {
+        assert.equal(tool, "read_clipboard");
+        assert.equal((args as { tag?: string }).tag, "fixture");
+        return { available: true, text: (args as { tag?: string }).tag ?? "", length: 1, timestamp: "t" };
+      },
+      expectDeps: {
+        getUiElement: async () => ({ found: false, element: null, elapsedMs: 1 }),
+        queryUi: async () => ({ found: false, count: 0, elements: [], truncated: false, visitedNodes: 0, elapsedMs: 1 })
+      }
     }
   });
   assert.equal(result.success, true);

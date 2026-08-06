@@ -131,6 +131,72 @@ export function emptyInteractionReport(requestedMode: InteractionMode, foregroun
 
 // ── Background policy helpers ──
 
+// CENTRAL background policy table for the generic tool set. This is the
+// SINGLE source of truth used by the pipeline background preflight
+// (backgroundUnsafeSteps), so no entry point can disagree about whether a
+// tool may run in background mode.
+//
+// Classification principles:
+//   safe                - read-only UIA queries / pure state reads; no
+//                         activation, no global input, no capture.
+//   bestEffort          - usually works in background but may fail depending
+//                         on the app / provider (PrintWindow capture, UIA
+//                         pattern actions, targeted posted input). Failures
+//                         surface as errors, never auto-upgraded.
+//   foregroundRequired  - depends on the current foreground window / focus
+//                         (global keyboard input via SendInput, physical
+//                         cursor, screen-region capture of arbitrary
+//                         occluders). Rejected up front in background mode.
+//
+// A step's explicit noActivate:true converts bestEffort posted-input tools to
+// allowed - but it NEVER upgrades a foregroundRequired tool (a posted key
+// still needs the right focus state; screen capture still needs visibility).
+const TOOL_BACKGROUND_POLICY: Record<string, BackgroundPolicy> = {
+  // Process/window lifecycle.
+  launch_app: "bestEffort", // noActivate launch is background-friendly; activate-less spawns can self-activate
+  profile_launch: "bestEffort", // pack-declared launch; background presentation is best-effort
+  wait_for_window: "safe",
+  list_windows: "safe",
+  get_window_state: "safe",
+  close_app: "bestEffort",
+  // Capture.
+  capture_window: "bestEffort", // PrintWindow works occluded; 'screen' needs visibility
+  capture_screen_region: "foregroundRequired", // copies whatever is on screen - occluders captured instead of the target
+  // Input.
+  type_text: "foregroundRequired", // SendInput Unicode needs focus (noActivate:true posts WM_CHAR -> bestEffort)
+  send_key: "foregroundRequired", // keybd_event needs focus (noActivate:true posts WM_KEYDOWN/UP -> bestEffort)
+  click_window: "bestEffort", // targeted PostMessage to a window
+  click_menu_item: "bestEffort", // targeted menu invocation
+  move_mouse_window: "bestEffort", // posts WM_MOUSEMOVE (no physical cursor)
+  read_clipboard: "safe",
+  write_clipboard: "bestEffort", // may contend with the focused app's clipboard use
+  // UIA.
+  ui_inspect_tree: "safe",
+  ui_query: "safe",
+  ui_get: "safe",
+  ui_wait: "safe",
+  ui_catalog: "safe",
+  ui_action: "bestEffort", // UIA pattern actions usually work unfocused; coordinate fallback needs visibility
+  // Profile layer.
+  profile_list: "safe",
+  profile_resolve: "safe",
+  profile_action: "bestEffort", // pack-declared backgroundPolicy refines this
+  // Pack / contract discovery.
+  app_pack_list: "safe",
+  app_pack_describe: "safe",
+  app_pack_validate: "safe",
+  app_pack_reload: "safe",
+  app_pack_probe: "bestEffort", // inspects a live app's UI
+  workflow_catalog: "safe",
+  tool_contract_list: "safe",
+  tool_contract_describe: "safe"
+};
+
+// The base background policy of a generic tool (before pack overrides).
+export function toolBackgroundPolicy(tool: string): BackgroundPolicy | undefined {
+  return TOOL_BACKGROUND_POLICY[tool];
+}
+
 // Look up the pack action contract's backgroundPolicy. Undefined means the
 // pack made no claim (treated as "no verified constraint": allowed in
 // background, failures surface normally).
@@ -153,10 +219,14 @@ export function stepBackgroundPolicy(
   step: { tool: string; args?: Record<string, unknown> }
 ): BackgroundPolicy | undefined {
   const args = step.args ?? {};
-  if ((step.tool === "send_key" || step.tool === "type_text") && args.noActivate !== true) {
-    return "foregroundRequired";
+  // Global keyboard input without noActivate depends on focus: the posted-
+  // message variant (noActivate:true) is a bestEffort targeted input instead.
+  if ((step.tool === "send_key" || step.tool === "type_text")) {
+    return args.noActivate === true ? "bestEffort" : "foregroundRequired";
   }
-  return backgroundPolicyForAction(actions, args.control as string | undefined, args.action as string | undefined);
+  const actionPolicy = backgroundPolicyForAction(actions, args.control as string | undefined, args.action as string | undefined);
+  if (actionPolicy) return actionPolicy;
+  return toolBackgroundPolicy(step.tool);
 }
 
 export type UnsafeStep = {

@@ -141,7 +141,7 @@ $env:SCREENSHOT_MCP_APP_PACK_DIRS = "X:\Private\AppPacks;D:\Team\AppPacks"
 要点：
 
 - `id` 必须匹配 `^[a-z][a-z0-9._-]{0,63}$`，与 profile.json 一致。
-- `catalogVisibility`：`session`（对客户端可见）/ `hidden`（知道 id 可调用，不列出）/ `internal`（仅 Pack 内部工作流可用）。
+- `catalogVisibility`：`session`（对客户端可见）/ `hidden`（知道 id 可调用，不列出）。`internal` 已移除（无组合引擎，internal 不可达）。
 - selector 支持 `automationId` / `name` / `controlType` / `className` / `frameworkId` + `match`（exact/contains/regex）+ `ancestor` / `path` / `index`。
 - confidence 支持 `stable` / `conditionally-stable` / `fragile` / `source-derived` / `runtime-verified` / `unsupported` / `action-limited`。
 - 菜单类控件用 `menu` hints 声明：`opensSubmenu`（键盘 Right 打开子菜单）、`invokeMode:"keyboard-enter"`（模态对话框命令的非阻塞触发）、`panelControl`（接收键盘事件的菜单面板窗口）、`sectionControl`（openMenu 枚举 section 的 selector）。
@@ -191,11 +191,11 @@ $env:SCREENSHOT_MCP_APP_PACK_DIRS = "X:\Private\AppPacks;D:\Team\AppPacks"
 { "pack": "example-app", "workflow": "open_settings", "inputs": {} }
 ```
 
-- 输入按 workflow 的 `inputSchema` 校验（required / additionalProperties）。
+- 输入按 workflow 的 `inputSchema` 完整校验（type / required / enum / minimum / maximum / minLength / maxLength / pattern / 嵌套对象 / 数组 items / additionalProperties），错误返回 `WORKFLOW_INPUT_INVALID` + `validationErrors:[{path,message}]`；校验使用与工具 outputSchema 相同的统一 Schema 校验器，不存在第二套手写 workflow 校验器。
 - `${pack.id}` 服务端注入；`${inputs.x}` 引用工作流输入。
 - Pack 的 `defaultExpect` 自动生效；步骤可引用前序步骤：`${launch.pid}`。
 - 返回 `runId`、命名步骤结果、`exports`、`finallyResults`。
-- `internal` 可见性的工作流只能被 Pack 内部工作流调用，直接调用返回 `WORKFLOW_INTERNAL`。
+- `internal` 可见性**已移除**（没有组合引擎时 internal 工作流不可达）：`visibility` 只接受 `session` / `hidden`；声明 `internal` 的 Pack 在加载时被拒绝。
 
 ## profile_run_steps
 
@@ -278,6 +278,12 @@ $env:SCREENSHOT_MCP_APP_PACK_DIRS = "X:\Private\AppPacks;D:\Team\AppPacks"
   **预检同时覆盖主流程 steps 与 finally**：即使 finally 含强制前台步骤，整条管道也会在
   启动应用/执行第一步之前被拒绝。`continue_run` 续跑前对剩余主步骤和 finally 使用同一套预检。
   `bestEffort` 步骤允许执行，运行时失败再返回明确错误。禁止执行到中途突然抢前台。
+- **集中后台策略表**：通用工具的 backgroundPolicy 由单一策略表定义（只读 UIA 查询 = `safe`；
+  UIA Pattern 操作 / PrintWindow 截图 / 定向 PostMessage / 剪贴板 / 启动 = `bestEffort`；
+  屏幕区域截图与全局键盘输入 = `foregroundRequired`）。步骤显式 `noActivate:true` 把
+  `send_key` / `type_text` 从 foregroundRequired 降为 bestEffort（允许后台执行），但**绝不**
+  把全局输入错误标成 safe。`workflow_catalog` 的后台能力与运行时使用同一套计算
+  （`backgroundUnsafePipelineSteps`，同时检查 steps 与 finally），目录与预检永远不会不一致。
 - 后台截图空白帧 → `BACKGROUND_CAPTURE_UNAVAILABLE`（不自动置顶重试）。
 - 后台启动时若应用自身抢前台，核心尝试恢复原前台窗口并如实报告
   `foregroundChanged:true` / `foregroundRestored:true`；无法恢复时返回 warning，绝不谎报。
@@ -359,7 +365,7 @@ restorePreviousForeground / stepDelayMs / allowForegroundFallback），不根据
 { "runId": "run_abc123", "continueFrom": "openSettings" }
 ```
 
-续接前检查：run 未过期（内存保留 10 分钟，最多 20 个）→ Pack 版本未变（`RUN_PACK_VERSION_CHANGED`）→ 进程仍存在（`RUN_PROCESS_EXITED`）→ HWND 仍有效（`RUN_WINDOW_RECREATED`）→ 快照可续接（`RUN_NOT_CONTINUABLE`）。续接从失败步骤重放，已完成步骤的**最小投影**（后续步骤引用的字段 + pipe-safe 字段 + exports）复用，不重复执行、不保存完整原始结果。超大的快照（含被引用的巨型字段）如实标记 `continuable:false` + `continuationReason:"RUN_SNAPSHOT_TRUNCATED"`，绝不伪装成可恢复。
+续接前检查：run 未过期（内存保留 10 分钟，最多 20 个）→ Pack 版本未变（`RUN_PACK_VERSION_CHANGED`）→ **进程仍存在且窗口仍有效**（`RUN_PROCESS_EXITED` / `RUN_WINDOW_RECREATED` / `RUN_WINDOW_UNAVAILABLE`——进程存活用 OpenProcess/GetExitCodeProcess 真实查询，绝不用"是否还有顶层窗口"代表进程存活）→ 快照可续接（`RUN_NOT_CONTINUABLE`）。续接从失败步骤重放，已完成步骤的**最小投影**（后续步骤引用的字段 + pipe-safe 字段 + exports）复用，不重复执行、不保存完整原始结果。超大的快照（含被引用的巨型字段）如实标记 `continuable:false` + `continuationReason:"RUN_SNAPSHOT_TRUNCATED"`，绝不伪装成可恢复。
 
 ### 续跑的统一生命周期
 
@@ -371,11 +377,11 @@ restorePreviousForeground / stepDelayMs / allowForegroundFallback），不根据
 
 ## 输出 Schema 与 structuredContent
 
-每个工具在 `src/contracts.ts` 有统一 `ToolContract`：`description`、`inputSchema`、`outputSchema`、`pipeSafeFields`、`annotations`（readOnly / destructive / idempotent / retrySafe / needsExpect）。
+每个工具在 `src/contracts.ts` 有统一 `ToolContract`：`description`、`inputSchema`、`outputSchema`、`pipeSafeFields`、`annotations`（readOnly / destructive / idempotent / retrySafe / needsExpect）。**Schema 校验是结构性子集**（type / required / properties / items / enum / anyOf / additionalProperties / minimum / maximum / minLength / maxLength / pattern），并非完整 JSON Schema 实现；未声明的关键字被忽略，额外字段默认允许。
 
 稳定公共输出字段：`schemaVersion / success / pid / hwnd / title / found / count / element / elements / value / matched / timedOut / code / message / details`。
 
-- 工具成功结果同时返回 `content`（JSON 文本，保持兼容）与 `structuredContent`（机器可读对象）。
+- 工具成功结果同时返回 `content`（JSON 文本，保持兼容）与 `structuredContent`（机器可读对象）。业务错误同样结构化：`isError:true` + text 内容（旧客户端兼容）+ `structuredContent:{ success:false, error:{ code, message, details } }`。
 - 管道中每个步骤的结果都会用该工具的 `outputSchema` 做运行时校验，不符合返回 `TOOL_OUTPUT_SCHEMA_MISMATCH`，**无效结果不会流入后续步骤**。
 - **数组工具的 canonical 输出**：`list_windows` / `profile_list` / `app_pack_list` / `workflow_catalog` / `tool_contract_list` 等数组型工具在普通调用、structuredContent、管道步骤结果、exports 与 run snapshot 中**统一返回 `{ items: [...] }`**，与 `tools/list` 的 outputSchema 完全一致：`${step.items.0.hwnd}` 可静态验证并运行。旧的 `${0.0.hwnd}` 裸数组引用保持兼容（引用解析器自动把顶层数字段映射到 `items.N`）。
 
@@ -417,7 +423,11 @@ npm run smoke:private-app-pack    # 私有 Pack 驱动（读 SCREENSHOT_MCP_TEST
 - 环境前提：键盘类步骤（type_text / send_key）依赖前台焦点。残留的编辑器实例（多个同进程名窗口）或前台全屏程序会抢占焦点并拉低 first-attempt 成功率（实测：清理残留实例后 20/20）。
 - 真实不同模型的自主生成成功率需要单独评测：仅凭公开工具契约构造合法管道由 `smoke:public-contract-pipeline` 证明——该测试不导入任何 `src/` 实现，只通过 MCP 客户端读取契约并构造、校验、执行管道。
 
-热重载：默认启用（`SCREENSHOTTOOL_HOT_RELOAD=0` 关闭）。修改 `src/` 或 `scripts/win-capture.ps1` 后无需重启。
+热重载边界：默认启用（`SCREENSHOTTOOL_HOT_RELOAD=0` 关闭），但**只对实际动态加载的模块生效**：
+`src/schemas.ts`、`src/windows.ts`、`src/profiles/registry.ts` 与 `scripts/win-capture.ps1`。
+修改其他核心源码（pipeline / contracts / executor / app-packs / interaction 等）后**建议重启 MCP
+服务器**——这些模块是静态导入的，运行中不承诺热重载，混合新旧模块状态不受支持。
+App Pack JSON 通过 `app_pack_reload` 独立热重载。
 
 ## 限制（真实，已实机确认）
 

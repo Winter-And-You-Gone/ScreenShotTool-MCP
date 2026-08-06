@@ -6,10 +6,14 @@
 // returned (TOOL_OUTPUT_SCHEMA_MISMATCH otherwise). Invalid results never flow
 // into later steps, exports, run snapshots, or structuredContent.
 //
-// This module implements a small structural JSON-Schema subset validator
-// (type / required / properties / items / enum / anyOf) - enough for the
-// contract table in contracts.ts - that reports STRUCTURED errors
-// ({path, message}) instead of a single message string.
+// This module implements a STRUCTURAL JSON-Schema SUBSET validator - NOT a
+// full JSON Schema implementation. Supported keywords: type / required /
+// properties / items / enum / anyOf / additionalProperties / minimum /
+// maximum / minLength / maxLength / pattern. Unknown keywords are ignored and
+// extra properties beyond the declared ones are allowed unless
+// additionalProperties:false. The same validator is used for workflow
+// inputSchema checks, so the supported subset is the contract for pack
+// workflows too.
 
 import type { JsonSchema } from "./contracts.js";
 
@@ -109,6 +113,34 @@ function validateNode(
     }
   }
 
+  // Numeric bounds (minimum/maximum) and string constraints (minLength /
+  // maxLength / pattern) - the subset used by workflow inputSchemas.
+  if (typeof value === "number" && !Number.isNaN(value)) {
+    if (schema.minimum !== undefined && value < schema.minimum) {
+      fail(`value at ${path} must be >= ${schema.minimum}`);
+    }
+    if (schema.maximum !== undefined && value > schema.maximum) {
+      fail(`value at ${path} must be <= ${schema.maximum}`);
+    }
+  }
+  if (typeof value === "string") {
+    if (schema.minLength !== undefined && value.length < schema.minLength) {
+      fail(`value at ${path} must be at least ${schema.minLength} characters`);
+    }
+    if (schema.maxLength !== undefined && value.length > schema.maxLength) {
+      fail(`value at ${path} must be at most ${schema.maxLength} characters`);
+    }
+    if (schema.pattern !== undefined) {
+      try {
+        if (!new RegExp(schema.pattern).test(value)) {
+          fail(`value at ${path} does not match pattern /${schema.pattern}/`);
+        }
+      } catch {
+        // Invalid pattern in the schema: treated as no constraint.
+      }
+    }
+  }
+
   if (Array.isArray(value) && schema.items) {
     for (let i = 0; i < value.length; i++) {
       if (!validateNode(value[i], schema.items, `${path}[${i}]`, errors, rootSchema)) valid = false;
@@ -125,6 +157,13 @@ function validateNode(
     for (const key of schema.required ?? []) {
       if (record[key] === undefined) {
         fail(`missing required field '${path}.${key}'`);
+      }
+    }
+    if (schema.additionalProperties === false) {
+      for (const key of Object.keys(record)) {
+        if (record[key] !== undefined && !schema.properties[key]) {
+          fail(`unexpected field '${path}.${key}' (additionalProperties=false)`);
+        }
       }
     }
   }

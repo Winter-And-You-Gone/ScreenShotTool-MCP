@@ -134,14 +134,19 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       throw error;
     }
     if (error instanceof McpUiError) {
+      // Structured errors: isError + text content (legacy clients) +
+      // structuredContent (machine-readable { success, error: { code,
+      // message, details } }).
+      const structured = { success: false, error: { code: error.code, message: error.message, ...(error.details !== undefined ? { details: error.details } : {}) } };
       return {
         isError: true,
         content: [
           {
             type: "text",
-            text: JSON.stringify({ success: false, code: error.code, message: error.message, details: error.details ?? {} }, null, 2)
+            text: JSON.stringify(structured, null, 2)
           }
-        ]
+        ],
+        structuredContent: structured
       };
     }
     return {
@@ -354,7 +359,27 @@ function packContext(packId: string): { id: string; actions: import("./app-packs
   return { id: pack.manifest.id, actions: pack.actions, profile, version: pack.manifest.version };
 }
 
-function pipelineExecutionContext(runtime: RuntimeModules, uiaDeps: UiaDeps, packId?: string): ExecutionContext {
+// The SINGLE pipeline ExecutionContext factory. Every high-level entry
+// (run_steps / profile_run_steps / run_workflow / continue_run / internal
+// workflow execution) builds its context through this function - no entry
+// hand-assembles the object literal. Unified pieces: dispatch (through the
+// unified executor), contract table, profile registry, App Pack registry,
+// foreground reads, interaction context, run store, and clock/deadline.
+export type PipelineContextOptions = {
+  runtime: RuntimeModules;
+  uiaDeps: UiaDeps;
+  packId?: string;
+  // Resolved interaction mode (explicit > workflow > pack default > auto).
+  interactionMode?: InteractionMode;
+  interaction?: ExecutionContext["interaction"];
+  // Window/process context auto-injected into steps (profile_run_steps).
+  autoContext?: ExecutionContext["autoContext"];
+  // Workflow inputs (${inputs.x}).
+  inputs?: Record<string, unknown>;
+};
+
+export function createPipelineExecutionContext(options: PipelineContextOptions): ExecutionContext {
+  const { runtime, uiaDeps, packId } = options;
   const executor = makeExecutor(runtime, uiaDeps);
   return {
     dispatch: (tool, toolArgs) => executeValidatedTool(tool, toolArgs, executor),
@@ -371,7 +396,11 @@ function pipelineExecutionContext(runtime: RuntimeModules, uiaDeps: UiaDeps, pac
     expectDeps: {
       getUiElement: (i) => uiaDeps.getUiElement(i),
       queryUi: (i) => uiaDeps.queryUi(i)
-    }
+    },
+    interactionMode: options.interactionMode,
+    ...(options.interaction ? { interaction: options.interaction } : {}),
+    ...(options.autoContext ? { autoContext: options.autoContext } : {}),
+    ...(options.inputs ? { inputs: options.inputs } : {})
   };
 }
 
@@ -404,11 +433,12 @@ async function runStepsTool(args: unknown, runtime: RuntimeModules, uiaDeps: Uia
   // actions inside the pipeline resolve the same default individually, so the
   // pipeline-level preflight must match). Otherwise auto.
   const mode: InteractionMode = input.interactionMode ?? stepsPackDefault(input.steps) ?? "auto";
-  const result = await runPipeline(input, {
-    ...pipelineExecutionContext(runtime, uiaDeps),
+  const result = await runPipeline(input, createPipelineExecutionContext({
+    runtime,
+    uiaDeps,
     interactionMode: mode,
-    interaction: input.foregroundDemo
-  });
+    ...(input.foregroundDemo ? { interaction: input.foregroundDemo } : {})
+  }));
   return withRunTtl(result);
 }
 
@@ -520,21 +550,17 @@ async function profileRunStepsTool(args: unknown, runtime: RuntimeModules, uiaDe
       captureBefore: input.captureBefore,
       maxTotalMs: input.maxTotalMs
     },
-    {
-      dispatch: (tool, toolArgs) => executeValidatedTool(tool, toolArgs, makeExecutor(runtime, uiaDeps)),
-      pack: { id: pack.manifest.id, actions: pack.actions, profile, version: pack.manifest.version },
-      autoContext,
-      expectDeps: {
-        getUiElement: (i) => uiaDeps.getUiElement(i),
-        queryUi: (i) => uiaDeps.queryUi(i)
-      },
+    createPipelineExecutionContext({
+      runtime,
+      uiaDeps,
+      packId: pack.manifest.id,
       interactionMode: mode,
       interaction: {
         ...(foregroundDemo ?? {}),
         ...(launchResult.interaction.foregroundBefore ? { foregroundBefore: launchResult.interaction.foregroundBefore } : {})
       },
-      restoreForeground: (hwnd) => runtime.windows.restoreForegroundWindow(hwnd)
-    }
+      autoContext
+    })
   );
 
   return {
@@ -592,14 +618,13 @@ async function runWorkflowTool(args: unknown, runtime: RuntimeModules, uiaDeps: 
     workflow,
     inputs: input.inputs ?? {},
     profile,
-    dispatch: (tool, toolArgs) => executeValidatedTool(tool, toolArgs, makeExecutor(runtime, uiaDeps)),
-    expectDeps: {
-      getUiElement: (i) => uiaDeps.getUiElement(i),
-      queryUi: (i) => uiaDeps.queryUi(i)
-    },
-    interactionMode: mode,
-    interaction: foregroundDemo,
-    restoreForeground: (hwnd) => runtime.windows.restoreForegroundWindow(hwnd)
+    ctx: createPipelineExecutionContext({
+      runtime,
+      uiaDeps,
+      packId: pack.manifest.id,
+      interactionMode: mode,
+      ...(foregroundDemo ? { interaction: foregroundDemo } : {})
+    })
   });
   return { ...withRunTtl(result), pack: input.pack, workflow: input.workflow };
 }
@@ -655,23 +680,27 @@ async function continueRunTool(args: unknown, runtime: RuntimeModules, uiaDeps: 
   const result = await continuePipeline({
     runId: input.runId,
     continueFrom: input.continueFrom,
-    ctx: {
-      ...pipelineExecutionContext(runtime, uiaDeps, snapshot.packId),
+    ctx: createPipelineExecutionContext({
+      runtime,
+      uiaDeps,
+      packId: snapshot.packId,
       interactionMode: resolved.mode,
       ...(resolved.interaction ? { interaction: resolved.interaction } : {})
-    },
+    }),
+    // REAL process + window liveness (OpenProcess/GetExitCodeProcess in the
+    // helper), never "still has a top-level window" as a proxy for alive.
     checkProcessAlive: async (pid) => {
       try {
-        const wins = await runtime.windows.listWindows({ pid });
-        return wins.length > 0;
+        const r = await runtime.windows.checkProcessAlive({ pid });
+        return r.processAlive;
       } catch {
         return false;
       }
     },
     checkHwndValid: async (hwnd) => {
       try {
-        await runtime.windows.getWindowState({ hwnd });
-        return true;
+        const r = await runtime.windows.checkProcessAlive({ hwnd });
+        return r.windowAlive;
       } catch {
         return false;
       }
@@ -832,7 +861,15 @@ async function dispatchToolValue(
   }
 }
 
-// ── Runtime loading (hot reload) ──
+// ── Runtime loading ──
+//
+// HOT-RELOAD BOUNDARY: only the modules below are dynamically loaded and may
+// hot-reload at runtime (schemas / windows / profiles-registry, plus the
+// PowerShell helper). Everything else in src/ (pipeline, contracts, executor,
+// app-packs, interaction, ...) is imported statically and requires a server
+// restart to pick up changes - modifying it while the server runs is NOT
+// supported and may produce mixed old/new module state. App Pack JSON is
+// reloaded independently via app_pack_reload.
 
 async function loadRuntime(): Promise<RuntimeModules> {
   const version = hotReloadEnabled ? await runtimeVersion() : "static";
@@ -856,6 +893,9 @@ async function loadRuntime(): Promise<RuntimeModules> {
 const RUNTIME_VERSION_CACHE_MS = 1000;
 let cachedRuntimeVersion: { value: string; expiresAt: number } | null = null;
 
+// Version = mtimes of EXACTLY the modules that are dynamically loaded (the
+// hot-reload boundary). pipeline/contracts/executor/app-packs are NOT
+// tracked: they are statically imported and require a restart.
 async function runtimeVersion(): Promise<string> {
   if (cachedRuntimeVersion && cachedRuntimeVersion.expiresAt > Date.now()) {
     return cachedRuntimeVersion.value;
@@ -866,8 +906,6 @@ async function runtimeVersion(): Promise<string> {
     path.join(moduleRoot, `schemas${sourceExt}`),
     path.join(moduleRoot, `windows${sourceExt}`),
     path.join(moduleRoot, "profiles", `registry${sourceExt}`),
-    path.join(moduleRoot, `contracts${sourceExt}`),
-    path.join(moduleRoot, `pipeline${sourceExt}`),
     path.join(runtimeRoot, "scripts", "win-capture.ps1")
   ];
   const versions = await Promise.all(files.map(async (file) => `${path.basename(file)}:${await fileMtimeMs(file)}`));

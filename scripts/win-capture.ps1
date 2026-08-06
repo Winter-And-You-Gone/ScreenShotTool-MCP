@@ -80,6 +80,18 @@ namespace ScreenshotTool {
     [DllImport("user32.dll", CharSet = CharSet.Unicode, EntryPoint = "GetClassNameW", SetLastError = true)]
     public static extern int GetClassName(IntPtr hWnd, StringBuilder lpClassName, int nMaxCount);
 
+    [DllImport("kernel32.dll", SetLastError = true)]
+    public static extern IntPtr OpenProcess(uint dwDesiredAccess, bool bInheritHandle, uint dwProcessId);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    public static extern bool GetExitCodeProcess(IntPtr hProcess, out uint lpExitCode);
+
+    [DllImport("kernel32.dll")]
+    public static extern bool CloseHandle(IntPtr hObject);
+
+    public const uint PROCESS_QUERY_LIMITED_INFORMATION = 0x1000;
+    public const uint STILL_ACTIVE = 259;
+
     [DllImport("user32.dll")]
     public static extern bool SetProcessDPIAware();
 
@@ -2189,6 +2201,54 @@ function Write-Clipboard {
   }
 }
 
+# REAL process liveness: OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION) +
+# GetExitCodeProcess. A process is dead when the handle cannot be opened or
+# the exit code is not STILL_ACTIVE (259). Never inferred from window
+# presence - a windowless process is alive, and a stale HWND can outlive its
+# owner process. (NOTE: $Pid is a read-only PowerShell automatic variable, so
+# the parameter is named ProcessId.)
+function Test-ProcessAlive {
+  param([int]$ProcessId)
+
+  if ($ProcessId -le 0) { return $false }
+  $handle = [ScreenshotTool.Native]::OpenProcess([ScreenshotTool.Native]::PROCESS_QUERY_LIMITED_INFORMATION, $false, [uint32]$ProcessId)
+  if ($handle -eq [IntPtr]::Zero) { return $false }
+  try {
+    $exitCode = [uint32]0
+    if (-not [ScreenshotTool.Native]::GetExitCodeProcess($handle, [ref]$exitCode)) { return $false }
+    return ($exitCode -eq [ScreenshotTool.Native]::STILL_ACTIVE)
+  } finally {
+    [ScreenshotTool.Native]::CloseHandle($handle) | Out-Null
+  }
+}
+
+# Resolve a raw HWND string/number to a window record, or $null when the
+# handle is no longer a valid window (IsWindow check).
+function Get-WindowByHandle {
+  param([string]$Hwnd)
+
+  $h = [IntPtr]::Zero
+  try { $h = [IntPtr]([int64]$Hwnd) } catch { return $null }
+  if ($h -eq [IntPtr]::Zero) { return $null }
+  if (-not [ScreenshotTool.Native]::IsWindow($h)) { return $null }
+  $rect = New-Object ScreenshotTool.Native+RECT
+  [ScreenshotTool.Native]::GetWindowRect($h, [ref]$rect) | Out-Null
+  $pidValue = [uint32]0
+  [ScreenshotTool.Native]::GetWindowThreadProcessId($h, [ref]$pidValue) | Out-Null
+  $sb = New-Object System.Text.StringBuilder 512
+  [ScreenshotTool.Native]::GetWindowText($h, $sb, $sb.Capacity) | Out-Null
+  $class = New-Object System.Text.StringBuilder 256
+  [ScreenshotTool.Native]::GetClassName($h, $class, $class.Capacity) | Out-Null
+  return @{
+    hwnd = $Hwnd
+    title = $sb.ToString()
+    pid = [int]$pidValue
+    processName = ""
+    className = $class.ToString()
+    rect = @{ x = $rect.Left; y = $rect.Top; width = ($rect.Right - $rect.Left); height = ($rect.Bottom - $rect.Top) }
+  }
+}
+
 function Get-WindowState {
   param([hashtable]$Target)
 
@@ -4149,6 +4209,23 @@ function Invoke-Action {
     }
     "get-window-state" {
       return Get-WindowState -Target $Request.target
+    }
+    "check-process-alive" {
+      # Real process-liveness check via OpenProcess/GetExitCodeProcess -
+      # NEVER inferred from "the process still has a top-level window"
+      # (a windowless process is alive; a window can belong to a dead
+      # process). Returns { processAlive, windowAlive, pid }.
+      $targetPid = $Request.target.pid
+      if ($null -eq $targetPid) { $targetPid = 0 }
+      $win = $null
+      if ($Request.target.hwnd -and $Request.target.hwnd -ne "") {
+        $win = Get-WindowByHandle $Request.target.hwnd
+      }
+      return @{
+        pid = [int]$targetPid
+        processAlive = (Test-ProcessAlive -ProcessId ([int]$targetPid))
+        windowAlive = ($null -ne $win)
+      }
     }
     "wait-for-window" {
       return Wait-ForWindow -Target $Request.target

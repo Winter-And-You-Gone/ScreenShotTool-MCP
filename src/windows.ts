@@ -249,6 +249,7 @@ type HelperRequest =
   | { action: "ui-action"; target: UiActionInput }
   | { action: "ui-wait"; target: Omit<UiWaitInput, "timeoutMs" | "pollIntervalMs"> & { timeoutMs?: number; pollIntervalMs?: number } }
   | { action: "get-exe-manifest-level"; exePath: string }
+  | { action: "check-process-alive"; target: { pid?: number; hwnd?: string } }
 
 export function getDefaultOutputDir(): string {
   return defaultOutputDir
@@ -272,6 +273,26 @@ export async function writeClipboard(input: WriteClipboardInput): Promise<WriteC
 
 export async function getWindowState(input: GetWindowStateInput): Promise<WindowStateResult> {
   return runHelper<WindowStateResult>({ action: "get-window-state", target: input })
+}
+
+export type ProcessAliveResult = {
+  pid: number;
+  processAlive: boolean;
+  windowAlive: boolean;
+};
+
+// REAL process liveness (OpenProcess/GetExitCodeProcess in the helper) plus
+// window validity (IsWindow). A process is NOT considered alive just because
+// a top-level window exists - and a window is NOT considered valid just
+// because a pid is alive. Pass pid and/or hwnd; each reported separately.
+export async function checkProcessAlive(input: { pid?: number; hwnd?: string | number }): Promise<ProcessAliveResult> {
+  return runHelper<ProcessAliveResult>({
+    action: "check-process-alive",
+    target: {
+      ...(input.pid !== undefined ? { pid: input.pid } : {}),
+      ...(input.hwnd !== undefined ? { hwnd: String(input.hwnd) } : {})
+    }
+  });
 }
 
 export async function waitForWindow(input: WaitForWindowInput): Promise<WaitForWindowResult> {

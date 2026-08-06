@@ -11,7 +11,10 @@ import type { BackgroundPolicy, InteractionMode, PackInteractionConfig } from ".
 
 // 4.1 manifest.json ---------------------------------------------------------
 
-export type CatalogVisibility = "session" | "hidden" | "internal";
+// NOTE: "internal" visibility was REMOVED (batch 2): no composition engine
+// exists, so an internal workflow would be unreachable. A pack that declares
+// `"visibility": "internal"` fails schema validation at load time.
+export type CatalogVisibility = "session" | "hidden";
 
 export type PackManifest = {
   schemaVersion: number;

@@ -101,7 +101,10 @@ export class AppPackRegistry {
           const t = profile.mainWindow.title.toLowerCase();
           if (profile.mainWindow.titleMatch === "regex") {
             try {
-              if (new RegExp(t).test(target.titleContains)) return pack;
+              // Case-insensitive via the flag ONLY - never by lowercasing the
+              // pattern source (a lowercased character class like [A-Z] or a
+              // case-sensitive escape would silently change semantics).
+              if (new RegExp(t, "i").test(target.titleContains)) return pack;
             } catch { /* ignore */ }
           } else if (t.includes(tc) || tc.includes(t)) {
             return pack;
