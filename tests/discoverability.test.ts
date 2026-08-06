@@ -28,6 +28,7 @@ import {
 } from "../src/targets.js";
 import { performProfileAction } from "../src/profiles/registry.js";
 import { projectElementFields } from "../src/windows.js";
+import { toolZodSchemas } from "../src/schemas.js";
 
 // ── 1. Error contract: business errors validate against outputSchema ──
 
@@ -85,6 +86,120 @@ test("profile_launch output schema includes targetRef", () => {
     contracts.profile_launch!.outputSchema
   );
   assert.equal(ok.ok, true, `targetRef result must validate: ${ok.reason}`);
+});
+
+test("profile_launch outputSchema requires targetRef in the success branch", () => {
+  const schema = contracts.profile_launch!.outputSchema;
+  // 1. The SUCCESS branch (first anyOf branch) requires targetRef.
+  const successBranch = unwrapToolError(schema)!;
+  assert.ok(successBranch.required?.includes("targetRef"), "targetRef must be required in the success branch");
+  assert.ok(successBranch.required?.includes("profile"), "profile stays required");
+  assert.ok(!successBranch.required?.includes("hwnd"), "hwnd must NOT be required (a launch may return only pid + targetRef)");
+
+  // 2. A success result missing targetRef must FAIL the schema.
+  const missingTargetRef = validateAgainstSchema(
+    {
+      profile: "x", pid: 1, startedByMcp: true, reused: false, uiaRootAvailable: true,
+      interaction: { requestedMode: "auto", effectiveMode: "background", foregroundChanged: false, targetActivated: false, physicalCursorMoved: false }
+    },
+    schema
+  );
+  assert.equal(missingTargetRef.ok, false, "a success result without targetRef must not validate");
+
+  // 3. A legal error envelope still validates (the withToolError wrapper).
+  const envelope = makeErrorEnvelope("PROFILE_NOT_FOUND", "No profile with id 'x'.", "Run app_pack_list to see which App Packs are loaded.");
+  const envelopeCheck = validateAgainstSchema(envelope, schema);
+  assert.equal(envelopeCheck.ok, true, "the error envelope must still validate: " + envelopeCheck.reason);
+
+  // 4. A success result WITH targetRef validates (covered by the first test
+  //    above; asserted again for the full shape including hwnd optionality).
+  const withTargetRef = validateAgainstSchema(
+    {
+      profile: "x", targetRef: "target_x_2", pid: 2, hwnd: "0x99", title: "x", startedByMcp: true, reused: false, uiaRootAvailable: true,
+      interaction: { requestedMode: "auto", effectiveMode: "background", foregroundChanged: false, targetActivated: false, physicalCursorMoved: false }
+    },
+    schema
+  );
+  assert.equal(withTargetRef.ok, true, "a success result with targetRef must validate: " + withTargetRef.reason);
+});
+
+// ── 2b. targetRef-aware vs unaware tool contract table ──
+
+// Tools whose runtime resolves targetRef (dispatch -> resolveTargetInput).
+const TARGET_REF_AWARE = [
+  "profile_action", "profile_resolve", "capture_window",
+  "ui_query", "ui_get", "ui_action", "ui_catalog", "ui_inspect_tree", "ui_wait"
+];
+
+// Low-level tools that share the window-selector shape but do NOT resolve
+// targetRef at runtime; they must not advertise it.
+const TARGET_REF_UNAWARE = [
+  "click_window", "move_mouse_window", "click_menu_item",
+  "type_text", "send_key", "get_window_state", "wait_for_window"
+];
+
+test("targetRef-aware tools accept targetRef alone and mention it in the missing-target message", () => {
+  // toolZodSchemas is statically imported above.
+  for (const tool of TARGET_REF_AWARE) {
+    const zodSchema = toolZodSchemas[tool];
+    const jsonSchema = contracts[tool]!.inputSchema as { properties?: Record<string, unknown>; anyOf?: unknown[] };
+
+    // 1. inputSchema contains targetRef (JSON exposure).
+    assert.ok(jsonSchema.properties?.targetRef, `${tool} JSON inputSchema must expose targetRef`);
+
+    // 2. Missing ALL target params -> the error message mentions targetRef.
+    //    Selector-requiring tools (ui_query/ui_get/ui_action/ui_wait) need a
+    //    selector to isolate the target-missing refine.
+    const base = tool === "profile_action" ? { profile: "p", control: "c", action: "invoke" }
+      : tool === "profile_resolve" ? { profile: "p", control: "c" }
+        : ["ui_query", "ui_get", "ui_action", "ui_wait"].includes(tool)
+          ? { selector: { controlType: "Button" }, ...(tool === "ui_action" ? { action: "invoke" } : {}), ...(tool === "ui_wait" ? { condition: "exists" } : {}) }
+          : {};
+    try {
+      zodSchema.parse(base);
+      assert.fail(`${tool} must reject a call with no target`);
+    } catch (error) {
+      const message = (error as Error).message;
+      assert.ok(message.includes("targetRef"), `${tool} missing-target message must mention targetRef, got: ${message.slice(0, 120)}`);
+    }
+
+    // 3. Passing ONLY targetRef passes the target-missing refine.
+    const parsed = zodSchema.parse({ ...base, targetRef: "target_p_1" });
+    assert.equal(parsed.targetRef, "target_p_1", `${tool} must accept targetRef alone`);
+
+    // 4. JSON anyOf exposes the targetRef branch first.
+    assert.deepEqual((jsonSchema.anyOf ?? [])[0], { required: ["targetRef"] }, `${tool} anyOf must allow targetRef`);
+  }
+});
+
+test("targetRef-unaware tools do not advertise targetRef and keep the legacy message", () => {
+  // toolZodSchemas is statically imported above.
+  for (const tool of TARGET_REF_UNAWARE) {
+    const zodSchema = toolZodSchemas[tool];
+    const jsonSchema = contracts[tool]!.inputSchema as { properties?: Record<string, unknown>; anyOf?: unknown[] };
+
+    // 1. No targetRef property anywhere (Zod + JSON exposure).
+    assert.ok(!("targetRef" in (zodSchema.shape as Record<string, unknown>)), `${tool} Zod schema must not declare targetRef`);
+    assert.equal(jsonSchema.properties?.targetRef, undefined, `${tool} JSON inputSchema must not expose targetRef`);
+
+    // 2. JSON anyOf does NOT include a targetRef branch.
+    const anyOf = (jsonSchema.anyOf ?? []) as Array<{ required?: string[] }>;
+    assert.ok(!anyOf.some((b) => b.required?.includes("targetRef")), `${tool} anyOf must not accept targetRef`);
+
+    // 3. Missing-target message stays legacy (no false targetRef claim).
+    const base = tool === "click_window" || tool === "move_mouse_window" ? { x: 1, y: 1 }
+      : tool === "click_menu_item" ? { path: ["File"] }
+        : tool === "type_text" ? { text: "hi" }
+          : tool === "send_key" ? { key: "enter" }
+            : {};
+    try {
+      zodSchema.parse(base);
+      assert.fail(`${tool} must reject a call with no target`);
+    } catch (error) {
+      const message = (error as Error).message;
+      assert.ok(!message.includes("targetRef"), `${tool} must not claim targetRef support, got: ${message.slice(0, 120)}`);
+    }
+  }
 });
 
 test("stale HWND rebinds to the new window of the same process", async () => {

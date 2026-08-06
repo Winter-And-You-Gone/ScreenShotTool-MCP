@@ -653,8 +653,8 @@ const profileLaunchOutput = withToolError(obj(
     manifestLevel: str(),
     interaction: interactionShape
   },
-  ["profile", "pid", "startedByMcp", "uiaRootAvailable", "interaction"],
-  "profile_launch success result (stable fields: profile, targetRef, pid, hwnd, title, startedByMcp, reused, uiaRootAvailable). targetRef is the preferred target binding for later profile actions."
+  ["profile", "targetRef", "pid", "startedByMcp", "uiaRootAvailable", "interaction"],
+  "profile_launch success result (stable fields: profile, targetRef, pid, hwnd, title, startedByMcp, reused, uiaRootAvailable). targetRef is REQUIRED: the preferred target binding for later profile actions (hwnd may be absent when the launch did not wait for a window)."
 ));
 
 // ── App Pack tools ──

@@ -191,6 +191,7 @@ test("interaction results conform to the tool output schemas", () => {
   // profile_launch result with interaction.
   const launch = {
     profile: "fixture",
+    targetRef: "target_fixture_4242",
     pid: 4242,
     hwnd: "0x200",
     title: "Fixture",

@@ -381,10 +381,33 @@ test("tool JSON schemas expose runtime selector and enum constraints", () => {
   assert.equal(toolInputSchemas.capture_window.properties.region.properties.width.maximum, 16_384);
   assert.equal(toolInputSchemas.capture_screen_region.properties.region.properties.height.maximum, 16_384);
   assert.deepEqual(toolInputSchemas.click_window.properties.button.enum, ["left", "right", "middle"]);
-  // targetRef is accepted by every target tool and preferred over pid/hwnd.
+  // targetRef is accepted by every targetRef-aware tool and preferred over
+  // pid/hwnd; tools whose runtime does not resolve targetRef must NOT
+  // advertise it.
   assert.ok(toolInputSchemas.capture_window.properties.targetRef, "capture_window accepts targetRef");
   assert.ok(toolInputSchemas.ui_query.properties.targetRef, "ui_query accepts targetRef");
   assert.ok(toolInputSchemas.profile_action.properties.targetRef, "profile_action accepts targetRef");
+  assert.ok(toolInputSchemas.ui_inspect_tree.properties.targetRef, "ui_inspect_tree accepts targetRef");
+  assert.ok(toolInputSchemas.ui_get.properties.targetRef, "ui_get accepts targetRef");
+  assert.ok(toolInputSchemas.ui_action.properties.targetRef, "ui_action accepts targetRef");
+  assert.ok(toolInputSchemas.ui_wait.properties.targetRef, "ui_wait accepts targetRef");
+  assert.ok(toolInputSchemas.profile_resolve.properties.targetRef, "profile_resolve accepts targetRef");
+  assert.ok(toolInputSchemas.ui_catalog.properties.targetRef, "ui_catalog accepts targetRef");
+  // Low-level tools without targetRef runtime resolution keep the 4-branch
+  // anyOf and no targetRef property.
+  assert.equal(toolInputSchemas.click_window.properties.targetRef, undefined, "click_window does not accept targetRef");
+  assert.equal(toolInputSchemas.move_mouse_window.properties.targetRef, undefined, "move_mouse_window does not accept targetRef");
+  assert.equal(toolInputSchemas.type_text.properties.targetRef, undefined, "type_text does not accept targetRef");
+  assert.equal(toolInputSchemas.send_key.properties.targetRef, undefined, "send_key does not accept targetRef");
+  assert.equal(toolInputSchemas.click_menu_item.properties.targetRef, undefined, "click_menu_item does not accept targetRef");
+  assert.equal(toolInputSchemas.get_window_state.properties.targetRef, undefined, "get_window_state does not accept targetRef");
+  assert.equal(toolInputSchemas.wait_for_window.properties.targetRef, undefined, "wait_for_window does not accept targetRef");
+  assert.deepEqual(toolInputSchemas.click_window.anyOf, [
+    { required: ["hwnd"] },
+    { required: ["pid"] },
+    { required: ["processName"] },
+    { required: ["titleContains"] }
+  ]);
   assert.deepEqual([...(toolInputSchemas.click_window.properties.coordinateSpace.enum ?? [])], ["client", "window"]);
 });
 

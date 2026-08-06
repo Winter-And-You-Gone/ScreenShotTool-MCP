@@ -15,6 +15,7 @@ import { McpUiError } from "../src/uia/results.js";
 // interaction report since the interaction-policy work).
 const LAUNCH_RESULT = {
   profile: "x",
+  targetRef: "target_x_1",
   pid: 1,
   title: "x",
   startedByMcp: true,

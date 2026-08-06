@@ -129,7 +129,6 @@ export const clickWindowSchema = z.object({
   pid: z.number().int().positive().optional(),
   processName: z.string().min(1).optional(),
   titleContains: z.string().min(1).optional(),
-  targetRef: z.string().min(1).max(128).regex(/^target_[A-Za-z0-9_.-]+$/, "targetRef must match ^target_[A-Za-z0-9_.-]+$").optional(),
   x: nonNegativeInt,
   y: nonNegativeInt,
   // Client-area-relative (window-relative) coordinates. NOT screen
@@ -139,8 +138,8 @@ export const clickWindowSchema = z.object({
   doubleClick: z.boolean().optional().default(false),
   delayMs: z.number().int().min(0).max(10000).optional().default(200)
 }).strict().refine(
-  (value) => value.hwnd !== undefined || value.pid !== undefined || value.processName !== undefined || value.titleContains !== undefined || value.targetRef !== undefined,
-  "Provide at least one of targetRef, hwnd, pid, processName, or titleContains."
+  (value) => value.hwnd !== undefined || value.pid !== undefined || value.processName !== undefined || value.titleContains !== undefined,
+  "Provide at least one of hwnd, pid, processName, or titleContains."
 );
 
 export const moveMouseWindowSchema = z.object({
@@ -148,7 +147,6 @@ export const moveMouseWindowSchema = z.object({
   pid: z.number().int().positive().optional(),
   processName: z.string().min(1).optional(),
   titleContains: z.string().min(1).optional(),
-  targetRef: z.string().min(1).max(128).regex(/^target_[A-Za-z0-9_.-]+$/, "targetRef must match ^target_[A-Za-z0-9_.-]+$").optional(),
   x: nonNegativeInt,
   y: nonNegativeInt,
   // Client-area-relative (window-relative) coordinates. NOT screen
@@ -156,8 +154,8 @@ export const moveMouseWindowSchema = z.object({
   coordinateSpace: z.enum(["client", "window"]).optional().default("client"),
   delayMs: z.number().int().min(0).max(10000).optional().default(200)
 }).strict().refine(
-  (value) => value.hwnd !== undefined || value.pid !== undefined || value.processName !== undefined || value.titleContains !== undefined || value.targetRef !== undefined,
-  "Provide at least one of targetRef, hwnd, pid, processName, or titleContains."
+  (value) => value.hwnd !== undefined || value.pid !== undefined || value.processName !== undefined || value.titleContains !== undefined,
+  "Provide at least one of hwnd, pid, processName, or titleContains."
 );
 
 export const clickMenuItemSchema = z.object({
@@ -374,7 +372,7 @@ export const uiGetSchema = z.object({
   maxDepth: uiaMaxDepth.optional().default(15),
   maxNodes: uiaMaxNodes.optional().default(2000),
   timeoutMs: uiaQueryTimeout.optional().default(10000)
-}).strict().refine(windowSelectorRefine, "Provide at least one of hwnd, pid, processName, or titleContains.");
+}).strict().refine(windowSelectorRefine, "Provide at least one of targetRef, hwnd, pid, processName, or titleContains.");
 
 export const uiActionSchema = z.object({
   ...windowSelectorFields,
@@ -408,7 +406,7 @@ export const uiActionSchema = z.object({
 ).refine(
   (value) => value.forceCoordinateClick ? value.allowCoordinateFallback === true : true,
   "forceCoordinateClick requires allowCoordinateFallback=true."
-).refine(windowSelectorRefine, "Provide at least one of hwnd, pid, processName, or titleContains.");
+).refine(windowSelectorRefine, "Provide at least one of targetRef, hwnd, pid, processName, or titleContains.");
 
 export const uiWaitSchema = z.object({
   ...windowSelectorFields,
@@ -436,7 +434,7 @@ export const uiWaitSchema = z.object({
 ).refine(
   (value) => value.condition === "countEquals" ? value.expectedCount !== undefined : true,
   "countEquals requires 'expectedCount'."
-).refine(windowSelectorRefine, "Provide at least one of hwnd, pid, processName, or titleContains.");
+).refine(windowSelectorRefine, "Provide at least one of targetRef, hwnd, pid, processName, or titleContains.");
 
 export const profileListSchema = z.object({}).strict();
 
@@ -448,7 +446,7 @@ export const profileResolveSchema = z.object({
   maxDepth: uiaMaxDepth.optional().default(15),
   maxNodes: uiaMaxNodes.optional().default(2000),
   timeoutMs: uiaQueryTimeout.optional().default(10000)
-}).strict().refine(windowSelectorRefine, "Provide at least one of hwnd, pid, processName, or titleContains.");
+}).strict().refine(windowSelectorRefine, "Provide at least one of targetRef, hwnd, pid, processName, or titleContains.");
 
 export const profileActionSchema = z.object({
   profile: z.string().min(1).max(MAX_SELECTOR_STR_LEN),
@@ -729,11 +727,16 @@ const hwndSchemaProperty = {
 } as const;
 
 const atLeastOneSelectorAnyOf = [
-  { required: ["targetRef"] },
   { required: ["hwnd"] },
   { required: ["pid"] },
   { required: ["processName"] },
   { required: ["titleContains"] }
+] as const;
+
+// anyOf for tools that ALSO accept the stable targetRef binding.
+const atLeastOneSelectorAnyOfWithTargetRef = [
+  { required: ["targetRef"] },
+  ...atLeastOneSelectorAnyOf
 ] as const;
 
 // Shared JSON Schema entry for targetRef.
@@ -835,7 +838,7 @@ export const toolInputSchemas = {
       ...interactionParamsJson
     },
     additionalProperties: false,
-    anyOf: atLeastOneSelectorAnyOf
+    anyOf: atLeastOneSelectorAnyOfWithTargetRef
   },
   capture_screen_region: {
     type: "object",
@@ -864,7 +867,6 @@ export const toolInputSchemas = {
       pid: { type: "integer", minimum: 1 },
       processName: { type: "string" },
       titleContains: { type: "string" },
-      targetRef: { ...targetRefJson },
       x: { type: "integer", minimum: 0, description: "Client-area-relative X coordinate. Coordinates are client-area-relative (window-relative), NOT screen coordinates - never subtract window offsets manually." },
       y: { type: "integer", minimum: 0, description: "Client-area-relative Y coordinate. Coordinates are client-area-relative (window-relative), NOT screen coordinates - never subtract window offsets manually." },
       coordinateSpace: { type: "string", enum: ["client", "window"], default: "client", description: "Coordinate space of x/y. This tool only supports client-area (window-relative) coordinates; screen coordinates are never accepted." },
@@ -883,7 +885,6 @@ export const toolInputSchemas = {
       pid: { type: "integer", minimum: 1 },
       processName: { type: "string" },
       titleContains: { type: "string" },
-      targetRef: { ...targetRefJson },
       x: { type: "integer", minimum: 0, description: "Client-area-relative X coordinate. Coordinates are client-area-relative (window-relative), NOT screen coordinates." },
       y: { type: "integer", minimum: 0, description: "Client-area-relative Y coordinate. Coordinates are client-area-relative (window-relative), NOT screen coordinates." },
       coordinateSpace: { type: "string", enum: ["client", "window"], default: "client", description: "Coordinate space of x/y. This tool only supports client-area (window-relative) coordinates; screen coordinates are never accepted." },
@@ -927,7 +928,6 @@ export const toolInputSchemas = {
       pid: { type: "integer", minimum: 1 },
       processName: { type: "string" },
       titleContains: { type: "string" },
-      targetRef: { ...targetRefJson },
       text: { type: "string", minLength: 1, maxLength: maxTypeTextLength, description: "Text to type into the target window. Sent via SendInput Unicode, so any Unicode character including CJK is supported. For standard Edit/RichEdit controls the helper may use EM_REPLACESEL, which replaces the current selection (if any) rather than appending at the caret; send an empty selection-clearing keystroke first if you need a pure insert." },
       delayMs: { type: "integer", minimum: 0, maximum: 10000, default: 50, description: "Delay between keystrokes in milliseconds." },
       pressMs: { type: "integer", minimum: 0, maximum: 5000, default: 30, description: "Duration of each key press in milliseconds." },
@@ -945,7 +945,6 @@ export const toolInputSchemas = {
       pid: { type: "integer", minimum: 1 },
       processName: { type: "string" },
       titleContains: { type: "string" },
-      targetRef: { ...targetRefJson },
       key: {
         anyOf: [
           { type: "string", enum: namedSendKeys },
@@ -1023,7 +1022,7 @@ export const toolInputSchemas = {
       timeoutMs: { type: "integer", minimum: 500, maximum: 120000, default: 20000 }
     },
     additionalProperties: false,
-    anyOf: atLeastOneSelectorAnyOf
+    anyOf: atLeastOneSelectorAnyOfWithTargetRef
   },
   ui_query: {
     type: "object",
@@ -1048,7 +1047,7 @@ export const toolInputSchemas = {
       timeoutMs: { type: "integer", minimum: 500, maximum: 120000, default: 20000 }
     },
     additionalProperties: false,
-    anyOf: atLeastOneSelectorAnyOf
+    anyOf: atLeastOneSelectorAnyOfWithTargetRef
   },
   ui_get: {
     type: "object",
@@ -1066,7 +1065,7 @@ export const toolInputSchemas = {
     },
     required: ["selector"],
     additionalProperties: false,
-    anyOf: atLeastOneSelectorAnyOf
+    anyOf: atLeastOneSelectorAnyOfWithTargetRef
   },
   ui_action: {
     type: "object",
@@ -1090,7 +1089,7 @@ export const toolInputSchemas = {
     },
     required: ["selector", "action"],
     additionalProperties: false,
-    anyOf: atLeastOneSelectorAnyOf
+    anyOf: atLeastOneSelectorAnyOfWithTargetRef
   },
   ui_wait: {
     type: "object",
@@ -1114,7 +1113,7 @@ export const toolInputSchemas = {
     },
     required: ["selector", "condition"],
     additionalProperties: false,
-    anyOf: atLeastOneSelectorAnyOf
+    anyOf: atLeastOneSelectorAnyOfWithTargetRef
   },
   profile_list: {
     type: "object",
@@ -1138,7 +1137,7 @@ export const toolInputSchemas = {
     },
     required: ["profile", "control"],
     additionalProperties: false,
-    anyOf: atLeastOneSelectorAnyOf
+    anyOf: atLeastOneSelectorAnyOfWithTargetRef
   },
   profile_action: {
     type: "object",
@@ -1166,7 +1165,7 @@ export const toolInputSchemas = {
     },
     required: ["profile", "control", "action"],
     additionalProperties: false,
-    anyOf: atLeastOneSelectorAnyOf
+    anyOf: atLeastOneSelectorAnyOfWithTargetRef
   },
   profile_launch: {
     type: "object",
@@ -1203,7 +1202,7 @@ export const toolInputSchemas = {
       timeoutMs: { type: "integer", minimum: 500, maximum: 120000, default: 30000 }
     },
     additionalProperties: false,
-    anyOf: atLeastOneSelectorAnyOf
+    anyOf: atLeastOneSelectorAnyOfWithTargetRef
   },
   run_steps: {
     type: "object",
