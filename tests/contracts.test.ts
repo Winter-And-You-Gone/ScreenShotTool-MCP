@@ -143,8 +143,11 @@ test("toMcpToolDefinition exposes outputSchema + standard annotations", () => {
 test("array tools expose {items} object-root schemas (MCP compatible)", () => {
   const def = toMcpToolDefinition(contracts.list_windows!);
   assert.equal(def.outputSchema.type, "object");
-  assert.equal(def.outputSchema.properties?.items?.type, "array");
-  assert.ok(def.outputSchema.required?.includes("items"));
+  // The success branch (first anyOf branch) carries the canonical {items}
+  // shape; the root keeps type:"object" for MCP compatibility.
+  const successBranch = def.outputSchema.anyOf?.[0] ?? def.outputSchema;
+  assert.equal(successBranch.properties?.items?.type, "array");
+  assert.ok(successBranch.required?.includes("items"));
 });
 
 test("contractExamples derives result paths from pipeSafeFields", () => {

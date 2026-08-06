@@ -35,6 +35,7 @@ import {
 } from "./types.js";
 import type { ProfileResolveInput, ProfileActionInput } from "../schemas.js";
 import { McpUiError } from "../uia/results.js";
+import { evaluateExpect } from "../expect.js";
 import {
   backgroundPolicyForAction,
   effectiveModeFor,
@@ -765,22 +766,158 @@ async function performCompositeProfileAction(
   }
 
   // ── ensureSelected: make a checkable control selected (idempotent). ──
-  // Reads toggleState first; already-selected -> success without any action;
-  // otherwise invoke and verify the final state. Safe to repeat.
+  // Success requires BOTH the control state (selected/toggleState On) AND the
+  // declared business postcondition (pack defaultExpect, unless expect:false).
+  // A control that reports selected while the business state is NOT satisfied
+  // is ACTION_STATE_INCONSISTENT - never a silent success. When the pack
+  // allows a window-message fallback (fallbackPolicy != "disabled"), the
+  // fallback is attempted and the business state re-verified.
   if (input.action === "ensureSelected") {
-    const before = await deps.getUiElement({ ...win(), selector, includeProcessPopups: true, timeoutMs: actionTimeout }).catch(() => null);
-    if (before?.element?.toggleState === "On") {
-      return {
-        profile: profile.id, control: input.control, selectorUsed: selector, confidence: entry.confidence, notes: entry.notes,
-        result: { success: true, method: "noop", alreadySelected: true, toggleState: "On" }
-      };
+    const packActions = getPackActions(profile.id);
+    const contract = packActions?.contracts.find((c) => c.control === input.control && c.action === "ensureSelected");
+    const expect = contract?.defaultExpect;
+    const expectEnabled = input.expect !== false;
+    const fallbackAllowed = contract?.fallbackPolicy !== "disabled";
+
+    // controlState verification: selected=true / toggleState On / SelectionItem.
+    const controlStateTrue = (e: Partial<UiElementState> | null | undefined): boolean =>
+      e != null && (e.selected === true || e.toggleState === "On");
+
+    // businessState verification: poll the declared postcondition (or an
+    // explicit UI-state condition when the pack declares none).
+    const verifyBusiness = async (): Promise<{ ok: boolean; reason?: string }> => {
+      if (!expectEnabled || !expect) {
+        // No declared business postcondition: control state is the whole
+        // story (may still be verified by the caller via expect).
+        return { ok: true };
+      }
+      const result = await evaluateExpect(
+        { getUiElement: (i) => deps.getUiElement(i), queryUi: (i) => deps.queryUi(i) },
+        {
+          ...expect,
+          profile,
+          hwnd: windowSel.hwnd,
+          pid: windowSel.pid,
+          includeProcessPopups: true,
+          timeoutMs: expect.timeoutMs ?? 6000,
+          pollIntervalMs: expect.pollIntervalMs ?? 150
+        }
+      );
+      return result.matched ? { ok: true } : { ok: false, reason: `postcondition '${expect.condition}' not satisfied` };
+    };
+
+    const readControl = async () => {
+      const r = await deps.getUiElement({ ...win(), selector, includeProcessPopups: true, timeoutMs: actionTimeout }).catch(() => null);
+      return r?.element ?? null;
+    };
+
+    let before = await readControl();
+    const controlOk = controlStateTrue(before);
+    if (controlOk) {
+      // Control state says selected - but the declared business postcondition
+      // must ALSO hold, or the action is inconsistent (e.g. a nav toggle that
+      // did not switch the page).
+      const business = await verifyBusiness();
+      if (business.ok) {
+        return {
+          profile: profile.id, control: input.control, selectorUsed: selector, confidence: entry.confidence, notes: entry.notes,
+          result: {
+            success: true, method: "noop", alreadySelected: true, toggleState: before?.toggleState ?? null,
+            controlStateVerified: true, businessStateVerified: true, fallbackUsed: false, physicalCursorMoved: false
+          }
+        };
+      }
+      // controlState=true but businessState=false: inconsistent. Try the
+      // window-message fallback when the pack allows it; otherwise fail with
+      // ACTION_STATE_INCONSISTENT (NEVER a silent success).
+      if (!fallbackAllowed || !(input.allowMessageClickFallback ?? input.allowCoordinateFallback ?? false)) {
+        throw new McpUiError(
+          "ACTION_STATE_INCONSISTENT",
+          "Control reports selected, but the declared postcondition is not satisfied.",
+          { profile: profile.id, control: input.control, action: input.action, controlState: before?.toggleState ?? null, businessState: business.reason },
+          "Verify the actual page/content state; the control may have toggled without switching the underlying view. Re-run with allowMessageClickFallback=true if the pack permits window-message fallback."
+        );
+      }
+      try {
+        const fb = await deps.performUiAction({ ...win(), selector, action: "windowMessageClick", includeProcessPopups: true, timeoutMs: actionTimeout });
+        before = await readControl();
+        const businessAfter = await verifyBusiness();
+        if (!controlStateTrue(before) || !businessAfter.ok) {
+          throw new McpUiError(
+            "ACTION_STATE_INCONSISTENT",
+            "Control reports selected, but the declared postcondition is not satisfied (window-message fallback did not help).",
+            { profile: profile.id, control: input.control, action: input.action, controlState: before?.toggleState ?? null, businessState: businessAfter.reason, method: fb.method },
+            "Verify the actual page/content state; the control may have toggled without switching the underlying view."
+          );
+        }
+        return {
+          profile: profile.id, control: input.control, selectorUsed: selector, confidence: entry.confidence, notes: entry.notes,
+          result: {
+            success: true, method: fb.method ?? "WindowMessageElementClick", alreadySelected: true,
+            controlStateVerified: true, businessStateVerified: true, fallbackUsed: true, physicalCursorMoved: false,
+            before: before?.toggleState ?? null, after: before?.toggleState ?? null
+          }
+        };
+      } catch (error) {
+        if (error instanceof McpUiError && error.code === "ACTION_STATE_INCONSISTENT") throw error;
+        throw new McpUiError(
+          "ACTION_STATE_INCONSISTENT",
+          "Control reports selected, but the declared postcondition is not satisfied (window-message fallback failed).",
+          { profile: profile.id, control: input.control, action: input.action, fallbackError: error instanceof McpUiError ? error.code : String(error) },
+          "Verify the actual page/content state; the control may have toggled without switching the underlying view."
+        );
+      }
     }
-    await deps.performUiAction({ ...win(), selector, action: "invoke", includeProcessPopups: true, timeoutMs: actionTimeout });
-    const after = await deps.getUiElement({ ...win(), selector, includeProcessPopups: true, timeoutMs: actionTimeout }).catch(() => null);
-    const nowSelected = after?.element?.toggleState === "On";
+
+    // Control state says not selected: act (pattern first, then the allowed
+    // window-message fallback), then verify control AND business state.
+    const perform = async (): Promise<{ method: string; element: Partial<UiElementState> | null }> => {
+      let actionResult: ActionResult;
+      try {
+        actionResult = await deps.performUiAction({ ...win(), selector, action: "invoke", includeProcessPopups: true, timeoutMs: actionTimeout });
+        if (!actionResult.success) {
+          throw new McpUiError("ACTION_FAILED", `ensureSelected invoke did not succeed: ${actionResult.method ?? "unknown"}.`, { control: input.control });
+        }
+      } catch (error) {
+        // Pattern path failed: window-message fallback only when the pack
+        // allows it and the caller opted in.
+        if (!fallbackAllowed || !(input.allowMessageClickFallback ?? input.allowCoordinateFallback ?? false)) {
+          throw error;
+        }
+        if (error instanceof McpUiError && (error.code === "PATTERN_NOT_SUPPORTED" || error.code === "ACTION_FAILED")) {
+          const fb = await deps.performUiAction({ ...win(), selector, action: "windowMessageClick", includeProcessPopups: true, timeoutMs: actionTimeout });
+          return { method: fb.method ?? "WindowMessageElementClick", element: await readControl() };
+        }
+        throw error;
+      }
+      return { method: actionResult.method ?? "invoke", element: await readControl() };
+    };
+
+    const { method, element: after } = await perform();
+    const nowSelected = controlStateTrue(after);
+    if (!nowSelected) {
+      throw new McpUiError(
+        "ACTION_STATE_INCONSISTENT",
+        `ensureSelected did not take: control still reports not-selected after '${method}'.`,
+        { profile: profile.id, control: input.control, action: input.action, before: before?.toggleState ?? null, after: after?.toggleState ?? null, method },
+        "Re-run the action and verify the outcome with ui_wait/expect; the control may not accept pattern toggles."
+      );
+    }
+    const business = await verifyBusiness();
+    if (!business.ok) {
+      throw new McpUiError(
+        "ACTION_STATE_INCONSISTENT",
+        `Control reports selected, but the declared postcondition is not satisfied (after '${method}').`,
+        { profile: profile.id, control: input.control, action: input.action, controlState: after?.toggleState ?? null, businessState: business.reason, method },
+        "Verify the actual page/content state; the control may have toggled without switching the underlying view."
+      );
+    }
     return {
       profile: profile.id, control: input.control, selectorUsed: selector, confidence: entry.confidence, notes: entry.notes,
-      result: { success: nowSelected, method: "invoke", alreadySelected: false, before: before?.element?.toggleState ?? null, after: after?.element?.toggleState ?? null }
+      result: {
+        success: true, method, alreadySelected: false, before: before?.toggleState ?? null, after: after?.toggleState ?? null,
+        controlStateVerified: true, businessStateVerified: true, fallbackUsed: method.startsWith("WindowMessage"), physicalCursorMoved: false
+      }
     };
   }
 

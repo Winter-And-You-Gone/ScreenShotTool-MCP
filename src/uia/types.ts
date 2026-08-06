@@ -48,11 +48,15 @@ export type UiElementState = {
   // withheld. Callers MUST NOT attempt to read the value via any other path.
   valueProtected: boolean;
   isReadOnly: boolean | null;
+  // Screen-space rectangle in physical pixels (coordinateSpace:"screen").
+  // Never subtract window offsets manually - coordinate tools accept
+  // client-area coordinates and convert server-side.
   boundingRect: {
     x: number;
     y: number;
     width: number;
     height: number;
+    coordinateSpace: "screen";
   } | null;
   runtimeId: number[];
   patterns: string[];
@@ -101,6 +105,7 @@ export type UiTreeNode = {
     y: number;
     width: number;
     height: number;
+    coordinateSpace: "screen";
   } | null;
   patterns: string[];
 };
@@ -157,7 +162,8 @@ export type UiAction =
   | "getValue"
   | "setChecked"
   | "increment"
-  | "decrement";
+  | "decrement"
+  | "windowMessageClick";
 
 export type ActionResult = {
   success: boolean;

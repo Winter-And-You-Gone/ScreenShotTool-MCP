@@ -368,6 +368,7 @@ test("schemas reject unknown fields to match additionalProperties:false", () => 
 
 test("tool JSON schemas expose runtime selector and enum constraints", () => {
   assert.deepEqual(toolInputSchemas.capture_window.anyOf, [
+    { required: ["targetRef"] },
     { required: ["hwnd"] },
     { required: ["pid"] },
     { required: ["processName"] },
@@ -380,6 +381,11 @@ test("tool JSON schemas expose runtime selector and enum constraints", () => {
   assert.equal(toolInputSchemas.capture_window.properties.region.properties.width.maximum, 16_384);
   assert.equal(toolInputSchemas.capture_screen_region.properties.region.properties.height.maximum, 16_384);
   assert.deepEqual(toolInputSchemas.click_window.properties.button.enum, ["left", "right", "middle"]);
+  // targetRef is accepted by every target tool and preferred over pid/hwnd.
+  assert.ok(toolInputSchemas.capture_window.properties.targetRef, "capture_window accepts targetRef");
+  assert.ok(toolInputSchemas.ui_query.properties.targetRef, "ui_query accepts targetRef");
+  assert.ok(toolInputSchemas.profile_action.properties.targetRef, "profile_action accepts targetRef");
+  assert.deepEqual([...(toolInputSchemas.click_window.properties.coordinateSpace.enum ?? [])], ["client", "window"]);
 });
 
 test("run_steps accepts a valid steps array and defaults args to {}", () => {

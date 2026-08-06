@@ -107,6 +107,7 @@ export const captureWindowSchema = z.object({
   pid: z.number().int().positive().optional(),
   processName: z.string().min(1).optional(),
   titleContains: z.string().min(1).optional(),
+  targetRef: z.string().min(1).max(128).regex(/^target_[A-Za-z0-9_.-]+$/, "targetRef must match ^target_[A-Za-z0-9_.-]+$").optional(),
   region: regionSchema.optional(),
   focus: z.boolean().optional().default(true),
   captureMethod: z.enum(["screen", "print"]).optional().default("print"),
@@ -114,8 +115,8 @@ export const captureWindowSchema = z.object({
   outputPath: z.string().min(1).optional(),
   ...interactionParams
 }).strict().refine(
-  (value) => value.hwnd !== undefined || value.pid !== undefined || value.processName !== undefined || value.titleContains !== undefined,
-  "Provide at least one of hwnd, pid, processName, or titleContains."
+  (value) => value.hwnd !== undefined || value.pid !== undefined || value.processName !== undefined || value.titleContains !== undefined || value.targetRef !== undefined,
+  "Provide at least one of targetRef, hwnd, pid, processName, or titleContains."
 );
 
 export const captureScreenRegionSchema = z.object({
@@ -128,14 +129,18 @@ export const clickWindowSchema = z.object({
   pid: z.number().int().positive().optional(),
   processName: z.string().min(1).optional(),
   titleContains: z.string().min(1).optional(),
+  targetRef: z.string().min(1).max(128).regex(/^target_[A-Za-z0-9_.-]+$/, "targetRef must match ^target_[A-Za-z0-9_.-]+$").optional(),
   x: nonNegativeInt,
   y: nonNegativeInt,
+  // Client-area-relative (window-relative) coordinates. NOT screen
+  // coordinates. See click_window description.
+  coordinateSpace: z.enum(["client", "window"]).optional().default("client"),
   button: z.enum(["left", "right", "middle"]).optional().default("left"),
   doubleClick: z.boolean().optional().default(false),
   delayMs: z.number().int().min(0).max(10000).optional().default(200)
 }).strict().refine(
-  (value) => value.hwnd !== undefined || value.pid !== undefined || value.processName !== undefined || value.titleContains !== undefined,
-  "Provide at least one of hwnd, pid, processName, or titleContains."
+  (value) => value.hwnd !== undefined || value.pid !== undefined || value.processName !== undefined || value.titleContains !== undefined || value.targetRef !== undefined,
+  "Provide at least one of targetRef, hwnd, pid, processName, or titleContains."
 );
 
 export const moveMouseWindowSchema = z.object({
@@ -143,12 +148,16 @@ export const moveMouseWindowSchema = z.object({
   pid: z.number().int().positive().optional(),
   processName: z.string().min(1).optional(),
   titleContains: z.string().min(1).optional(),
+  targetRef: z.string().min(1).max(128).regex(/^target_[A-Za-z0-9_.-]+$/, "targetRef must match ^target_[A-Za-z0-9_.-]+$").optional(),
   x: nonNegativeInt,
   y: nonNegativeInt,
+  // Client-area-relative (window-relative) coordinates. NOT screen
+  // coordinates. See move_mouse_window description.
+  coordinateSpace: z.enum(["client", "window"]).optional().default("client"),
   delayMs: z.number().int().min(0).max(10000).optional().default(200)
 }).strict().refine(
-  (value) => value.hwnd !== undefined || value.pid !== undefined || value.processName !== undefined || value.titleContains !== undefined,
-  "Provide at least one of hwnd, pid, processName, or titleContains."
+  (value) => value.hwnd !== undefined || value.pid !== undefined || value.processName !== undefined || value.titleContains !== undefined || value.targetRef !== undefined,
+  "Provide at least one of targetRef, hwnd, pid, processName, or titleContains."
 );
 
 export const clickMenuItemSchema = z.object({
@@ -301,11 +310,14 @@ const windowSelectorFields = {
   hwnd: z.union([z.string().min(1), z.number().int().positive()]).optional(),
   pid: z.number().int().positive().optional(),
   processName: z.string().min(1).max(MAX_SELECTOR_STR_LEN).optional(),
-  titleContains: z.string().min(1).max(MAX_SELECTOR_STR_LEN).optional()
+  titleContains: z.string().min(1).max(MAX_SELECTOR_STR_LEN).optional(),
+  // Stable target binding returned by profile_launch. Preferred over pid/
+  // hwnd: survives window recreation and refreshes the binding automatically.
+  targetRef: z.string().min(1).max(128).regex(/^target_[A-Za-z0-9_.-]+$/, "targetRef must match ^target_[A-Za-z0-9_.-]+$").optional()
 } as const;
 
 const windowSelectorRefine = (value: Record<string, unknown>) =>
-  value.hwnd !== undefined || value.pid !== undefined || value.processName !== undefined || value.titleContains !== undefined;
+  value.hwnd !== undefined || value.pid !== undefined || value.processName !== undefined || value.titleContains !== undefined || value.targetRef !== undefined;
 
 export const uiInspectTreeSchema = z.object({
   ...windowSelectorFields,
@@ -317,19 +329,43 @@ export const uiInspectTreeSchema = z.object({
   includePatterns: z.boolean().optional().default(true),
   includeOffscreen: z.boolean().optional().default(true),
   controlTypes: z.array(z.string().min(1).max(MAX_SELECTOR_STR_LEN)).max(50).optional(),
+  // Scoped fallback options for large trees: restrict the walk to the
+  // subtree under rootSelector and project only the requested fields.
+  rootSelector: uiElementSelectorSchema.optional(),
+  fields: z.array(z.string().min(1).max(64)).max(32).optional(),
   timeoutMs: uiaQueryTimeout.optional().default(20000)
-}).strict().refine(windowSelectorRefine, "Provide at least one of hwnd, pid, processName, or titleContains.");
+}).strict().refine(windowSelectorRefine, "Provide at least one of targetRef, hwnd, pid, processName, or titleContains.");
 
 export const uiQuerySchema = z.object({
   ...windowSelectorFields,
-  selector: uiElementSelectorSchema,
+  // Optional: with rootSelector/ancestorSelector the selector may be omitted
+  // (the scoped search then matches within the scoped subtree).
+  selector: uiElementSelectorSchema.optional(),
+  // Scoped search: restrict the walk to the subtree under rootSelector
+  // (combined with ancestorSelector for deeper scoping). Keeps results small
+  // instead of enumerating the whole tree.
+  rootSelector: uiElementSelectorSchema.optional(),
+  ancestorSelector: uiElementSelectorSchema.optional(),
+  // Case-insensitive substring filter on the element name (applied after the
+  // walk; cheap projection instead of a big result).
+  nameContains: z.string().min(1).max(MAX_SELECTOR_STR_LEN).optional(),
+  // Projection: only these fields are returned per element. Unknown fields
+  // are ignored; missing fields are omitted.
+  fields: z.array(z.string().min(1).max(64)).max(32).optional(),
+  // "auto": start at the default depth and escalate (8/16/24) until matches
+  // are found or the limit is reached.
+  depthStrategy: z.enum(["fixed", "auto"]).optional().default("fixed"),
+  maxDepthAutoLimit: uiaMaxDepth.optional().default(24),
   includeProcessPopups: z.boolean().optional().default(true),
   maxDepth: uiaMaxDepth.optional().default(15),
   maxNodes: uiaMaxNodes.optional().default(2000),
   includePatterns: z.boolean().optional().default(true),
   maxResults: z.number().int().min(1).max(uiaMaxReturnElements).optional().default(uiaMaxReturnElements),
   timeoutMs: uiaQueryTimeout.optional().default(20000)
-}).strict().refine(windowSelectorRefine, "Provide at least one of hwnd, pid, processName, or titleContains.");
+}).strict().refine(
+  (value) => value.rootSelector !== undefined || value.selector !== undefined || value.ancestorSelector !== undefined,
+  "Provide a selector, rootSelector, or ancestorSelector."
+).refine(windowSelectorRefine, "Provide at least one of targetRef, hwnd, pid, processName, or titleContains.");
 
 export const uiGetSchema = z.object({
   ...windowSelectorFields,
@@ -348,7 +384,8 @@ export const uiActionSchema = z.object({
     "expand", "collapse", "setValue", "setRangeValue", "scrollIntoView",
     "focus", "legacyDefaultAction", "click",
     "appendText", "clear", "selectAll", "getValue", "setChecked",
-    "increment", "decrement"
+    "increment", "decrement",
+    "windowMessageClick"
   ]),
   value: z.string().max(uiaValueMaxLen).optional(),
   rangeValue: z.number().optional(),
@@ -431,6 +468,10 @@ export const profileActionSchema = z.object({
   allowCoordinateFallback: z.boolean().optional().default(false),
   allowMessageClickFallback: z.boolean().optional().default(false),
   forceCoordinateClick: z.boolean().optional().default(false),
+  // Set false to disable the pack's defaultExpect for this control+action
+  // (only honored by the composite ensureSelected verification; other
+  // actions keep pack-default verification through the pipeline).
+  expect: z.union([z.literal(false), z.boolean().optional()]).optional(),
   includeProcessPopups: z.boolean().optional().default(true),
   maxDepth: uiaMaxDepth.optional().default(15),
   maxNodes: uiaMaxNodes.optional().default(2000),
@@ -454,7 +495,7 @@ export const profileActionSchema = z.object({
 ).refine(
   (value) => value.forceCoordinateClick ? value.allowCoordinateFallback === true : true,
   "forceCoordinateClick requires allowCoordinateFallback=true."
-).refine(windowSelectorRefine, "Provide at least one of hwnd, pid, processName, or titleContains.");
+).refine(windowSelectorRefine, "Provide at least one of targetRef, hwnd, pid, processName, or titleContains.");
 
 export type UiInspectTreeInput = z.infer<typeof uiInspectTreeSchema>;
 export type UiQueryInput = z.infer<typeof uiQuerySchema>;
@@ -485,8 +526,12 @@ export const uiCatalogSchema = z.object({
   enabledOnly: z.boolean().optional().default(false),
   maxDepth: uiaMaxDepth.optional().default(20),
   maxNodes: uiaMaxNodes.optional().default(5000),
+  // Scoped fallback options for large trees.
+  rootSelector: uiElementSelectorSchema.optional(),
+  fields: z.array(z.string().min(1).max(64)).max(32).optional(),
+  summaryOnly: z.boolean().optional().default(false),
   timeoutMs: uiaQueryTimeout.optional().default(30000)
-}).strict().refine(windowSelectorRefine, "Provide at least one of hwnd, pid, processName, or titleContains.");
+}).strict().refine(windowSelectorRefine, "Provide at least one of targetRef, hwnd, pid, processName, or titleContains.");
 export type UiCatalogInput = z.infer<typeof uiCatalogSchema>;
 
 export type UiElementSelectorInput = import("./uia/types.js").UiElementSelector;
@@ -684,11 +729,19 @@ const hwndSchemaProperty = {
 } as const;
 
 const atLeastOneSelectorAnyOf = [
+  { required: ["targetRef"] },
   { required: ["hwnd"] },
   { required: ["pid"] },
   { required: ["processName"] },
   { required: ["titleContains"] }
 ] as const;
+
+// Shared JSON Schema entry for targetRef.
+const targetRefJson = {
+  type: "string",
+  pattern: "^target_[A-Za-z0-9_.-]+$",
+  description: "Stable target binding returned by profile_launch. Preferred over pid/hwnd: it survives window recreation and refreshes the binding automatically. Priority: explicit hwnd > targetRef > pid/processName/titleContains."
+} as const;
 
 // Shared JSON Schema for the interactionMode + foregroundDemo params.
 const interactionParamsJson = {
@@ -762,6 +815,7 @@ export const toolInputSchemas = {
       pid: { type: "integer", minimum: 1 },
       processName: { type: "string" },
       titleContains: { type: "string" },
+      targetRef: { ...targetRefJson },
       region: {
         type: "object",
         properties: {
@@ -810,8 +864,10 @@ export const toolInputSchemas = {
       pid: { type: "integer", minimum: 1 },
       processName: { type: "string" },
       titleContains: { type: "string" },
-      x: { type: "integer", minimum: 0, description: "X coordinate relative to the target window top-left corner." },
-      y: { type: "integer", minimum: 0, description: "Y coordinate relative to the target window top-left corner." },
+      targetRef: { ...targetRefJson },
+      x: { type: "integer", minimum: 0, description: "Client-area-relative X coordinate. Coordinates are client-area-relative (window-relative), NOT screen coordinates - never subtract window offsets manually." },
+      y: { type: "integer", minimum: 0, description: "Client-area-relative Y coordinate. Coordinates are client-area-relative (window-relative), NOT screen coordinates - never subtract window offsets manually." },
+      coordinateSpace: { type: "string", enum: ["client", "window"], default: "client", description: "Coordinate space of x/y. This tool only supports client-area (window-relative) coordinates; screen coordinates are never accepted." },
       button: { type: "string", enum: ["left", "right", "middle"], default: "left", description: "Mouse button: left, right, or middle." },
       doubleClick: { type: "boolean", default: false },
       delayMs: { type: "integer", minimum: 0, maximum: 10000, default: 200, description: "Delay after posting mouse messages, useful before taking the next screenshot." },
@@ -827,8 +883,10 @@ export const toolInputSchemas = {
       pid: { type: "integer", minimum: 1 },
       processName: { type: "string" },
       titleContains: { type: "string" },
-      x: { type: "integer", minimum: 0, description: "X coordinate relative to the target window top-left corner." },
-      y: { type: "integer", minimum: 0, description: "Y coordinate relative to the target window top-left corner." },
+      targetRef: { ...targetRefJson },
+      x: { type: "integer", minimum: 0, description: "Client-area-relative X coordinate. Coordinates are client-area-relative (window-relative), NOT screen coordinates." },
+      y: { type: "integer", minimum: 0, description: "Client-area-relative Y coordinate. Coordinates are client-area-relative (window-relative), NOT screen coordinates." },
+      coordinateSpace: { type: "string", enum: ["client", "window"], default: "client", description: "Coordinate space of x/y. This tool only supports client-area (window-relative) coordinates; screen coordinates are never accepted." },
       delayMs: { type: "integer", minimum: 0, maximum: 10000, default: 200, description: "Delay after posting WM_MOUSEMOVE, useful before taking the next screenshot." }
     },
     required: ["x", "y"],
@@ -869,6 +927,7 @@ export const toolInputSchemas = {
       pid: { type: "integer", minimum: 1 },
       processName: { type: "string" },
       titleContains: { type: "string" },
+      targetRef: { ...targetRefJson },
       text: { type: "string", minLength: 1, maxLength: maxTypeTextLength, description: "Text to type into the target window. Sent via SendInput Unicode, so any Unicode character including CJK is supported. For standard Edit/RichEdit controls the helper may use EM_REPLACESEL, which replaces the current selection (if any) rather than appending at the caret; send an empty selection-clearing keystroke first if you need a pure insert." },
       delayMs: { type: "integer", minimum: 0, maximum: 10000, default: 50, description: "Delay between keystrokes in milliseconds." },
       pressMs: { type: "integer", minimum: 0, maximum: 5000, default: 30, description: "Duration of each key press in milliseconds." },
@@ -886,6 +945,7 @@ export const toolInputSchemas = {
       pid: { type: "integer", minimum: 1 },
       processName: { type: "string" },
       titleContains: { type: "string" },
+      targetRef: { ...targetRefJson },
       key: {
         anyOf: [
           { type: "string", enum: namedSendKeys },
@@ -949,6 +1009,7 @@ export const toolInputSchemas = {
       pid: { type: "integer", minimum: 1 },
       processName: { type: "string" },
       titleContains: { type: "string" },
+      targetRef: { ...targetRefJson },
       includeProcessPopups: { type: "boolean", default: true, description: "Also search top-level windows of the same PID (popups, dialogs, tool windows, Qt menus)." },
       maxDepth: { type: "integer", minimum: 1, maximum: 30, default: 10 },
       maxNodes: { type: "integer", minimum: 1, maximum: 5000, default: 1500 },
@@ -957,6 +1018,8 @@ export const toolInputSchemas = {
       includePatterns: { type: "boolean", default: true },
       includeOffscreen: { type: "boolean", default: true },
       controlTypes: { type: "array", items: { type: "string" }, description: "Optional allow-list of control types (e.g. [\"Button\",\"Edit\"])." },
+      rootSelector: { ...uiElementSelectorJsonSchema, description: "Restrict the inspection to the subtree under this element (scoped; keeps output small)." },
+      fields: { type: "array", items: { type: "string" }, maxItems: 32, description: "Projection: only these element fields are returned per node." },
       timeoutMs: { type: "integer", minimum: 500, maximum: 120000, default: 20000 }
     },
     additionalProperties: false,
@@ -969,7 +1032,14 @@ export const toolInputSchemas = {
       pid: { type: "integer", minimum: 1 },
       processName: { type: "string" },
       titleContains: { type: "string" },
+      targetRef: { ...targetRefJson },
       selector: uiElementSelectorJsonSchema,
+      rootSelector: { ...uiElementSelectorJsonSchema, description: "Restrict the search to the subtree under this element (scoped query; keeps output small)." },
+      ancestorSelector: { ...uiElementSelectorJsonSchema, description: "Only return elements that have a matching ancestor." },
+      nameContains: { type: "string", description: "Case-insensitive substring filter on the element name." },
+      fields: { type: "array", items: { type: "string" }, maxItems: 32, description: "Projection: only these element fields are returned (e.g. [\"name\",\"automationId\",\"controlType\",\"toggleState\",\"selected\",\"boundingRect\"])." },
+      depthStrategy: { type: "string", enum: ["fixed", "auto"], default: "fixed", description: "fixed: use maxDepth as-is. auto: start at the default depth and escalate (8/16/24) until matches are found or maxDepthAutoLimit is reached." },
+      maxDepthAutoLimit: { type: "integer", minimum: 1, maximum: 30, default: 24 },
       includeProcessPopups: { type: "boolean", default: true },
       maxDepth: { type: "integer", minimum: 1, maximum: 30, default: 15 },
       maxNodes: { type: "integer", minimum: 1, maximum: 5000, default: 2000 },
@@ -977,7 +1047,6 @@ export const toolInputSchemas = {
       maxResults: { type: "integer", minimum: 1, maximum: 100, default: 100 },
       timeoutMs: { type: "integer", minimum: 500, maximum: 120000, default: 20000 }
     },
-    required: ["selector"],
     additionalProperties: false,
     anyOf: atLeastOneSelectorAnyOf
   },
@@ -988,6 +1057,7 @@ export const toolInputSchemas = {
       pid: { type: "integer", minimum: 1 },
       processName: { type: "string" },
       titleContains: { type: "string" },
+      targetRef: { ...targetRefJson },
       selector: uiElementSelectorJsonSchema,
       includeProcessPopups: { type: "boolean", default: true },
       maxDepth: { type: "integer", minimum: 1, maximum: 30, default: 15 },
@@ -1005,8 +1075,9 @@ export const toolInputSchemas = {
       pid: { type: "integer", minimum: 1 },
       processName: { type: "string" },
       titleContains: { type: "string" },
+      targetRef: { ...targetRefJson },
       selector: uiElementSelectorJsonSchema,
-      action: { type: "string", enum: ["invoke", "toggle", "select", "addToSelection", "removeFromSelection", "expand", "collapse", "setValue", "setRangeValue", "scrollIntoView", "focus", "legacyDefaultAction", "click", "appendText", "clear", "selectAll", "getValue", "setChecked", "increment", "decrement"] },
+      action: { type: "string", enum: ["invoke", "toggle", "select", "addToSelection", "removeFromSelection", "expand", "collapse", "setValue", "setRangeValue", "scrollIntoView", "focus", "legacyDefaultAction", "click", "appendText", "clear", "selectAll", "getValue", "setChecked", "increment", "decrement", "windowMessageClick"], description: "windowMessageClick resolves the element by selector and posts a targeted window message (WM_LBUTTONDOWN/UP) at the element center. It does NOT move or click the physical mouse and does NOT activate the window." },
       value: { type: "string", maxLength: 4000, description: "Text for setValue/appendText; \"true\"/\"false\" for setChecked; item name for selectByName." },
       rangeValue: { type: "number", description: "Target value for setRangeValue (clamped to [minimum, maximum])." },
       allowCoordinateFallback: { type: "boolean", default: false, description: "Allow keyboard then coordinate-message click fallback ONLY when all UIA patterns are unavailable. Off by default. Never moves the physical cursor." },
@@ -1028,6 +1099,7 @@ export const toolInputSchemas = {
       pid: { type: "integer", minimum: 1 },
       processName: { type: "string" },
       titleContains: { type: "string" },
+      targetRef: { ...targetRefJson },
       selector: uiElementSelectorJsonSchema,
       condition: { type: "string", enum: ["exists", "notExists", "visible", "hidden", "enabled", "disabled", "valueEquals", "valueContains", "toggleStateEquals", "selected", "notSelected", "expanded", "collapsed", "countEquals"] },
       expectedValue: { type: "string", maxLength: 4000 },
@@ -1058,6 +1130,7 @@ export const toolInputSchemas = {
       pid: { type: "integer", minimum: 1 },
       processName: { type: "string" },
       titleContains: { type: "string" },
+      targetRef: { ...targetRefJson },
       includeProcessPopups: { type: "boolean", default: true },
       maxDepth: { type: "integer", minimum: 1, maximum: 30, default: 15 },
       maxNodes: { type: "integer", minimum: 1, maximum: 5000, default: 2000 },
@@ -1079,10 +1152,12 @@ export const toolInputSchemas = {
       allowCoordinateFallback: { type: "boolean", default: false },
       allowMessageClickFallback: { type: "boolean", default: false, description: "Alias for allowCoordinateFallback (spec name)." },
       forceCoordinateClick: { type: "boolean", default: false },
+      expect: { type: "boolean", enum: [false], description: "Set false to disable the pack's defaultExpect business-state verification for this action (ensureSelected composite)." },
       hwnd: { ...hwndSchemaProperty },
       pid: { type: "integer", minimum: 1 },
       processName: { type: "string" },
       titleContains: { type: "string" },
+      targetRef: { ...targetRefJson },
       includeProcessPopups: { type: "boolean", default: true },
       maxDepth: { type: "integer", minimum: 1, maximum: 30, default: 15 },
       maxNodes: { type: "integer", minimum: 1, maximum: 5000, default: 2000 },
@@ -1116,11 +1191,15 @@ export const toolInputSchemas = {
       pid: { type: "integer", minimum: 1 },
       processName: { type: "string" },
       titleContains: { type: "string" },
+      targetRef: { ...targetRefJson },
       includeProcessPopups: { type: "boolean", default: true },
       visibleOnly: { type: "boolean", default: true, description: "Only catalog onscreen controls." },
       enabledOnly: { type: "boolean", default: false },
       maxDepth: { type: "integer", minimum: 1, maximum: 30, default: 20 },
       maxNodes: { type: "integer", minimum: 1, maximum: 5000, default: 5000 },
+      rootSelector: { ...uiElementSelectorJsonSchema, description: "Restrict the catalog to the subtree under this element (scoped; keeps output small)." },
+      fields: { type: "array", items: { type: "string" }, maxItems: 32, description: "Projection: only these control fields are returned." },
+      summaryOnly: { type: "boolean", default: false, description: "Return counts and control-type distribution only, with no per-control entries (compact)." },
       timeoutMs: { type: "integer", minimum: 500, maximum: 120000, default: 30000 }
     },
     additionalProperties: false,

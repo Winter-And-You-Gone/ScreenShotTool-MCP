@@ -67,6 +67,66 @@ npm test
 底层高级用户：     validate_steps → run_steps → continue_run
 ```
 
+## 模型推荐调用路径
+
+工具选择由契约（tools/list 的 description / inputSchema / outputSchema）与
+`app_pack_describe` 返回的 `usageGuidance` 引导。通用推荐顺序：
+
+**已知 App Pack 时**
+
+```
+app_pack_describe → profile_launch → 使用 targetRef 的 profile_action
+                  → 业务后置条件验证（ui_wait / expect）→ capture_window
+```
+
+用户已明确指定 Profile 时可直接 `profile_launch → profile_action`，不强制先调用
+`app_pack_list`。`profile_launch` 返回的 `targetRef` 是后续动作的首选目标绑定：
+窗口重建后它会自动重新绑定到新窗口，无需手工换 HWND。
+
+**查找未知控件**
+
+```
+profile controls（profile_resolve / profile_action）→ scoped ui_query
+（rootSelector / ancestorSelector / nameContains / fields / maxResults）
+→ ui_catalog → scoped ui_inspect_tree
+```
+
+`ui_catalog` 与 `ui_inspect_tree` 是诊断 fallback：不要为了定位一个已知语义控件
+枚举整棵应用树。`ui_query` 支持 `depthStrategy=auto` 自动从浅到深扩展搜索深度。
+
+**禁止的反模式**
+
+- 有 Profile/App Pack 仍先用 `launch_app`（launch_app 是低层 fallback）。
+- 每次动作都重新抓整棵树（用 profile controls 或 scoped ui_query）。
+- 把旧 hwnd 永久复用（窗口重建后用 targetRef，绑定会自动刷新）。
+- 手工换算 screen/client 坐标（boundingRect 标注 `coordinateSpace:"screen"`，
+  点击工具只接受 client-area 坐标并标注 `coordinateSpace`）。
+- 把窗口消息点击描述成真实鼠标点击（结果明确 `physicalCursorMoved:false`）。
+- 看到没有窗口就断言应用崩溃（区分 `processAlive` / `windowAlive` /
+  `profileWindowMatched`；`WINDOW_NOT_FOUND_FOR_PROCESS` 不代表进程退出）。
+
+## 错误输出契约
+
+所有工具的业务错误都以统一结构返回，且满足该工具公开的 outputSchema
+（不会再出现 `-32602 output schema mismatch` 掩盖真实错误码）：
+
+```json
+{
+  "success": false,
+  "error": {
+    "code": "ELEMENT_NOT_FOUND",
+    "message": "No element matched selector: ...",
+    "suggestion": "Use scoped ui_query within the nearest known profile control...",
+    "retryable": false
+  }
+}
+```
+
+常见错误码都带 `suggestion`（TARGET_REQUIRED / WINDOW_NOT_FOUND /
+WINDOW_NOT_FOUND_FOR_PROCESS / STALE_WINDOW_HANDLE / ELEMENT_NOT_FOUND /
+ELEMENT_AMBIGUOUS / FOREGROUND_REQUIRED / MAX_DEPTH_EXCEEDED /
+ACTION_STATE_INCONSISTENT / BACKGROUND_CAPTURE_UNAVAILABLE / TREE_OUTPUT_TOO_LARGE）。
+
 ## App Pack 是什么
 
 App Pack 是一个**声明式 JSON 目录**，把"某个软件的启动方式、窗口识别、逻辑控件名、UIA selector、动作契约、默认后置条件、可复用工作流"全部描述为数据。任何用户都可以为自己的 Windows 软件创建一个 App Pack，**不需要修改 MCP 源码**。

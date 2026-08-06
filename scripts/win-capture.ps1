@@ -3016,7 +3016,7 @@ function Get-UiaElementState {
   try {
     $r = $Element.Current.BoundingRectangle
     if ($r.Width -gt 0 -and $r.Height -gt 0) {
-      $rect = [ordered]@{ x = [int]$r.X; y = [int]$r.Y; width = [int]$r.Width; height = [int]$r.Height }
+      $rect = [ordered]@{ x = [int]$r.X; y = [int]$r.Y; width = [int]$r.Width; height = [int]$r.Height; coordinateSpace = "screen" }
     }
   } catch {}
 
@@ -3116,6 +3116,9 @@ function Get-UiaElementState {
     isPassword = $isPassword
     valueProtected = $valueProtected
     isReadOnly = $isReadOnly
+    # boundingRect is ALWAYS in screen space (physical pixels). Callers must
+    # NOT subtract window offsets manually - coordinate tools accept
+    # client-area coordinates and perform the conversion server-side.
     boundingRect = $rect
     runtimeId = $runtimeId
     patterns = $patterns
@@ -3319,9 +3322,27 @@ function Resolve-UiaRecordsFromRoots {
   $visited = 0
   $truncated = $false
   $hasPath = $Selector.ContainsKey("path") -and $Selector.path -and @($Selector.path).Count -gt 0
-  $ancestorSelector = $null
+  # Ancestor constraints: single selector.ancestor (legacy) OR an ancestors
+  # array (scoped queries: rootSelector + ancestorSelector). ALL must match.
+  $ancestorSelectors = [System.Collections.ArrayList]::new()
   if ($Selector.ContainsKey("ancestor") -and $Selector.ancestor -and (Test-SelectorHasLocator $Selector.ancestor)) {
-    $ancestorSelector = [hashtable]$Selector.ancestor
+    [void]$ancestorSelectors.Add([hashtable]$Selector.ancestor)
+  }
+  if ($Selector.ContainsKey("ancestors") -and $Selector.ancestors -and @($Selector.ancestors).Count -gt 0) {
+    foreach ($a in @($Selector.ancestors)) {
+      if (Test-SelectorHasLocator $a) { [void]$ancestorSelectors.Add([hashtable]$a) }
+    }
+  }
+  $hasAncestors = $ancestorSelectors.Count -gt 0
+
+  # All ancestors must match (AND). The walker is the caller's RawViewWalker.
+  function Test-AllAncestors {
+    param($Element, $Selectors, $Walker, [int]$MaxDepth)
+    if ($Selectors.Count -eq 0) { return $true }
+    foreach ($anc in $Selectors) {
+      if (-not (Test-UiaAncestorChain -Element $Element -AncestorSelector $anc -Walker $Walker -MaxDepth $MaxDepth)) { return $false }
+    }
+    return $true
   }
 
   # Dedup across roots: a Qt::Tool/QDialog top-level window parented (in the
@@ -3353,7 +3374,7 @@ function Resolve-UiaRecordsFromRoots {
         $finalMatch = $false
         try { $finalMatch = Test-UiaElementMatches -Element $record.Element -Selector $Selector } catch { $finalMatch = $false }
         if (-not $finalMatch) { continue }
-        if ($null -ne $ancestorSelector -and -not (Test-UiaAncestorChain -Element $record.Element -AncestorSelector $ancestorSelector -Walker $walker -MaxDepth $MaxDepth)) { continue }
+        if ($hasAncestors -and -not (Test-AllAncestors -Element $record.Element -Selectors $ancestorSelectors -Walker $walker -MaxDepth $MaxDepth)) { continue }
         $records.Add([pscustomobject]@{
           Element = $record.Element
           Root = $root
@@ -3388,7 +3409,7 @@ function Resolve-UiaRecordsFromRoots {
       } catch {}
       $isMatch = $false
       try { $isMatch = Test-UiaElementMatches -Element $node.Element -Selector $Selector } catch { $isMatch = $false }
-      if ($isMatch -and ($null -eq $ancestorSelector -or (Test-UiaAncestorChain -Element $node.Element -AncestorSelector $ancestorSelector -Walker $walker -MaxDepth $MaxDepth))) {
+      if ($isMatch -and (-not $hasAncestors -or (Test-AllAncestors -Element $node.Element -Selectors $ancestorSelectors -Walker $walker -MaxDepth $MaxDepth))) {
         $records.Add([pscustomobject]@{
           Element = $node.Element
           Root = $root
@@ -3441,6 +3462,12 @@ function Invoke-UiInspectTree {
   if ($Target.ContainsKey("includeOffscreen")) { $includeOffscreen = [bool]$Target.includeOffscreen }
   $controlTypes = $null
   if ($Target.ContainsKey("controlTypes") -and $Target.controlTypes) { $controlTypes = @($Target.controlTypes) }
+  # Scoped inspection: only elements matching rootSelector (and their
+  # descendants) are returned. The root element itself is included.
+  $rootSelector = $null
+  if ($Target.ContainsKey("rootSelector") -and $Target.rootSelector -and (Test-SelectorHasLocator $Target.rootSelector)) {
+    $rootSelector = [hashtable]$Target.rootSelector
+  }
 
   $windowSel = @{}
   foreach ($k in @('hwnd','pid','processName','titleContains')) { if ($Target.ContainsKey($k) -and $null -ne $Target.$k) { $windowSel[$k] = $Target.$k } }
@@ -3476,7 +3503,7 @@ function Invoke-UiInspectTree {
     }
     $rootDeadline = [DateTimeOffset]::UtcNow.AddMilliseconds($perRootMs)
     $stack = [System.Collections.Stack]::new()
-    $stack.Push([pscustomobject]@{ Element = $root.element; Depth = 0; ParentId = $null })
+    $stack.Push([pscustomobject]@{ Element = $root.element; Depth = 0; ParentId = $null; InScope = ($null -eq $rootSelector) })
     while ($stack.Count -gt 0) {
       if ($script:walkStop) { break }
       if ($nodes.Count -ge $maxNodes) { $truncated = $true; break }
@@ -3487,6 +3514,17 @@ function Invoke-UiInspectTree {
       $visited++
       $el = $node.Element
       $nodeId = $nodes.Count + 1
+
+      # Scoped inspection: an element matches rootSelector -> its whole
+      # subtree becomes in-scope. In-scope elements are returned (subject to
+      # the other filters); out-of-scope elements are skipped, but traversal
+      # continues so a deeper match can still be found.
+      $inScope = [bool]$node.InScope
+      $isRootMatch = $false
+      if ($null -ne $rootSelector -and -not $inScope) {
+        try { $isRootMatch = Test-UiaElementMatches -Element $el -Selector $rootSelector } catch { $isRootMatch = $false }
+        if ($isRootMatch) { $inScope = $true }
+      }
 
       $ct = $null; try { $ct = $el.Current.ControlType } catch {}
       $ctName = if ($ct) { $ct.ProgrammaticName } else { "" }
@@ -3508,8 +3546,10 @@ function Invoke-UiInspectTree {
       try { $nh = $el.Current.NativeWindowHandle; if ($nh -ne 0) { $nativeHandle = [string]$nh; [void]$visitedHwnds.Add($nativeHandle) } } catch {}
 
       # Filtering: filters only affect whether the node is RETURNED, not
-      # whether traversal continues past it.
+      # whether traversal continues past it. Scoped inspection only returns
+      # elements inside a matched rootSelector subtree.
       $include = $true
+      if (-not $inScope) { $include = $false }
       if (-not $includeOffscreen -and $off) { $include = $false }
       if ($automationIdOnly -and [string]::IsNullOrEmpty($autoId)) { $include = $false }
       if ($interactiveOnly) {
@@ -3519,7 +3559,7 @@ function Invoke-UiInspectTree {
 
       if ($include) {
         $rect = $null
-        try { $r = $el.Current.BoundingRectangle; if ($r.Width -gt 0 -and $r.Height -gt 0) { $rect = [ordered]@{ x=[int]$r.X; y=[int]$r.Y; width=[int]$r.Width; height=[int]$r.Height } } } catch {}
+        try { $r = $el.Current.BoundingRectangle; if ($r.Width -gt 0 -and $r.Height -gt 0) { $rect = [ordered]@{ x=[int]$r.X; y=[int]$r.Y; width=[int]$r.Width; height=[int]$r.Height; coordinateSpace="screen" } } } catch {}
         $pats = @()
         if ($includePatterns) { $pats = (Get-UiaElementState -Element $el -IncludePatterns $true -IncludeValues $false).patterns }
         $nodes.Add([ordered]@{
@@ -3555,7 +3595,7 @@ function Invoke-UiInspectTree {
         try { $child = $walker.GetNextSibling($child) } catch { $child = $null }
       }
       $parentId = if ($include) { $nodeId } else { $node.ParentId }
-      foreach ($c in $buf) { $stack.Push([pscustomobject]@{ Element = $c; Depth = ($node.Depth + 1); ParentId = $parentId }) }
+      foreach ($c in $buf) { $stack.Push([pscustomobject]@{ Element = $c; Depth = ($node.Depth + 1); ParentId = $parentId; InScope = $inScope }) }
     }
   }
 
@@ -3779,6 +3819,18 @@ function Invoke-UiAction {
         elseif (Invoke-KeyboardFallback $live $targetHwnd "Enter") { $method = "Keyboard.Enter"; $fallbackUsed = $true }
         elseif ($allowFallback -and (Invoke-CoordinateClick -Element $live -TargetHwnd $targetHwnd -AllowFallback $true)) { $method = "coordinate_click_fallback"; $fallbackUsed = $true }
         else { Throw-UiaError "COORDINATE_FALLBACK_DISABLED" "Element has no invokable pattern and fallback is disabled." ([ordered]@{ selector = $Target.selector; patterns = $stateBefore.patterns; stage = "click" }) }
+      }
+      "windowMessageClick" {
+        # Selector-driven window-message click: the server resolves the
+        # element by selector, converts the UIA bounding rectangle (screen
+        # space) to client coordinates (DPI-aware), validates the center is
+        # inside the client area, and posts WM_LBUTTONDOWN/UP. It NEVER moves
+        # or clicks the physical mouse and does NOT activate the window.
+        if (-not (Invoke-CoordinateClick -Element $live -TargetHwnd $targetHwnd -AllowFallback $true)) {
+          Throw-UiaError "ACTION_FAILED" "windowMessageClick could not be performed (element offscreen, zero-size, or outside the client area)." ([ordered]@{ selector = $Target.selector; stage = "window-message-click" })
+        }
+        $method = "WindowMessageElementClick"
+        $fallbackUsed = $true
       }
       default { Throw-UiaError "ACTION_FAILED" "Unknown action: $action" ([ordered]@{ stage = "dispatch" }) }
     }

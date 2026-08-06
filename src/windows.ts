@@ -315,7 +315,11 @@ export async function waitForWindow(input: WaitForWindowInput): Promise<WaitForW
 // shared worker's serial queue - mirroring the wait_for_window design.
 
 export async function inspectUiTree(input: UiInspectTreeInput): Promise<InspectTreeResult> {
-  return runHelper<InspectTreeResult>({ action: "ui-inspect-tree", target: input });
+  const raw = await runHelper<InspectTreeResult>({ action: "ui-inspect-tree", target: input });
+  if (input.fields && input.fields.length > 0) {
+    raw.nodes = raw.nodes.map((n) => projectElementFields(n as unknown as Record<string, unknown>, input.fields) as unknown as InspectTreeResult["nodes"][number]);
+  }
+  return raw;
 }
 
 // ── ui_catalog ──
@@ -360,6 +364,10 @@ export async function catalogUi(input: {
   maxDepth?: number;
   maxNodes?: number;
   timeoutMs?: number;
+  // Scoped catalog: restrict the walk to the subtree under rootSelector.
+  rootSelector?: import("./uia/types.js").UiElementSelector;
+  // Projection: only these control fields are returned per entry.
+  fields?: string[];
 }): Promise<{
   totalNodes: number;
   actionableNodes: number;
@@ -402,6 +410,7 @@ export async function catalogUi(input: {
     includeOffscreen: !(input.visibleOnly ?? true),
     interactiveOnly: false,
     automationIdOnly: false,
+    rootSelector: input.rootSelector,
     timeoutMs: input.timeoutMs ?? 30000
   });
 
@@ -548,6 +557,9 @@ export async function catalogUi(input: {
     });
   }
 
+  const controlsOut: Array<Record<string, unknown>> = (input.fields && input.fields.length > 0
+    ? controls.map((c) => projectElementFields(c as unknown as Record<string, unknown>, input.fields))
+    : controls) as unknown as Array<Record<string, unknown>>;
   return {
     totalNodes: nodes.length,
     actionableNodes: controls.length,
@@ -557,14 +569,164 @@ export async function catalogUi(input: {
     controlTypes,
     patterns: patternCounts,
     unmappedActionableControls,
-    controls,
+    controls: controlsOut as unknown as Array<{
+      controlType: string;
+      automationId: string;
+      name: string;
+      className: string;
+      frameworkId: string;
+      enabled: boolean;
+      visible: boolean;
+      offscreen: boolean;
+      rootHwnd: string;
+      recommendedSelector: Record<string, unknown>;
+      selectorConfidence: "stable" | "conditionally-stable" | "fragile" | "unsupported";
+      selectorVerified: boolean;
+      selectorMatchCount: number;
+      supportedActions: string[];
+      patterns: string[];
+      profileControl?: string;
+    }>,
     truncated: tree.truncated,
     elapsedMs: tree.elapsedMs
   };
 }
 
-export async function queryUi(input: UiQueryInput): Promise<QueryResult> {
-  return runHelper<QueryResult>({ action: "ui-query", target: input });
+// ── Scoped UI search (ui_query) ──
+//
+// Scoped queries keep output small instead of enumerating the whole tree:
+//   - rootSelector / ancestorSelector restrict the walk (composed into the
+//     PowerShell resolver's selector.ancestor),
+//   - nameContains filters matches by element name (case-insensitive),
+//   - fields projects each element to a small subset,
+//   - depthStrategy=auto escalates depth (8/16/24) until matches are found,
+//   - maxResults caps the result list.
+// All of this happens server-side - the model never parses large trees.
+
+export type ScopedQueryOptions = {
+  rootSelector?: import("./uia/types.js").UiElementSelector;
+  ancestorSelector?: import("./uia/types.js").UiElementSelector;
+  nameContains?: string;
+  fields?: string[];
+  depthStrategy?: "fixed" | "auto";
+  maxDepthAutoLimit?: number;
+};
+
+const AUTO_DEPTH_STEPS = [8, 16, 24] as const;
+
+// Selector field allow-list for the projection (mirrors UiElementState's
+// stable public fields; values are safe to surface).
+const ELEMENT_FIELD_KEYS = [
+  "automationId", "name", "controlType", "className", "frameworkId",
+  "processId", "nativeWindowHandle", "enabled", "offscreen", "focusable",
+  "hasKeyboardFocus", "isPassword", "valueProtected", "isReadOnly",
+  "boundingRect", "patterns", "value", "rangeValue", "minimum", "maximum",
+  "smallChange", "largeChange", "toggleState", "selected", "selectedName",
+  "selectedIndex", "expandCollapseState"
+] as const;
+
+// Project an element state to the requested field subset. boundingRect is
+// always screen-space; the projection keeps it (with coordinateSpace) so the
+// model never has to guess.
+export function projectElementFields(element: Record<string, unknown>, fields?: string[]): Record<string, unknown> {
+  if (!fields || fields.length === 0) return element;
+  const out: Record<string, unknown> = {};
+  for (const f of fields) {
+    const key = (ELEMENT_FIELD_KEYS as readonly string[]).includes(f) ? f : undefined;
+    if (key && element[key] !== undefined) out[key] = element[key];
+  }
+  return out;
+}
+
+export type ScopedQueryResult = import("./uia/types.js").QueryResult & {
+  scoped?: boolean;
+  maxDepth?: number;
+  depthExpanded?: boolean;
+  requestedMaxDepth?: number | null;
+  projected?: boolean;
+};
+
+function applyScopedQuery(
+  result: import("./uia/types.js").QueryResult,
+  input: { nameContains?: string; fields?: string[] },
+  scoped: boolean
+): ScopedQueryResult {
+  let elements = result.elements;
+  if (input.nameContains) {
+    const needle = input.nameContains.toLowerCase();
+    elements = elements.filter((e) => e.name.toLowerCase().includes(needle));
+  }
+  return {
+    ...result,
+    count: elements.length,
+    elements: (input.fields && input.fields.length > 0
+      ? elements.map((e) => projectElementFields(e as unknown as Record<string, unknown>, input.fields))
+      : elements) as import("./uia/types.js").UiElementState[],
+    scoped
+  };
+}
+
+export async function queryUi(input: UiQueryInput): Promise<ScopedQueryResult> {
+  const scoped = input.rootSelector !== undefined || input.ancestorSelector !== undefined || input.nameContains !== undefined || input.fields !== undefined || input.depthStrategy === "auto";
+
+  if (!scoped) {
+    return runHelper<import("./uia/types.js").QueryResult>({ action: "ui-query", target: input });
+  }
+
+  // Compose ancestor constraints for the PS resolver. The PS resolver
+  // supports BOTH a single selector.ancestor AND an `ancestors` array (AND
+  // semantics) - scoped queries pass rootSelector + ancestorSelector as the
+  // array so both constraints apply.
+  const baseSelector = input.selector ?? {};
+  const ancestorList: import("./uia/types.js").UiElementSelector[] = [];
+  if (input.rootSelector) ancestorList.push(input.rootSelector);
+  if (input.ancestorSelector) ancestorList.push(input.ancestorSelector);
+  const selectorWithAncestor = ancestorList.length > 0
+    ? { ...baseSelector, ancestors: ancestorList }
+    : baseSelector;
+
+  const target = { ...input, selector: selectorWithAncestor };
+
+  const depthAuto = input.depthStrategy === "auto";
+  const maxDepth = input.maxDepth ?? 15;
+  const limit = input.maxDepthAutoLimit ?? 24;
+
+  // Depth escalation: run at increasing depths until matches appear (or the
+  // limit is reached). Shallow-first keeps deep searches cheap when the
+  // element is near the root.
+  let result: import("./uia/types.js").QueryResult | null = null;
+  let usedDepth = maxDepth;
+  let depthExpanded = false;
+  if (depthAuto) {
+    const depths = [...AUTO_DEPTH_STEPS.filter((d) => d >= maxDepth && d <= limit)];
+    for (const d of depths) {
+      const r = await runHelper<import("./uia/types.js").QueryResult>({ action: "ui-query", target: { ...target, maxDepth: d } });
+      if (r.count > 0) {
+        result = r;
+        usedDepth = d;
+        break;
+      }
+      depthExpanded = true;
+      usedDepth = d;
+    }
+    if (!result) {
+      result = await runHelper<import("./uia/types.js").QueryResult>({ action: "ui-query", target: { ...target, maxDepth: limit } });
+      usedDepth = limit;
+    }
+  } else {
+    result = await runHelper<import("./uia/types.js").QueryResult>({ action: "ui-query", target });
+    usedDepth = maxDepth;
+  }
+
+  const projected = applyScopedQuery(result, input, true);
+  return {
+    ...projected,
+    // Report the search metadata so the model can reason about depth.
+    maxDepth: usedDepth,
+    depthExpanded,
+    requestedMaxDepth: depthAuto ? null : maxDepth,
+    ...(input.fields && input.fields.length > 0 ? { projected: true } : {})
+  };
 }
 
 export async function getUiElement(input: UiGetInput): Promise<GetResult> {
