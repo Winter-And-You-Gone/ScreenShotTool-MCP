@@ -2,20 +2,41 @@
 //
 // The validator warns about LIKELY hard-coded credentials in executable
 // argument positions (workflow steps/finally/captureBefore args, workflow
-// inputSchema defaults/examples, action literal arguments) and in free
-// profile values. It must NOT flag identifiers: control ids, automationId
-// selectors, aliases, display names, environment-variable NAMES, or
-// ${...} variable references.
+// inputSchema defaults/examples/const/enum - including NESTED schemas,
+// action literal arguments) and in free profile values. It must NOT flag
+// identifiers: control ids, automationId selectors, aliases, display names,
+// or EXPLICIT environment-variable-name fields (executableEnv etc).
 //
-// Design: WHITELIST scan roots (positions that can carry executable
-// literals) + path-aware classification, instead of "serialize the whole
-// pack and regex it". Pure functions - no host-environment access, no
-// reading of environment variable contents.
+// Reference syntax: the ONLY formally supported non-literal reference form
+// is the App Pack pipeline's ${...} syntax (${env.X}, ${inputs.x},
+// ${secrets.x}). $env:/env:///secret:///process.env. forms are NOT claimed
+// to be safe - a bare literal that merely LOOKS like such a syntax is
+// treated per its field context (sensitive field -> warning).
+//
+// Design: WHITELIST scan roots + explicit scan CONTEXT per candidate string
+// (profile_value / workflow_args / ... / selector / metadata). Identifier
+// exclusion applies ONLY in selector/metadata contexts - an executable
+// argument named `key`/`path`/`source` is never excluded by its field name,
+// and credential value shapes take priority over neutral field names.
+// Pure functions - no host-environment access, no reading of environment
+// variable contents.
+
+export type SensitiveScanContext =
+  | "profile_value"
+  | "workflow_args"
+  | "workflow_expect"
+  | "workflow_retry"
+  | "input_schema_literal"
+  | "action_literal"
+  | "selector"
+  | "metadata";
 
 export type SensitiveFinding = {
+  file: "profile.json" | "workflows.json" | "actions.json";
   path: string; // dot/bracket path, e.g. workflows.configure.steps[0].args.password
   reason: string;
   redactedPreview: string;
+  context: SensitiveScanContext;
 };
 
 export type SensitiveScanResult = {
@@ -24,7 +45,8 @@ export type SensitiveScanResult = {
 
 // ── Redaction ──
 
-// Never echo the full secret anywhere (message/details/logs/tests).
+// Never echo the full secret anywhere (message/details/logs/tests). The
+// finding stores NO raw value - only the redacted preview.
 export function redactSensitiveValue(value: string): string {
   if (value.length <= 8) return "***";
   const keep = Math.min(2, Math.floor(value.length / 4));
@@ -33,38 +55,35 @@ export function redactSensitiveValue(value: string): string {
   return `${head}…${tail}`;
 }
 
-// ── Path classification ──
+// ── Path/context classification ──
 
 export type SensitiveClassification =
   | { kind: "excluded_identifier" }
-  | { kind: "environment_reference" }
-  | { kind: "input_reference" }
+  | { kind: "environment_variable_name" }
+  | { kind: "variable_reference" }
   | { kind: "ordinary_text" }
   | { kind: "likely_sensitive_literal"; reason: string };
 
-// Field-name suffixes/prefixes that mark a path as an IDENTIFIER position
-// (never scanned as a credential value). Matched case-insensitively on the
-// LAST path segment; selectors are matched on any "selector-ish" segment.
+// Field names that EXPLICITLY represent an environment-variable NAME
+// (never a credential value), regardless of the value's shape.
+const ENV_NAME_FIELD_RE = /^(executableEnv|environmentVariable|environmentVariables|envName|envVar|envKey)$/i;
+
+// The ONLY supported reference syntax: ${...} pipeline placeholders.
+const REFERENCE_RE = /^\$\{[^}]+\}$/;
+const REFERENCE_INSIDE_RE = /\$\{[^}]+\}/g;
+
+// Field-name suffixes/prefixes that mark a path as an IDENTIFIER position.
+// Used ONLY in selector/metadata contexts - never in executable contexts.
 const IDENTIFIER_LEAF_RE = /(^|_|\.|-)(id|ids|key|keys|name|names|title|alias|aliases|description|notes|reason|role|page|parent|group|members|children|control|controlid|automationid|objectname|accessiblename|rootcontrol|navigationcontrol|scrollcontainer|ready|marker|mappingstatus|file|path|source|profileid|workflowid|packid|saveas)$/i;
 const DISPLAY_NAME_RE = /^(displayname|display_name)$/i;
 
-// Environment-variable NAME pattern (ALL_CAPS_UNDERSCORE) - a name, not a
-// value. Only excluded when the field semantics say "env name".
-const ENV_NAME_RE = /^[A-Z][A-Z0-9_]*$/;
-
-// ${...} / $env:... / env://... / secret://... / process.env.X references.
-const REFERENCE_RE = /^\$\{[^}]+\}$/;
-const PIPE_REFERENCE_RE = /^\$\{[^}]+\}$/;
-
 // Sensitive FIELD NAMES (camelCase/snake_case/kebab-case tolerant). A field
 // with one of these names whose value is a bare literal is a strong signal.
-// camelCase is matched via a lowercase->uppercase boundary (apiToken,
-// accessToken, clientSecret, ...).
 const SENSITIVE_FIELD_RE =
   /(^|_|\.|-|[a-z])(password|passwd|passphrase|secret|token|apikey|api_key|accesstoken|refreshToken|authorization|auth|cookie|session|privateKey|clientSecret|credential|bearer|pw)$/i;
 
 // Value-shape features that indicate a real credential even under a neutral
-// field name. Deliberately conservative - short/ordinary text never matches.
+// field name in an EXECUTABLE context. Deliberately conservative.
 const BEARER_RE = /^Bearer\s+\S{8,}$/i;
 const BASIC_RE = /^Basic\s+[A-Za-z0-9+/=]{8,}$/i;
 const JWT_RE = /^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/;
@@ -73,59 +92,61 @@ const CLOUD_KEY_RE = /^(AKIA|ASIA|AIza|sk-|ghp_|xox[baprs]-)/;
 const URL_CRED_RE = /\/\/[^/\s:@]+:[^/\s:@]+@/; // user:password@ in a URL
 const CONNECTION_STRING_RE = /(password|pwd|secret|token)\s*=\s*\S+/i;
 
-// A string that is ONLY a variable/environment reference (or a template
-// whose fixed text is non-sensitive glue like "Bearer "/"Basic ") is safe
-// indirection, not a literal secret. Literal credentials glued next to a
-// reference (e.g. "Bearer abcdef123456") still match the value-shape rules.
-function isSafeReference(value: string): boolean {
-  const trimmed = value.trim();
-  if (REFERENCE_RE.test(trimmed) || PIPE_REFERENCE_RE.test(trimmed)) return true;
-  // Template with a reference plus only glue text: strip the reference(s)
-  // and check whether what remains is empty or non-sensitive glue.
-  const withoutRefs = trimmed.replace(/\$\{[^}]+\}/g, "").trim();
+// True when the value is exactly one ${...} reference.
+export function isSupportedReference(value: string): boolean {
+  return REFERENCE_RE.test(value.trim());
+}
+
+// True when the value is a template made ONLY of ${...} references plus
+// whitespace and safe glue (Bearer/Basic prefixes, punctuation). Anything
+// else left over means the template carries a literal - not a pure
+// reference, and possibly a credential glued to one.
+export function isReferenceOnlyTemplate(value: string): boolean {
+  const withoutRefs = value.trim().replace(REFERENCE_INSIDE_RE, "").trim();
   if (withoutRefs.length === 0) return true;
-  const glue = withoutRefs.replace(/^(Bearer|Basic)\s*/i, "").trim();
+  const glue = withoutRefs
+    .replace(/^(Bearer|Basic)\s*/i, "")
+    .replace(/^[:=,\s"'()\[\]{}]+$/, "")
+    .trim();
   return glue.length === 0;
 }
 
-// Decide whether a string at a path is a likely credential literal.
-export function classifyStringAtPath(path: string, value: string): SensitiveClassification {
-  const segments = path.split(/[.[\]]/).filter((s) => s !== "");
-  const leaf = segments[segments.length - 1] ?? "";
+// Decide whether a string at a path (with an explicit scan context) is a
+// likely credential literal.
+export function classifyStringAtPath(
+  pathSegments: Array<string | number>,
+  value: string,
+  context: SensitiveScanContext
+): SensitiveClassification {
+  const leaf = String(pathSegments[pathSegments.length - 1] ?? "");
 
-  // 1) Identifier/description positions are never credential values.
-  if (IDENTIFIER_LEAF_RE.test(leaf) || DISPLAY_NAME_RE.test(leaf)) {
-    return { kind: "excluded_identifier" };
-  }
-  // Selector sub-trees (automationId/name/className...) are identifiers.
-  if (path.includes(".selectors") || path.includes(".selector") || path.includes("automationId") || path.includes("objectName")) {
-    return { kind: "excluded_identifier" };
-  }
-
-  // 2) executableEnv is an ENVIRONMENT VARIABLE NAME, never a secret value.
-  if (leaf === "executableEnv" || leaf === "environmentVariable" || leaf === "envName") {
-    return { kind: "environment_reference" };
+  // 1) Explicit environment-variable-NAME fields: never a credential value,
+  //    regardless of value shape (MY_APP_TOKEN / RTK_PASSWORD / ...).
+  if (ENV_NAME_FIELD_RE.test(leaf)) {
+    return { kind: "environment_variable_name" };
   }
 
-  // 3) Whole-string variable references are safe indirection.
-  if (isSafeReference(value)) {
-    return { kind: "input_reference" };
+  // 2) Supported ${...} reference (or a reference-only template such as
+  //    "Bearer ${env.API_TOKEN}") is safe indirection in ANY context.
+  if (isSupportedReference(value) || isReferenceOnlyTemplate(value)) {
+    return { kind: "variable_reference" };
   }
 
-  // 4) Sensitive field name + bare literal -> likely credential. The field
-  //    name may be a PARENT segment (e.g. inputSchema property "password"
-  //    under ".default"): any segment counts.
-  const anySensitiveSegment = segments.some((s) => SENSITIVE_FIELD_RE.test(s));
-  if (anySensitiveSegment && value.length >= 3) {
-    // An ALL_CAPS value under a sensitive field is ambiguous (could be an
-    // env name); only flag it when it is not purely a NAME-shaped token.
-    if (ENV_NAME_RE.test(value)) {
-      return { kind: "ordinary_text" };
+  // 3) Identifier exclusion applies ONLY in selector/metadata contexts.
+  //    An executable arg named key/path/source/file is NEVER excluded.
+  if (context === "selector" || context === "metadata") {
+    const pathStr = pathSegments.join(".");
+    if (IDENTIFIER_LEAF_RE.test(leaf) || DISPLAY_NAME_RE.test(leaf)) {
+      return { kind: "excluded_identifier" };
     }
-    return { kind: "likely_sensitive_literal", reason: "sensitive_field_with_literal_value" };
+    if (pathStr.includes("selectors") || pathStr.includes("selector") || pathStr.includes("automationId") || pathStr.includes("objectName")) {
+      return { kind: "excluded_identifier" };
+    }
   }
 
-  // 5) Value-shape features under any non-identifier field.
+  // 4) Credential VALUE SHAPES take priority over neutral field names, in
+  //    executable contexts (and conservatively in selector/metadata too:
+  //    a full Bearer/JWT/private key is never a normal control id).
   const shapes: Array<[RegExp, string]> = [
     [BEARER_RE, "bearer_token_literal"],
     [BASIC_RE, "basic_auth_literal"],
@@ -139,6 +160,14 @@ export function classifyStringAtPath(path: string, value: string): SensitiveClas
     if (re.test(value)) {
       return { kind: "likely_sensitive_literal", reason };
     }
+  }
+
+  // 5) Sensitive FIELD NAME (any path segment) + bare literal. ALL-CAPS
+  //    values are NOT auto-excluded here: an uppercase literal under
+  //    args.password is a hard-coded credential, not an env-name (env-name
+  //    exclusion is handled by rule 1 only).
+  if (pathSegments.some((s) => SENSITIVE_FIELD_RE.test(String(s))) && value.length >= 3) {
+    return { kind: "likely_sensitive_literal", reason: "sensitive_field_with_literal_value" };
   }
 
   return { kind: "ordinary_text" };
@@ -157,92 +186,164 @@ export type SensitiveScanInput = {
   actions: Array<{ control: string; action: string; defaultExpect?: unknown }>;
 };
 
-// Walk only the positions that can carry executable literals:
-//   - workflow steps/finally args, captureBefore.read.args, expect, retry
-//   - workflow inputSchema property defaults/examples/const/enum values
-//   - action defaultExpect (only the value-carrying leaf fields)
-//   - profile free values (whole profile; identifier leaves are excluded by
-//     classification, executableEnv excluded by the env-name rule)
 function walkValue(
   value: unknown,
-  path: string,
+  pathSegments: Array<string | number>,
+  context: SensitiveScanContext,
+  file: SensitiveFinding["file"],
   findings: SensitiveFinding[],
   depth = 0
 ): void {
   if (depth > 32) return; // cycle/depth safety (JSON data, but be safe)
   if (typeof value === "string") {
-    const cls = classifyStringAtPath(path, value);
+    const cls = classifyStringAtPath(pathSegments, value, context);
     if (cls.kind === "likely_sensitive_literal") {
-      findings.push({ path, reason: cls.reason, redactedPreview: redactSensitiveValue(value) });
+      findings.push({
+        file,
+        path: pathSegments.map((s, i) => (typeof s === "number" ? `[${s}]` : i === 0 ? s : `.${s}`)).join(""),
+        reason: cls.reason,
+        redactedPreview: redactSensitiveValue(value),
+        context
+      });
     }
     return;
   }
   if (Array.isArray(value)) {
     for (let i = 0; i < value.length; i++) {
-      walkValue(value[i], `${path}[${i}]`, findings, depth + 1);
+      walkValue(value[i], [...pathSegments, i], context, file, findings, depth + 1);
     }
     return;
   }
   if (value !== null && typeof value === "object") {
     for (const [key, child] of Object.entries(value as Record<string, unknown>)) {
-      walkValue(child, path ? `${path}.${key}` : key, findings, depth + 1);
+      walkValue(child, [...pathSegments, key], context, file, findings, depth + 1);
     }
   }
 }
 
-// Keys inside an inputSchema property whose values may be literal secrets.
+// Keys inside an inputSchema whose values may be literal secrets.
 const SCHEMA_LITERAL_KEYS = new Set(["default", "example", "examples", "const", "enum"]);
 
-export function scanSensitiveValues(input: SensitiveScanInput): SensitiveScanResult {
-  const findings: SensitiveFinding[] = [];
+// Keys whose value is a nested SCHEMA (or array of schemas) to recurse into.
+const SCHEMA_NEST_KEYS: Record<string, "single" | "array" | "map"> = {
+  properties: "map",
+  patternProperties: "map",
+  items: "single", // single schema or array of schemas (handled below)
+  prefixItems: "array",
+  allOf: "array",
+  anyOf: "array",
+  oneOf: "array",
+  not: "single",
+  if: "single",
+  then: "single",
+  else: "single",
+  dependentSchemas: "map",
+  contains: "single",
+  unevaluatedItems: "single",
+  unevaluatedProperties: "single",
+  propertyNames: "single"
+};
 
-  // Profile free values (executableEnv is excluded by classification).
-  walkValue(input.profile, "profile", findings);
+let schemaNodeBudget = 0;
+const SCHEMA_NODE_LIMIT = 4000;
 
-  // Workflow executable positions.
-  for (let wi = 0; wi < input.workflows.length; wi++) {
-    const wf = input.workflows[wi]!;
-    const wfPath = `workflows.${wf.id ?? wi}`;
-    for (let si = 0; si < wf.steps.length; si++) {
-      const step = wf.steps[si]!;
-      walkValue(step.args, `${wfPath}.steps[${si}].args`, findings);
-      if (step.captureBefore?.read?.args) {
-        walkValue(step.captureBefore.read.args, `${wfPath}.steps[${si}].captureBefore.read.args`, findings);
-      }
-      if (step.expect) walkValue(step.expect, `${wfPath}.steps[${si}].expect`, findings);
-      if (step.retry) walkValue(step.retry, `${wfPath}.steps[${si}].retry`, findings);
+// Recursively scan a JSON Schema for literal secret keywords. Only
+// default/example/examples/const/enum values are classified; description/
+// title/$id/$ref/pattern/format are never scanned.
+function scanSchemaLiterals(
+  schema: unknown,
+  pathSegments: Array<string | number>,
+  findings: SensitiveFinding[],
+  file: SensitiveFinding["file"],
+  depth = 0
+): void {
+  if (depth > 40 || schemaNodeBudget >= SCHEMA_NODE_LIMIT) return;
+  if (schema === null || typeof schema !== "object" || Array.isArray(schema)) {
+    // A bare literal at a schema position is not an executable value.
+    return;
+  }
+  schemaNodeBudget++;
+  const obj = schema as Record<string, unknown>;
+
+  // Literal keywords at this node.
+  for (const key of SCHEMA_LITERAL_KEYS) {
+    const literal = obj[key];
+    if (literal !== undefined) {
+      walkValue(literal, [...pathSegments, key], "input_schema_literal", file, findings);
     }
-    for (let fi = 0; fi < (wf.finally ?? []).length; fi++) {
-      const step = wf.finally![fi]!;
-      walkValue(step.args, `${wfPath}.finally[${fi}].args`, findings);
-      if (step.captureBefore?.read?.args) {
-        walkValue(step.captureBefore.read.args, `${wfPath}.finally[${fi}].captureBefore.read.args`, findings);
+  }
+
+  // Recurse into nested schema containers.
+  for (const [key, kind] of Object.entries(SCHEMA_NEST_KEYS)) {
+    const child = obj[key];
+    if (child === undefined) continue;
+    if (kind === "map" && typeof child === "object" && !Array.isArray(child)) {
+      for (const [subKey, subSchema] of Object.entries(child as Record<string, unknown>)) {
+        scanSchemaLiterals(subSchema, [...pathSegments, key, subKey], findings, file, depth + 1);
       }
-      if (step.expect) walkValue(step.expect, `${wfPath}.finally[${fi}].expect`, findings);
-      if (step.retry) walkValue(step.retry, `${wfPath}.finally[${fi}].retry`, findings);
-    }
-    // inputSchema property defaults/examples/const/enum.
-    for (const [propName, propSchema] of Object.entries(wf.inputSchema?.properties ?? {})) {
-      const propPath = `${wfPath}.inputSchema.properties.${propName}`;
-      if (propSchema !== null && typeof propSchema === "object") {
-        for (const key of SCHEMA_LITERAL_KEYS) {
-          const literal = (propSchema as Record<string, unknown>)[key];
-          if (literal !== undefined) {
-            walkValue(literal, `${propPath}.${key}`, findings);
-          }
+    } else if (kind === "array" && Array.isArray(child)) {
+      for (let i = 0; i < child.length; i++) {
+        scanSchemaLiterals(child[i], [...pathSegments, key, i], findings, file, depth + 1);
+      }
+    } else if (kind === "single") {
+      // items may be a single schema OR an array of schemas (tuple form).
+      if (Array.isArray(child)) {
+        for (let i = 0; i < child.length; i++) {
+          scanSchemaLiterals(child[i], [...pathSegments, key, i], findings, file, depth + 1);
         }
+      } else {
+        scanSchemaLiterals(child, [...pathSegments, key], findings, file, depth + 1);
       }
     }
   }
 
-  // Action contracts: defaultExpect value-carrying leaves (expectedValue,
-  // toggleState, selector values are identifiers/state, not credentials).
+  // additionalProperties: boolean or a schema.
+  const additional = obj.additionalProperties;
+  if (additional !== undefined && additional !== null && typeof additional === "object") {
+    scanSchemaLiterals(additional, [...pathSegments, "additionalProperties"], findings, file, depth + 1);
+  }
+}
+
+export function scanSensitiveValues(input: SensitiveScanInput): SensitiveScanResult {
+  const findings: SensitiveFinding[] = [];
+  schemaNodeBudget = 0;
+
+  // Profile free values (explicit env-name fields excluded by rule 1).
+  walkValue(input.profile, ["profile"], "profile_value", "profile.json", findings);
+
+  // Workflow executable positions.
+  for (let wi = 0; wi < input.workflows.length; wi++) {
+    const wf = input.workflows[wi]!;
+    const wfPath = ["workflows", wf.id ?? wi];
+    for (let si = 0; si < wf.steps.length; si++) {
+      const step = wf.steps[si]!;
+      walkValue(step.args, [...wfPath, "steps", si, "args"], "workflow_args", "workflows.json", findings);
+      if (step.captureBefore?.read?.args) {
+        walkValue(step.captureBefore.read.args, [...wfPath, "steps", si, "captureBefore", "read", "args"], "workflow_args", "workflows.json", findings);
+      }
+      if (step.expect) walkValue(step.expect, [...wfPath, "steps", si, "expect"], "workflow_expect", "workflows.json", findings);
+      if (step.retry) walkValue(step.retry, [...wfPath, "steps", si, "retry"], "workflow_retry", "workflows.json", findings);
+    }
+    for (let fi = 0; fi < (wf.finally ?? []).length; fi++) {
+      const step = wf.finally![fi]!;
+      walkValue(step.args, [...wfPath, "finally", fi, "args"], "workflow_args", "workflows.json", findings);
+      if (step.captureBefore?.read?.args) {
+        walkValue(step.captureBefore.read.args, [...wfPath, "finally", fi, "captureBefore", "read", "args"], "workflow_args", "workflows.json", findings);
+      }
+      if (step.expect) walkValue(step.expect, [...wfPath, "finally", fi, "expect"], "workflow_expect", "workflows.json", findings);
+      if (step.retry) walkValue(step.retry, [...wfPath, "finally", fi, "retry"], "workflow_retry", "workflows.json", findings);
+    }
+    // Nested inputSchema scanning (properties/items/allOf/anyOf/oneOf/...).
+    scanSchemaLiterals(wf.inputSchema, [...wfPath, "inputSchema"], findings, "workflows.json");
+  }
+
+  // Action contracts: defaultExpect value-carrying leaves.
   for (let ai = 0; ai < input.actions.length; ai++) {
     const contract = input.actions[ai]!;
-    const base = `actions.contracts[${ai}]`;
+    const base = ["actions", "contracts", ai];
     const expect = contract.defaultExpect;
     if (expect !== null && typeof expect === "object") {
-      walkValue((expect as Record<string, unknown>).expectedValue, `${base}.defaultExpect.expectedValue`, findings);
+      walkValue((expect as Record<string, unknown>).expectedValue, [...base, "defaultExpect", "expectedValue"], "action_literal", "actions.json", findings);
     }
   }
 

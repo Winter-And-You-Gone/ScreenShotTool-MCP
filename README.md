@@ -250,7 +250,7 @@ $env:SCREENSHOT_MCP_APP_PACK_DIRS = "X:\Private\AppPacks;D:\Team\AppPacks"
 
 检查项：manifest/profile/controls/actions/workflows 的 Schema、control 引用、workflow 工具名、参数 Schema、输出引用路径、循环/前向引用、敏感字段、目录逃逸、绝对路径、重复 ID、未知动作、不安全重试（非幂等 + retrySafe）。返回 `{ valid, errors[], warnings[], checked[] }`。
 
-App Pack validator 会对**可执行参数位置**中疑似硬编码的凭据值发出 `SENSITIVE_VALUE` 警告（workflow steps/finally/captureBefore 参数、inputSchema 的 default/example/const/enum、action 字面量参数）。标识符、可访问名称、控件 ID 与环境变量**名称**（如 `executableEnv`）不会被当作凭据；`${env.APP_PASSWORD}` 等变量引用也不会。请使用输入或环境变量引用代替字面量秘密。
+App Pack validator 会对**可执行参数位置**中疑似硬编码的凭据值发出 `SENSITIVE_VALUE` 警告（profile、workflow steps/finally/captureBefore 参数、嵌套 inputSchema 的 default/example/examples/const/enum、action 字面量参数），并精确标注来源文件（profile.json / workflows.json / actions.json）。控件标识符、selector、显示名称、描述与明确的环境变量**名称**字段（如 `executableEnv`）不会被当作凭据；全大写文本也不会自动视为环境变量引用。只有 App Pack 正式支持的 `${...}` 引用语法（如 `${env.APP_PASSWORD}`）被视为非字面量引用。请使用输入或环境变量引用代替字面量秘密。
 
 ## 生成 Pack 草稿
 

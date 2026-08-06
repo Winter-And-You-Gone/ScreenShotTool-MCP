@@ -437,13 +437,13 @@ function validateSensitiveData(
   // Path-aware sensitive-value scan (see src/app-packs/sensitive.ts):
   //   - scans ONLY positions that can carry executable literals
   //     (workflow steps/finally/captureBefore args, expect/retry,
-  //     inputSchema defaults/examples/const/enum, action defaultExpect
-  //     values, free profile values),
-  //   - never flags identifiers (control ids, automationId selectors,
-  //     aliases/displayNames), environment-variable NAMES (executableEnv),
-  //     or ${...} variable references.
-  // Findings carry exact paths and REDACTED previews - the raw value is
-  // never echoed into warnings.
+  //     nested inputSchema defaults/examples/const/enum, action
+  //     defaultExpect values, free profile values),
+  //   - never flags identifiers (selector/control metadata only),
+  //     explicit environment-variable-NAME fields (executableEnv), or
+  //     ${...} variable references.
+  // Findings carry the SOURCE FILE, exact paths and REDACTED previews -
+  // the raw value is never echoed into warnings.
   const sensitive = scanSensitiveValues({
     profile: pack.profile,
     workflows: pack.workflows.workflows,
@@ -451,7 +451,7 @@ function validateSensitiveData(
   });
   for (const finding of sensitive.findings) {
     warnings.push({
-      file: "workflows.json",
+      file: finding.file,
       path: finding.path,
       code: "SENSITIVE_VALUE",
       message: `A likely hard-coded credential was found in an executable argument position (${finding.reason}); value preview '${finding.redactedPreview}'.`,

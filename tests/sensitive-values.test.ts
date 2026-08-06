@@ -158,33 +158,52 @@ test("stability: identical input yields identical ordered findings", () => {
   assert.deepEqual(a, b);
 });
 
-// ── classification unit checks ──
+// ── classification unit checks (path + context aware) ──
 
-test("classify: sensitive field with ALL_CAPS value is treated as ordinary text (ambiguous env name)", () => {
-  const cls = classifyStringAtPath("workflows.w.steps[0].args.password", "MY_REAL_PASSWORD");
-  assert.equal(cls.kind, "ordinary_text");
-});
+function segs(path: string): Array<string | number> {
+  return path.split(/[.[\]]/).filter((s) => s !== "");
+}
 
-test("classify: literal under sensitive field warns", () => {
-  const cls = classifyStringAtPath("workflows.w.steps[0].args.password", "literal-secret");
+test("classify: ALL_CAPS literal under sensitive field in workflow_args WARNS (no env-name guess)", () => {
+  const cls = classifyStringAtPath(segs("workflows.w.steps[0].args.password"), "SUPERSECRET123", "workflow_args");
   assert.equal(cls.kind, "likely_sensitive_literal");
 });
 
-test("classify: executableEnv never warns regardless of value shape", () => {
-  const cls = classifyStringAtPath("profile.executableEnv", "MY_APP_TOKEN");
-  assert.equal(cls.kind, "environment_reference");
+test("classify: executableEnv is an environment-variable NAME regardless of value shape", () => {
+  const cls = classifyStringAtPath(segs("profile.executableEnv"), "MY_APP_TOKEN", "profile_value");
+  assert.equal(cls.kind, "environment_variable_name");
+  const cls2 = classifyStringAtPath(segs("profile.environmentVariable"), "RTK_PASSWORD", "profile_value");
+  assert.equal(cls2.kind, "environment_variable_name");
 });
 
-test("classify: selector subtree values are identifiers", () => {
-  const cls = classifyStringAtPath("workflows.w.steps[0].args.selector.automationId", "passwordInput");
+test("classify: ${...} reference is safe in any context", () => {
+  const cls = classifyStringAtPath(segs("workflows.w.steps[0].args.password"), "${env.MY_APP_TOKEN}", "workflow_args");
+  assert.equal(cls.kind, "variable_reference");
+  const cls2 = classifyStringAtPath(segs("workflows.w.steps[0].args.authorization"), "Bearer ${env.API_TOKEN}", "workflow_args");
+  assert.equal(cls2.kind, "variable_reference");
+});
+
+test("classify: $env: syntax is NOT a supported reference - sensitive field warns", () => {
+  const cls = classifyStringAtPath(segs("workflows.w.steps[0].args.password"), "$env:RTK_PASSWORD", "workflow_args");
+  assert.equal(cls.kind, "likely_sensitive_literal");
+});
+
+test("classify: selector subtree values are identifiers (selector context only)", () => {
+  const cls = classifyStringAtPath(segs("workflows.w.steps[0].args.selector.automationId"), "passwordInput", "selector");
   assert.equal(cls.kind, "excluded_identifier");
+  // Same path in an EXECUTABLE context is not excluded by field name alone.
+  const exec = classifyStringAtPath(segs("workflows.w.steps[0].args.key"), "passwordInput", "workflow_args");
+  assert.equal(exec.kind, "ordinary_text");
 });
 
-test("classify: identifier leaf names never warn", () => {
+test("classify: identifier leaf names excluded ONLY in selector/metadata contexts", () => {
   for (const leaf of ["id", "aliases", "displayName", "notes", "reason", "role", "mappingStatus", "saveAs"]) {
-    const cls = classifyStringAtPath(`workflows.w.steps[0].args.${leaf}`, "passwordInput");
-    assert.equal(cls.kind, "excluded_identifier", `leaf '${leaf}' must be excluded`);
+    const cls = classifyStringAtPath(segs(`controls.x.${leaf}`), "passwordInput", "metadata");
+    assert.equal(cls.kind, "excluded_identifier", `leaf '${leaf}' must be excluded in metadata`);
   }
+  // In workflow_args the same leaf names are NOT excluded.
+  const exec = classifyStringAtPath(segs("workflows.w.steps[0].args.key"), "AKIA1234567890ABCDEF", "workflow_args");
+  assert.equal(exec.kind, "likely_sensitive_literal", "cloud key shape must win over neutral field name");
 });
 
 // ── integration through the pack validator ──
@@ -256,4 +275,162 @@ test("validator integration: env-reference args do not warn", async () => {
     }
   });
   assert.ok(!v.warnings.some((x) => x.code === "SENSITIVE_VALUE"), JSON.stringify(v.warnings));
+});
+
+// ── new coverage: uppercase literals, neutral executable args, nesting, files ──
+
+test("warn: uppercase literals under sensitive fields", () => {
+  const cases: Array<[string, string]> = [
+    ["password", "SUPERSECRET123"],
+    ["token", "ABCDEF1234567890"],
+    ["clientSecret", "PRODUCTIONSECRET"],
+    ["apiKey", "AKIA1234567890ABCDEF"]
+  ];
+  for (const [field, value] of cases) {
+    const input = workflowWithArgs({ [field]: value });
+    const paths = scan(input);
+    assert.ok(paths.length > 0, `'${field}' must warn, got ${JSON.stringify(paths)}`);
+  }
+});
+
+test("warn: executable args key/path/source/file are not excluded by field name", () => {
+  const cases: Array<[string, string]> = [
+    ["key", "AKIA1234567890ABCDEF"],
+    ["path", "https://user:supersecret@example.com"],
+    ["source", "Bearer abcdef1234567890"],
+    ["file", "connection password=literal-secret"]
+  ];
+  for (const [field, value] of cases) {
+    const input = workflowWithArgs({ [field]: value });
+    const paths = scan(input);
+    assert.ok(paths.includes(`workflows.configure.steps[0].args.${field}`), `'${field}' must warn, got ${JSON.stringify(paths)}`);
+  }
+});
+
+test("no-warn: env-name fields and ${...} references stay safe", () => {
+  const envInput: SensitiveScanInput = {
+    profile: { executableEnv: "MY_APP_TOKEN", environmentVariable: "RTK_PASSWORD" },
+    workflows: [],
+    actions: []
+  };
+  assert.deepEqual(scan(envInput), []);
+  const refInput = workflowWithArgs({ password: "${env.RTK_PASSWORD}", token: "${inputs.password}", authorization: "Bearer ${env.API_TOKEN}", auth: "Basic ${inputs.credentials}" });
+  assert.deepEqual(scan(refInput), []);
+});
+
+test("warn: nested inputSchema literals are found at any depth", () => {
+  const nested: SensitiveScanInput = {
+    profile: {},
+    workflows: [{
+      id: "configure",
+      steps: [],
+      inputSchema: {
+        properties: {
+          credentials: {
+            type: "object",
+            properties: {
+              password: { type: "string", default: "hardcoded-secret" }
+            }
+          }
+        }
+      }
+    }],
+    actions: []
+  };
+  const paths = scan(nested);
+  assert.ok(paths.includes("workflows.configure.inputSchema.properties.credentials.properties.password.default"), JSON.stringify(paths));
+});
+
+test("warn: inputSchema items/oneOf/allOf/additionalProperties literals", () => {
+  const schema: SensitiveScanInput = {
+    profile: {},
+    workflows: [{
+      id: "configure",
+      steps: [],
+      inputSchema: {
+        properties: {
+          list: { type: "array", items: { type: "object", properties: { token: { type: "string", example: "literal-token-value" } } } },
+          choice: { oneOf: [{ type: "string" }, { type: "object", properties: { clientSecret: { type: "string", const: "hardcoded-const" } } }] },
+          combo: { allOf: [{ properties: { authorization: { type: "string", examples: ["Bearer abcdef123456"] } } }] },
+          map: { type: "object", additionalProperties: { properties: { apiKey: { type: "string", enum: ["AKIA1234567890ABCDEF"] } } } }
+        }
+      }
+    }],
+    actions: []
+  };
+  const paths = scan(schema);
+  for (const expected of [
+    "workflows.configure.inputSchema.properties.list.items.properties.token.example",
+    "workflows.configure.inputSchema.properties.choice.oneOf[1].properties.clientSecret.const",
+    "workflows.configure.inputSchema.properties.combo.allOf[0].properties.authorization.examples[0]",
+    "workflows.configure.inputSchema.properties.map.additionalProperties.properties.apiKey.enum[0]"
+  ]) {
+    assert.ok(paths.includes(expected), `missing ${expected}; got ${JSON.stringify(paths)}`);
+  }
+});
+
+test("no-warn: inputSchema description/title are never scanned", () => {
+  const schema: SensitiveScanInput = {
+    profile: {},
+    workflows: [{
+      id: "w",
+      steps: [],
+      inputSchema: {
+        properties: {
+          password: { type: "string", description: "Password used for authentication", title: "Secret Settings" }
+        }
+      }
+    }],
+    actions: []
+  };
+  assert.deepEqual(scan(schema), []);
+});
+
+test("file: findings carry the correct source file", async () => {
+  const profileOnly: SensitiveScanInput = {
+    profile: { apiToken: "PROFILELITERAL" },
+    workflows: [],
+    actions: []
+  };
+  const pf = scanSensitiveValues(profileOnly).findings;
+  assert.equal(pf.length, 1);
+  assert.equal(pf[0]!.file, "profile.json");
+
+  const wfOnly: SensitiveScanInput = {
+    profile: {},
+    workflows: [{ id: "w", steps: [{ tool: "type_text", args: { password: "WORKFLOWLITERAL" } }] }],
+    actions: []
+  };
+  const wf = scanSensitiveValues(wfOnly).findings;
+  assert.equal(wf.length, 1);
+  assert.equal(wf[0]!.file, "workflows.json");
+  assert.equal(wf[0]!.path, "workflows.w.steps[0].args.password");
+
+  const actionOnly: SensitiveScanInput = {
+    profile: {},
+    workflows: [],
+    actions: [{ control: "x", action: "invoke", defaultExpect: { profileControl: "y", condition: "valueEquals", expectedValue: "Bearer ACTIONLITERALTOKEN" } }]
+  };
+  const af = scanSensitiveValues(actionOnly).findings;
+  assert.equal(af.length, 1);
+  assert.equal(af[0]!.file, "actions.json");
+  assert.equal(af[0]!.path, "actions.contracts[0].defaultExpect.expectedValue");
+});
+
+test("redaction: no raw value in serialized findings for all new cases", () => {
+  const secrets = ["SUPERSECRET123", "AKIA1234567890ABCDEF", "Bearer abcdef1234567890", "hardcoded-secret"];
+  const input = workflowWithArgs({
+    password: secrets[0]!,
+    apiKey: secrets[1]!,
+    source: secrets[2]!,
+    token: "nested"
+  });
+  const result = scanSensitiveValues(input);
+  const serialized = JSON.stringify(result);
+  for (const secret of secrets) {
+    assert.ok(!serialized.includes(secret), `raw secret leaked: ${secret}`);
+  }
+  for (const f of result.findings) {
+    assert.ok(!f.redactedPreview.includes("SUPERSECRET123"));
+  }
 });
