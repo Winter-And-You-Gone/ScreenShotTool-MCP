@@ -242,6 +242,7 @@ type HelperRequest =
   | { action: "read-clipboard"; target?: Record<string, unknown> }
   | { action: "write-clipboard"; target: WriteClipboardInput }
   | { action: "get-window-state"; target: GetWindowStateInput }
+  | { action: "get-client-rect-screen"; target: { hwnd: string | number } }
   | { action: "wait-for-window"; target: Omit<WaitForWindowInput, "timeoutMs" | "pollIntervalMs"> & { timeoutMs?: number; pollIntervalMs?: number } }
   | { action: "ui-inspect-tree"; target: UiInspectTreeInput }
   | { action: "ui-query"; target: UiQueryInput }
@@ -273,6 +274,23 @@ export async function writeClipboard(input: WriteClipboardInput): Promise<WriteC
 
 export async function getWindowState(input: GetWindowStateInput): Promise<WindowStateResult> {
   return runHelper<WindowStateResult>({ action: "get-window-state", target: input })
+}
+
+// Real Win32 client area of a window in SCREEN coordinates. Unlike a UIA
+// Window boundingRect (which includes the title bar, borders and shadows),
+// this is the true client rect: GetClientRect + ClientToScreen. Returns the
+// rect with an explicit coordinateSpace:"screen" and the Win32 source label.
+export type ClientRectScreenResult = {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+  coordinateSpace: "screen";
+  source: string;
+};
+
+export async function getWindowClientRectScreen(input: { hwnd: string | number }): Promise<ClientRectScreenResult> {
+  return runHelper<ClientRectScreenResult>({ action: "get-client-rect-screen", target: { hwnd: String(input.hwnd) } });
 }
 
 export type ProcessAliveResult = {

@@ -26,13 +26,14 @@ export type ControlStateCondition = (typeof CONTROL_STATE_CONDITIONS)[number];
 
 // Fallback methods the executor can actually perform (profile composite
 // actions map each method to a UIA action). Packs may declare any subset in
-// any order; the executor honors the declared order.
+// any order; the executor honors the declared order. ONLY methods with a real
+// executor mapping belong here - a declarative-only label would silently
+// misreport what actually ran.
 export const FALLBACK_METHODS = [
   "SelectionItemPattern",
   "TogglePattern",
   "InvokePattern",
-  "WindowMessageElementClick",
-  "KeyboardNavigation"
+  "WindowMessageElementClick"
 ] as const;
 
 export type FallbackMethod = (typeof FALLBACK_METHODS)[number];

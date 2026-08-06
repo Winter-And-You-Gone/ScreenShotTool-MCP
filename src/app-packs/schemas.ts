@@ -176,8 +176,9 @@ const packBusinessPostconditionSchema: z.ZodType<import("./types.js").PackBusine
 // Control-state conditions apply to the control ITSELF - no profileControl
 // or selector references (unlike business postconditions which reference
 // content markers via profileControl). Conditions come from the SHARED enum
-// (src/app-packs/enums.ts) - the executor implements exactly these.
-const packControlStateConditionSchema = z.object({
+// (src/app-packs/enums.ts) - the executor implements exactly these. Exported
+// so tests can assert schema == executor set equality.
+export const packControlStateConditionSchema = z.object({
   condition: z.enum(CONTROL_STATE_CONDITIONS),
   expectedValue: z.string().max(4000).optional(),
   toggleState: z.enum(["On", "Off", "Indeterminate"]).optional()

@@ -15,6 +15,66 @@ export type Rect = {
 
 export type RectLike = Partial<Rect> & { x?: number; y?: number; width?: number; height?: number };
 
+// Scroll direction relative to a viewport, for a vertical scrollbar whose
+// value INCREASES as content scrolls DOWN (the standard mapping):
+//   backward = scroll up   = value decreases = decrement
+//   forward  = scroll down = value increases = increment
+export type ScrollDirection = "backward" | "forward" | "none";
+
+// Determine which way to scroll to bring `elementRect` fully inside
+// `viewportRect` (with margin). Pure geometry - never uses control names or
+// page types.
+//   element bottom > viewport bottom - margin -> forward (scroll down;
+//                                                 value increases)
+//   element top < viewport top + margin       -> backward (scroll up;
+//                                                 value decreases)
+//   otherwise                                  -> none
+// Order matters: an element hanging BELOW the viewport often also has its
+// top above the viewport top (it spans the whole viewport); the bottom
+// overhang decides first, so the direction is forward, never backward.
+export function determineScrollDirection(
+  elementRect: RectLike | null | undefined,
+  viewportRect: RectLike | null | undefined,
+  margin: number
+): ScrollDirection {
+  if (!elementRect || !viewportRect) return "none";
+  const m = Math.max(0, margin);
+  const e = {
+    top: elementRect.y ?? 0,
+    bottom: (elementRect.y ?? 0) + (elementRect.height ?? 0)
+  };
+  const v = {
+    top: viewportRect.y ?? 0,
+    bottom: (viewportRect.y ?? 0) + (viewportRect.height ?? 0)
+  };
+  if (e.bottom > v.bottom - m) return "forward";
+  if (e.top < v.top + m) return "backward";
+  return "none";
+}
+
+// Compute the next finite RangeValue step toward `direction` from the
+// current value. Never jumps straight to minimum/maximum.
+//   effectiveStep prefers largeChange, then smallChange, then
+//   max((maximum-minimum)*0.1, 1) (the proportional step is floored at 1 so
+//   tiny spans still make progress), and clamps at the range bounds.
+export function nextRangeValueStep(
+  current: number,
+  direction: "backward" | "forward",
+  range: { minimum?: number | null; maximum?: number | null; smallChange?: number | null; largeChange?: number | null }
+): number {
+  const min = range.minimum ?? 0;
+  const max = range.maximum ?? Math.max(min + 1, current + 1);
+  const span = Math.max(0, max - min);
+  const effectiveStep =
+    (range.largeChange ?? 0) > 0 ? range.largeChange! :
+    (range.smallChange ?? 0) > 0 ? range.smallChange! :
+    Math.max(span * 0.1, 1);
+  if (direction === "forward") {
+    return Math.min(max, current + effectiveStep);
+  }
+  return Math.max(min, current - effectiveStep);
+}
+
 export type VisibilityResult = {
   visible: boolean;      // element exists and is not offscreen per UIA
   fullyVisible: boolean; // geometrically inside the viewport with margin
@@ -22,7 +82,7 @@ export type VisibilityResult = {
   elementRect?: RectLike;
   viewportRect?: RectLike;
   margin: number;
-  viewportSource: "scrollContainer" | "pageRoot" | "windowClient" | "none";
+  viewportSource: "scrollContainer" | "pageRoot" | "windowClientRect" | "windowBoundingRect" | "none";
 };
 
 export function isRectFullyVisible(

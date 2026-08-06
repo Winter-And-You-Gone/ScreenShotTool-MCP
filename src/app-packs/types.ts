@@ -102,12 +102,12 @@ export type PackControlStateRequirement = {
   all?: PackDefaultExpect[];
 };
 
-export type PackFallbackMethod =
-  | "SelectionItemPattern"
-  | "TogglePattern"
-  | "InvokePattern"
-  | "WindowMessageElementClick"
-  | "KeyboardNavigation";
+// Fallback methods a pack may declare. Sourced from the shared runtime enum
+// (src/app-packs/enums.ts) so the schema, validator and executor stay in
+// lockstep - only methods with a real executor mapping belong here.
+import type { FallbackMethod } from "./enums.js";
+
+export type PackFallbackMethod = FallbackMethod;
 
 export type PackFallbackPolicy = {
   enabled?: boolean;

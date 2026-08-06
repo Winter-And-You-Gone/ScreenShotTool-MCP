@@ -11,27 +11,13 @@
 // Pure functions - no UIA access, fully unit-testable.
 
 import type { UiElementState } from "../uia/types.js";
+// SINGLE SOURCE OF TRUTH: the condition list and type live in
+// src/app-packs/enums.ts (used by the zod schema, the validator and this
+// evaluator). No duplicate definition here - a condition the schema accepts
+// is guaranteed to have an executor implementation below.
+import { CONTROL_STATE_CONDITIONS, type ControlStateCondition } from "../app-packs/enums.js";
 
-// The conditions accepted by the controlState schema (src/app-packs/schemas.ts
-// packControlStateConditionSchema). Single source of truth - the validator
-// and this evaluator both read from here conceptually; keep in sync.
-export const CONTROL_STATE_CONDITIONS = [
-  "selected",
-  "notSelected",
-  "toggleStateEquals",
-  "expanded",
-  "collapsed",
-  "exists",
-  "notExists",
-  "visible",
-  "hidden",
-  "enabled",
-  "disabled",
-  "valueEquals",
-  "valueContains"
-] as const;
-
-export type ControlStateCondition = (typeof CONTROL_STATE_CONDITIONS)[number];
+export { CONTROL_STATE_CONDITIONS, type ControlStateCondition };
 
 export type ControlStateDefinition = {
   any?: Array<{ condition: ControlStateCondition; expectedValue?: string; toggleState?: "On" | "Off" | "Indeterminate" }>;

@@ -38,7 +38,7 @@ import { McpUiError } from "../uia/results.js";
 import { evaluateExpect } from "../expect.js";
 import { evaluateControlState, snapshotFromElement, type ControlStateEvaluation } from "./control-state.js";
 import { resolveFallbackPolicy, EXECUTABLE_FALLBACK_METHODS, type FallbackDecision } from "./fallback.js";
-import { evaluateVisibility, isRectFullyVisible, toRect, type RectLike, type VisibilityResult } from "./visibility.js";
+import { evaluateVisibility, isRectFullyVisible, toRect, determineScrollDirection, nextRangeValueStep, type RectLike, type VisibilityResult } from "./visibility.js";
 import {
   backgroundPolicyForAction,
   effectiveModeFor,
@@ -52,6 +52,11 @@ import {
 // The UIA surface the profile layer needs. index.ts supplies the real
 // implementations from the loaded windows.js runtime module.
 export type UiaDeps = {
+  // Real Win32 client rect (GetClientRect + ClientToScreen) in screen
+  // coordinates - used as the window viewport fallback for ensureVisible.
+  getWindowClientRectScreen: (input: { hwnd: string | number }) => Promise<{
+    x: number; y: number; width: number; height: number; coordinateSpace: "screen"; source: string;
+  }>;
   getUiElement: (input: {
     hwnd?: string | number;
     pid?: number;
@@ -485,6 +490,7 @@ export function profileList() {
 
 // Build the UiaDeps object from a loaded windows module. Used by index.ts.
 export function buildUiaDeps(windows: {
+  getWindowClientRectScreen: (input: { hwnd: string | number }) => Promise<{ x: number; y: number; width: number; height: number; coordinateSpace: "screen"; source: string }>;
   getUiElement: (input: never) => Promise<GetResult>;
   performUiAction: (input: never) => Promise<ActionResult>;
   queryUi: (input: never) => Promise<QueryResult>;
@@ -495,6 +501,7 @@ export function buildUiaDeps(windows: {
   restoreForegroundWindow: (previousForegroundHwnd?: string) => Promise<{ restored: boolean; foregroundHwnd: string; foregroundChanged: boolean }>;
 }): UiaDeps {
   return {
+    getWindowClientRectScreen: windows.getWindowClientRectScreen as UiaDeps["getWindowClientRectScreen"],
     getUiElement: windows.getUiElement as UiaDeps["getUiElement"],
     performUiAction: windows.performUiAction as UiaDeps["performUiAction"],
     queryUi: windows.queryUi as UiaDeps["queryUi"],
@@ -849,12 +856,24 @@ async function performCompositeProfileAction(
           if (r) return { rect: r, source: "pageRoot" };
         }
       }
-      // Fall back to the main window's client rect (converted to screen via
-      // the window's own boundingRect - UIA reports window rects in screen
-      // space already).
+      // Fall back to the real Win32 client rect (GetClientRect +
+      // ClientToScreen, screen space) - NEVER the UIA Window boundingRect
+      // (which includes the title bar, borders and shadows and would mark
+      // elements near the window edge as falsely fully visible). When the
+      // client rect is unavailable, fall back to the window bounding rect but
+      // label it accurately - it is NOT the client area.
+      const hwnd = windowSel.hwnd;
+      if (hwnd !== undefined) {
+        try {
+          const client = await deps.getWindowClientRectScreen({ hwnd });
+          if (client && client.coordinateSpace === "screen" && client.width > 0 && client.height > 0) {
+            return { rect: { x: client.x, y: client.y, width: client.width, height: client.height }, source: "windowClientRect" };
+          }
+        } catch { /* invalid/minimized hwnd - fall through to the explicit bounding-rect fallback */ }
+      }
       try {
         const winRect = await deps.getUiElement({ ...win(), selector: { controlType: "Window" }, includeProcessPopups: true, timeoutMs: actionTimeout });
-        if (winRect.found) return { rect: toRect(winRect.element.boundingRect) ?? null, source: "windowClient" };
+        if (winRect.found) return { rect: toRect(winRect.element.boundingRect) ?? null, source: "windowBoundingRect" };
       } catch { /* ignore */ }
       return { rect: null, source: "none" };
     };
@@ -862,8 +881,14 @@ async function performCompositeProfileAction(
     const checkVisible = async (e: UiElementState | null): Promise<VisibilityResult | null> => {
       if (!e) return null;
       const vp = await resolveViewport();
+      if (vp.rect) lastViewportRect = vp.rect;
       return evaluateVisibility(e, vp.rect, margin, vp.source);
     };
+
+    // Last known viewport rect (used by the direction logic so each scroll
+    // step compares against the CURRENT viewport, re-resolved after every
+    // scroll).
+    let lastViewportRect: RectLike | null = null;
 
     let element = await readElement();
     if (!element) {
@@ -879,7 +904,19 @@ async function performCompositeProfileAction(
 
     const attemptedStrategies: string[] = [];
     let scrollValueChanged = false;
+    let scrollDirection: import("./visibility.js").ScrollDirection = "none";
+    let initialScrollValue: number | null = null;
+    let finalScrollValue: number | null = null;
+    let attemptCount = 0;
     const deadline = Date.now() + (input.timeoutMs ?? 15000);
+
+    // Direction from the CURRENT element/viewport geometry (margin-aware).
+    // Pure function - never derived from control names.
+    const currentDirection = (): import("./visibility.js").ScrollDirection => {
+      const eRect = toRect(element?.boundingRect);
+      const vpRect = lastViewportRect;
+      return determineScrollDirection(eRect, vpRect, margin);
+    };
 
     // 1) ScrollItemPattern on the control itself.
     if (strategies.includes("ScrollItemPattern") && element.patterns.some((p) => p.includes("ScrollItem"))) {
@@ -898,9 +935,9 @@ async function performCompositeProfileAction(
       } catch { /* pattern not supported or scroll did not take - continue */ }
     }
 
-    // 2) Declared scroll container: drive RangeValuePattern (absolute). The
-    //    container itself is the viewport; track its scroll value to detect
-    //    no-change stalls.
+    // 2) Declared scroll container: direction-aware FINITE RangeValue steps.
+    //    Never jumps straight to maximum/minimum; each step is bounded by
+    //    largeChange/smallChange/range proportion and re-verifies geometry.
     if (scrollContainer && strategies.includes("RangeValueScroll") && Date.now() < deadline) {
       attemptedStrategies.push("RangeValueScroll");
       const containerEntry = normalizeControlEntry(profile.controls[scrollContainer]);
@@ -909,18 +946,30 @@ async function performCompositeProfileAction(
           try {
             const container = await deps.getUiElement({ ...win(), selector: containerSelector, includeProcessPopups: true, timeoutMs: actionTimeout, maxDepth: localMaxDepth });
             if (container.found && container.element?.patterns.some((p) => p.includes("RangeValue"))) {
-              const beforeValue = container.element.rangeValue;
-              await deps.performUiAction(act({ selector: containerSelector, action: "setRangeValue", rangeValue: Number(container.element.maximum ?? 0) }));
-              await waitSettle(250);
-              element = await readElement();
-              const afterContainer = await deps.getUiElement({ ...win(), selector: containerSelector, includeProcessPopups: true, timeoutMs: actionTimeout, maxDepth: localMaxDepth }).catch(() => null);
-              const afterValue = afterContainer?.element?.rangeValue ?? beforeValue;
-              if (afterValue !== beforeValue) scrollValueChanged = true;
-              vis = await checkVisible(element);
+              const range = container.element;
+              initialScrollValue = range.rangeValue;
+              for (let step = 0; step < 8 && Date.now() < deadline; step++) {
+                attemptCount++;
+                const dir = currentDirection();
+                if (dir === "none") break;
+                scrollDirection = dir;
+                const target = nextRangeValueStep(range.rangeValue ?? 0, dir, range);
+                if (target === range.rangeValue) break; // no finite progress possible
+                await deps.performUiAction(act({ selector: containerSelector, action: "setRangeValue", rangeValue: target }));
+                await waitSettle(200);
+                const re = await deps.getUiElement({ ...win(), selector: containerSelector, includeProcessPopups: true, timeoutMs: actionTimeout, maxDepth: localMaxDepth }).catch(() => null);
+                const newValue = re?.element?.rangeValue ?? range.rangeValue;
+                if (newValue !== (range.rangeValue ?? 0)) scrollValueChanged = true;
+                else break; // scroll value did not change - stop
+                element = await readElement();
+                vis = await checkVisible(element);
+                if (vis?.fullyVisible) break;
+              }
+              finalScrollValue = (await deps.getUiElement({ ...win(), selector: containerSelector, includeProcessPopups: true, timeoutMs: actionTimeout, maxDepth: localMaxDepth }).catch(() => null))?.element?.rangeValue ?? initialScrollValue;
               if (vis?.fullyVisible) {
                 return {
                   profile: profile.id, control: input.control, selectorUsed: selector, confidence: entry.confidence, notes: entry.notes,
-                  result: { success: true, method: "RangeValueScroll", alreadyVisible: false, scrolled: true, scrollContainer, ...vis }
+                  result: { success: true, method: "RangeValueScroll", alreadyVisible: false, scrolled: true, scrollContainer, ...vis, scrollDirection, attemptedStrategies, initialScrollValue, finalScrollValue, attemptCount }
                 };
               }
               break;
@@ -931,8 +980,11 @@ async function performCompositeProfileAction(
     }
 
     // 3) Step messages on the scroll container (window message, never the
-    //    physical mouse). Re-resolve + re-verify after every step; stop when
-    //    the scroll value stops changing or the deadline passes.
+    //    physical mouse). forward -> increment, backward -> decrement (the
+    //    standard vertical-scrollbar mapping; the helper actions are named
+    //    after the UIA RangeValue semantics). Re-resolve + re-verify after
+    //    every step; stop when the scroll value stops changing, the
+    //    direction reverses without improvement, or the deadline passes.
     if (scrollContainer && strategies.includes("WindowMessageWheel") && Date.now() < deadline) {
       attemptedStrategies.push("WindowMessageWheel");
       const containerEntry = normalizeControlEntry(profile.controls[scrollContainer]);
@@ -944,14 +996,23 @@ async function performCompositeProfileAction(
             const containerRect = toRect(container.element.boundingRect);
             const ctrlRect = toRect((await readElement())?.boundingRect);
             if (!containerRect || !ctrlRect) continue;
-            // Positive when the control sits above the viewport (scroll up).
-            const cy = ctrlRect.y ?? 0;
-            const vy = containerRect.y ?? 0;
-            const direction = cy < vy ? 1 : -1;
             let lastValue = container.element.rangeValue;
-            for (let step = 0; step < 8 && Date.now() < deadline; step++) {
+            let lastDirection: import("./visibility.js").ScrollDirection = "none";
+            for (let step = 0; step < 10 && Date.now() < deadline; step++) {
+              attemptCount++;
+              const dir = currentDirection();
+              if (dir === "none") break;
+              scrollDirection = dir;
+              // Direction reversal without improvement: stop (avoids
+              // oscillation loops).
+              if (lastDirection !== "none" && lastDirection !== dir) {
+                const improved = vis?.fullyVisible === true;
+                if (!improved) break;
+              }
+              lastDirection = dir;
+              const action = dir === "forward" ? "increment" : "decrement";
               try {
-                await deps.performUiAction(act({ selector: containerSelector, action: direction > 0 ? "increment" : "decrement" }));
+                await deps.performUiAction(act({ selector: containerSelector, action }));
               } catch { /* not a range control; nothing to step */ }
               await waitSettle(120);
               const re = await deps.getUiElement({ ...win(), selector: containerSelector, includeProcessPopups: true, timeoutMs: actionTimeout, maxDepth: localMaxDepth }).catch(() => null);
@@ -960,8 +1021,7 @@ async function performCompositeProfileAction(
                 scrollValueChanged = true;
                 lastValue = newValue;
               } else if (newValue !== undefined && newValue !== null) {
-                // No change: stop stepping.
-                break;
+                break; // no change: stop stepping
               }
               element = await readElement();
               vis = await checkVisible(element);
@@ -970,7 +1030,7 @@ async function performCompositeProfileAction(
             if (vis?.fullyVisible) {
               return {
                 profile: profile.id, control: input.control, selectorUsed: selector, confidence: entry.confidence, notes: entry.notes,
-                result: { success: true, method: "WindowMessageWheel", alreadyVisible: false, scrolled: true, scrollContainer, ...vis }
+                result: { success: true, method: "WindowMessageWheel", alreadyVisible: false, scrolled: true, scrollContainer, ...vis, scrollDirection, attemptedStrategies, initialScrollValue, finalScrollValue: lastValue, attemptCount }
               };
             }
           } catch { /* try next container selector */ }
@@ -1082,16 +1142,26 @@ async function performCompositeProfileAction(
     };
 
     // Run one activation attempt and re-read the control. Returns the method
-    // actually used (or null when the attempt itself failed and no further
-    // attempt should be made on this path).
+    // actually used (or failed=true when the attempt itself failed and no
+    // further attempt should be made on this path).
+    // The method -> UIA action map is EXACTLY the shared fallback enum: every
+    // declared method has a real mapping, and an unknown method is a hard
+    // error - NEVER a silent default to invoke.
+    const actionFor: Record<import("../app-packs/enums.js").FallbackMethod, string> = {
+      SelectionItemPattern: "select",
+      TogglePattern: "toggle",
+      InvokePattern: "invoke",
+      WindowMessageElementClick: "windowMessageClick"
+    };
     const attemptMethod = async (m: string): Promise<{ method: string; element: Partial<UiElementState> | null; failed: boolean }> => {
-      const actionFor: Record<string, string> = {
-        SelectionItemPattern: "select",
-        TogglePattern: "toggle",
-        InvokePattern: "invoke",
-        WindowMessageElementClick: "windowMessageClick"
-      };
-      const action = actionFor[m] ?? "invoke";
+      const action = actionFor[m as import("../app-packs/enums.js").FallbackMethod];
+      if (!action) {
+        throw new McpUiError(
+          "UNSUPPORTED_FALLBACK_METHOD",
+          `Fallback method '${m}' is not implemented by the executor (supported: ${Object.keys(actionFor).join(", ")}).`,
+          { control: input.control, method: m }
+        );
+      }
       try {
         const r = await deps.performUiAction(act({ selector, action }));
         if (!r.success) throw new McpUiError("ACTION_FAILED", `${m} did not succeed.`, { control: input.control });

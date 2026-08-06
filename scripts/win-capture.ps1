@@ -50,6 +50,12 @@ namespace ScreenshotTool {
       public int Bottom;
     }
 
+    [StructLayout(LayoutKind.Sequential)]
+    public struct POINT {
+      public int X;
+      public int Y;
+    }
+
     [DllImport("user32.dll")]
     public static extern bool EnumWindows(EnumWindowsProc lpEnumFunc, IntPtr lParam);
 
@@ -73,6 +79,12 @@ namespace ScreenshotTool {
 
     [DllImport("user32.dll", SetLastError = true)]
     public static extern bool GetWindowRect(IntPtr hWnd, out RECT lpRect);
+
+    [DllImport("user32.dll", SetLastError = true)]
+    public static extern bool GetClientRect(IntPtr hWnd, out RECT lpRect);
+
+    [DllImport("user32.dll", SetLastError = true)]
+    public static extern bool ClientToScreen(IntPtr hWnd, ref POINT lpPoint);
 
     [DllImport("user32.dll", SetLastError = true)]
     public static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint lpdwProcessId);
@@ -2392,6 +2404,53 @@ function Format-WindowLongHex {
   return '0x{0:X8}' -f ([uint32]$normalized)
 }
 
+# ── get-client-rect-screen ──
+# Real Win32 client area of a window in SCREEN coordinates. GetClientRect
+# returns the client rect in CLIENT coordinates (origin at the client-area
+# top-left); ClientToScreen converts that origin to screen space. The result
+# NEVER includes the title bar, borders, shadows or other non-client area.
+# Returns { x, y, width, height, coordinateSpace:"screen", source }.
+function Get-ClientRectScreen {
+  param([hashtable]$Target)
+
+  $hwnd = [IntPtr]::Zero
+  if ($Target.ContainsKey('hwnd') -and -not [string]::IsNullOrWhiteSpace([string]$Target.hwnd)) {
+    $hwnd = [IntPtr]([int64]$Target.hwnd)
+  }
+  if ($hwnd -eq [IntPtr]::Zero) {
+    Throw-UiaError "INVALID_HWND" "get-client-rect-screen requires a valid hwnd." ([ordered]@{ stage = "get-client-rect-screen" })
+  }
+  if (-not [ScreenshotTool.Native]::IsWindow($hwnd)) {
+    Throw-UiaError "INVALID_HWND" "hwnd $($Target.hwnd) is not a valid window." ([ordered]@{ stage = "get-client-rect-screen"; hwnd = $Target.hwnd })
+  }
+  # Minimized windows have a zero-size client rect; report the failure
+  # explicitly instead of returning a degenerate rect.
+  if ([ScreenshotTool.Native]::IsIconic($hwnd)) {
+    Throw-UiaError "WINDOW_MINIMIZED" "hwnd $($Target.hwnd) is minimized; its client rect is empty." ([ordered]@{ stage = "get-client-rect-screen"; hwnd = $Target.hwnd })
+  }
+
+  $client = New-Object ScreenshotTool.Native+RECT
+  if (-not [ScreenshotTool.Native]::GetClientRect($hwnd, [ref]$client)) {
+    Throw-UiaError "WINDOW_CLIENT_RECT_FAILED" "GetClientRect failed for hwnd $($Target.hwnd)." ([ordered]@{ stage = "get-client-rect-screen"; hwnd = $Target.hwnd; lastError = [System.Runtime.InteropServices.Marshal]::GetLastWin32Error() })
+  }
+
+  $origin = New-Object ScreenshotTool.Native+POINT
+  $origin.X = 0
+  $origin.Y = 0
+  if (-not [ScreenshotTool.Native]::ClientToScreen($hwnd, [ref]$origin)) {
+    Throw-UiaError "WINDOW_CLIENT_RECT_FAILED" "ClientToScreen failed for hwnd $($Target.hwnd)." ([ordered]@{ stage = "get-client-rect-screen"; hwnd = $Target.hwnd; lastError = [System.Runtime.InteropServices.Marshal]::GetLastWin32Error() })
+  }
+
+  return [ordered]@{
+    x = [int]$origin.X
+    y = [int]$origin.Y
+    width = [int]($client.Right - $client.Left)
+    height = [int]($client.Bottom - $client.Top)
+    coordinateSpace = "screen"
+    source = "GetClientRect+ClientToScreen"
+  }
+}
+
 function Wait-ForWindow {
   param([hashtable]$Target)
 
@@ -4261,6 +4320,9 @@ function Invoke-Action {
     }
     "get-window-state" {
       return Get-WindowState -Target $Request.target
+    }
+    "get-client-rect-screen" {
+      return Get-ClientRectScreen -Target $Request.target
     }
     "check-process-alive" {
       # Real process-liveness check via OpenProcess/GetExitCodeProcess -

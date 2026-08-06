@@ -20,25 +20,24 @@
 // runtime as defense in depth.
 
 import type { ControlEntry } from "./types.js";
-import type { PackActionContract, PackFallbackMethod } from "../app-packs/types.js";
+import type { PackActionContract } from "../app-packs/types.js";
 import type { InteractionMode } from "../interaction.js";
+import { FALLBACK_METHODS, FORBIDDEN_FALLBACK_METHODS, type FallbackMethod } from "../app-packs/enums.js";
 
-// The methods the executor REALLY supports for pattern-free activation.
-export const EXECUTABLE_FALLBACK_METHODS: PackFallbackMethod[] = [
-  "SelectionItemPattern",
-  "TogglePattern",
-  "InvokePattern",
-  "WindowMessageElementClick"
-];
+// The methods the executor REALLY supports. Derived from the single shared
+// enum (src/app-packs/enums.ts) minus the always-forbidden set - there is
+// exactly one definition, and it equals what the schema accepts.
+export const EXECUTABLE_FALLBACK_METHODS: FallbackMethod[] = [...FALLBACK_METHODS];
 
-// Never executable - even if a pack (erroneously) declares them.
-export const ALWAYS_FORBIDDEN_FALLBACK_METHODS = ["PhysicalMouse", "GlobalKeyboard", "SetCursorPos"] as const;
+// Never executable - even if a pack (erroneously) declares them. Same source
+// as the schema's `forbidden` enum.
+export const ALWAYS_FORBIDDEN_FALLBACK_METHODS = [...FORBIDDEN_FALLBACK_METHODS] as const;
 
 export type FallbackDecision = {
   enabled: boolean;
   // Methods to try, in declared order (control-level methods win over the
   // action-contract default set).
-  methods: PackFallbackMethod[];
+  methods: FallbackMethod[];
   // Why fallback is disabled (for diagnostics).
   disabledReason?: string;
   // Which source supplied the method list.
@@ -71,10 +70,10 @@ export function resolveFallbackPolicy(input: ResolveFallbackInput): FallbackDeci
 
   // 3) Control-level method list (declared order). Methods are validated at
   //    pack-load; ALWAYS_FORBIDDEN entries are dropped here as defense in depth.
-  let methods: PackFallbackMethod[] = [];
+  let methods: FallbackMethod[] = [];
   let source: FallbackDecision["source"] = "default";
   if (controlFb?.methods && controlFb.methods.length > 0) {
-    methods = controlFb.methods.filter((m): m is PackFallbackMethod =>
+    methods = controlFb.methods.filter((m): m is FallbackMethod =>
       !(ALWAYS_FORBIDDEN_FALLBACK_METHODS as readonly string[]).includes(m)
     );
     source = "control";
