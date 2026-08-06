@@ -167,21 +167,21 @@ test("rejects absolute paths in profile data", async () => {
   assert.ok(v.errors.some((e) => e.code === "ABSOLUTE_PATH"));
 });
 
-test("sensitive-value scan covers profile VALUES but not control IDENTIFIERS", async () => {
-  // A credential-looking VALUE in the profile must warn...
+test("sensitive-value scan covers executable VALUES but not identifiers or env NAMES", async () => {
+  // executableEnv is an ENVIRONMENT VARIABLE NAME, never a credential
+  // value - must NOT warn even when the name contains "TOKEN".
   const dir = await makeTempDir();
-  await writePack(dir, "sens-profile", {
+  await writePack(dir, "sens-envname", {
     "manifest.json": VALID_MANIFEST,
     "profile.json": { ...VALID_PROFILE, executableEnv: "MY_APP_TOKEN_VAULT" }
   });
-  const loadedProfile = await loadPackFromDir(path.join(dir, "sens-profile"));
-  assert.ok(loadedProfile);
-  const vp = validatePack(loadedProfile);
-  assert.ok(vp.warnings.some((w) => w.code === "SENSITIVE_VALUE"));
+  const loadedEnv = await loadPackFromDir(path.join(dir, "sens-envname"));
+  assert.ok(loadedEnv);
+  const ve = validatePack(loadedEnv);
+  assert.ok(!ve.warnings.some((w) => w.code === "SENSITIVE_VALUE"), JSON.stringify(ve.warnings));
 
-  // ...but a control whose IDENTIFIER/selector contains "password" (a
-  // stable runtime objectName, e.g. "rtkPasswordEdit") must NOT warn: it is
-  // an identifier, not a credential value.
+  // A control whose IDENTIFIER/selector contains "password" (a stable
+  // runtime objectName, e.g. "rtkPasswordEdit") must NOT warn.
   const dir2 = await makeTempDir();
   await writePack(dir2, "sens-control", {
     "manifest.json": VALID_MANIFEST,
@@ -197,6 +197,24 @@ test("sensitive-value scan covers profile VALUES but not control IDENTIFIERS", a
   assert.ok(loadedControl);
   const vc = validatePack(loadedControl);
   assert.ok(!vc.warnings.some((w) => w.code === "SENSITIVE_VALUE"), JSON.stringify(vc.warnings));
+
+  // A literal credential in a WORKFLOW executable argument MUST warn with
+  // an exact path (the scan covers executable positions, not just profile).
+  const dir3 = await makeTempDir();
+  await writePack(dir3, "sens-workflow", {
+    "manifest.json": VALID_MANIFEST,
+    "profile.json": VALID_PROFILE,
+    "workflows.json": {
+      workflows: [{ id: "configure", steps: [{ tool: "type_text", args: { password: "literal-secret" } }] }]
+    }
+  });
+  const loadedWf = await loadPackFromDir(path.join(dir3, "sens-workflow"));
+  assert.ok(loadedWf);
+  const vw = validatePack(loadedWf);
+  const w = vw.warnings.find((x) => x.code === "SENSITIVE_VALUE");
+  assert.ok(w, "workflow literal secret must warn, got " + JSON.stringify(vw.warnings));
+  assert.equal(w!.path, "workflows.configure.steps[0].args.password");
+  assert.ok(!JSON.stringify(w).includes("literal-secret"), "warning must not leak the raw secret");
 });
 
 test("rejects unsafe retry (non-idempotent + retrySafe)", async () => {

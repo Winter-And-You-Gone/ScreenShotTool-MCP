@@ -22,6 +22,7 @@ import { isSensitiveFieldName } from "../outputs.js";
 import { extractReferenceHeads } from "../piping.js";
 import type { LoadedPack, PackWorkflow, PackWorkflowStep } from "./types.js";
 import { CONTROL_STATE_CONDITIONS, FALLBACK_METHODS, FORBIDDEN_FALLBACK_METHODS } from "./enums.js";
+import { scanSensitiveValues } from "./sensitive.js";
 
 export type ValidationIssue = {
   file: string;
@@ -57,7 +58,6 @@ const RESERVED_STEP_IDS = new Set(["vars", "env", "steps", "results", "run", "pa
 // Matches drive-letter paths and UNC roots anywhere in the data, tolerating
 // JSON escaping (\\ vs \).
 const ABSOLUTE_PATH_RE = /([A-Za-z]:[\\/]{1,2}|[\\/]{2,4})/;
-const SENSITIVE_VALUE_RE = /password|token|credential|secret|authorization|cookie/i;
 
 export function validatePack(pack: LoadedPack): PackValidationResult {
   const errors: ValidationIssue[] = [];
@@ -434,18 +434,28 @@ function validateSensitiveData(
       suggestion: "Use executableEnv (an env var name) for the executable location."
     });
   }
-  // Sensitive-value scan is scoped to VALUES that could hold a credential:
-  // profile fields (executableEnv/launch/security are plain data, so scan
-  // only string VALUES, never object KEYS). Control ids, aliases and
-  // automationId selectors are IDENTIFIERS - an objectName like
-  // "rtkPasswordEdit" is a stable runtime fact, not a credential, and must
-  // not trip the scan.
-  const sensitiveValues = JSON.stringify(collectStringValues(pack.profile));
-  if (SENSITIVE_VALUE_RE.test(sensitiveValues)) {
+  // Path-aware sensitive-value scan (see src/app-packs/sensitive.ts):
+  //   - scans ONLY positions that can carry executable literals
+  //     (workflow steps/finally/captureBefore args, expect/retry,
+  //     inputSchema defaults/examples/const/enum, action defaultExpect
+  //     values, free profile values),
+  //   - never flags identifiers (control ids, automationId selectors,
+  //     aliases/displayNames), environment-variable NAMES (executableEnv),
+  //     or ${...} variable references.
+  // Findings carry exact paths and REDACTED previews - the raw value is
+  // never echoed into warnings.
+  const sensitive = scanSensitiveValues({
+    profile: pack.profile,
+    workflows: pack.workflows.workflows,
+    actions: pack.actions.contracts
+  });
+  for (const finding of sensitive.findings) {
     warnings.push({
-      file: "profile.json", path: "*", code: "SENSITIVE_VALUE",
-      message: "Profile data contains a string matching password/token/credential/secret/authorization/cookie. Credentials must never be stored in packs.",
-      suggestion: "Remove the value; secrets belong in the environment, not the pack."
+      file: "workflows.json",
+      path: finding.path,
+      code: "SENSITIVE_VALUE",
+      message: `A likely hard-coded credential was found in an executable argument position (${finding.reason}); value preview '${finding.redactedPreview}'.`,
+      suggestion: "Replace the literal with an input or environment reference (e.g. ${env.APP_PASSWORD})."
     });
   }
   // Profile id must match the manifest id (consistency).
@@ -459,20 +469,6 @@ function validateSensitiveData(
 }
 
 // ── Semantic map validation (pages.json / components.json + control meta) ──
-
-// Recursively collect all STRING VALUES (never object keys) from a data
-// structure. Used to scope the sensitive-value scan to values a credential
-// could live in, excluding identifiers (object keys, control ids).
-function collectStringValues(value: unknown, out: string[] = []): string[] {
-  if (typeof value === "string") {
-    out.push(value);
-  } else if (Array.isArray(value)) {
-    for (const item of value) collectStringValues(item, out);
-  } else if (value !== null && typeof value === "object") {
-    for (const v of Object.values(value)) collectStringValues(v, out);
-  }
-  return out;
-}
 
 const SCREEN_COORD_KEYS = new Set(["x", "y"]);
 
