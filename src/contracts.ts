@@ -998,7 +998,7 @@ export const contracts: Record<string, ToolContract> = {
   },
   capture_window: {
     name: "capture_window",
-    description: "IMPORTANT: screenshots are SLOW (1-5s each). Prefer state checks (list_windows, ui_get) over screenshots. 'print' mode uses PrintWindow (works occluded/minimized, misses separate popup/tooltip windows); 'screen' mode copies the visible screen. interactionMode=background forces the non-activating PrintWindow path and reports interaction metadata; capture never auto-upgrades to foreground (BACKGROUND_CAPTURE_UNAVAILABLE instead). Returns: path,width,height,target,rect,timestamp,interaction. Pipe-safe: path, interaction.",
+    description: "Captures the visual contents of a target window as an image file. Use when the task requires visual content, layout inspection, rendering verification, or an image artifact - including when the user explicitly asks for a screenshot. 'print' mode uses PrintWindow (works occluded/minimized, misses separate popup/tooltip windows); 'screen' mode copies the visible screen. Capture latency depends on the target application, rendering backend, window state, and capture method; PrintWindow may require the target window to process a synchronous WM_PRINT/WM_PRINTCLIENT request. interactionMode=background forces the non-activating PrintWindow path and reports interaction metadata; capture never auto-upgrades to foreground (BACKGROUND_CAPTURE_UNAVAILABLE instead). Returns: path,width,height,target,rect,timestamp,interaction. Pipe-safe: path, interaction.",
     inputSchema: toolInputSchemas.capture_window as unknown as JsonSchema,
     outputSchema: captureWindowOutput,
     schemaVersion: 1,
@@ -1007,7 +1007,7 @@ export const contracts: Record<string, ToolContract> = {
   },
   capture_screen_region: {
     name: "capture_screen_region",
-    description: "Captures a screen-space rectangle in physical pixels (slow: 1-5s). Copies whatever is currently visible - occluders are captured instead of the target. Returns: path,width,height,target,rect,timestamp. Pipe-safe: path.",
+    description: "Captures a screen-space rectangle as an image file in physical pixels. Use when the task requires visual content, layout inspection, rendering verification, or an image artifact - including when the user explicitly asks for a screenshot. Copies whatever is currently visible - occluders are captured instead of the target. Returns: path,width,height,target,rect,timestamp. Pipe-safe: path.",
     inputSchema: toolInputSchemas.capture_screen_region as unknown as JsonSchema,
     outputSchema: captureOutput,
     schemaVersion: 1,

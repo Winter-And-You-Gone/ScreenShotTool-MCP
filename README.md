@@ -1,7 +1,18 @@
 # ScreenShotTool MCP
 
-> ⚠️ **截图很慢！** 每次 `capture_window` / `capture_screen_region` 需要 1-5 秒，且可能阻塞目标应用的渲染线程（PrintWindow 发 WM_PRINT 消息，目标必须同步响应）。
-> **优先用其他工具替代截图：** `list_windows` / `get_window_state` / `ui_get` / `ui_wait` 验证状态变化，或从目标应用日志/文件读数据。**只在真正需要视觉内容时才截图。**
+### 截图与结构化状态工具的选择
+
+当任务需要查看视觉内容、检查布局、验证渲染效果、生成图像结果，
+或用户明确要求截图时，直接使用 `capture_window` 或
+`capture_screen_region`。
+
+当任务需要读取控件值、判断选中状态、定位语义控件或验证业务
+后置条件时，使用 `resolve_semantic_control`、`ui_get`、
+`ui_query` 或 profile action。
+
+两类工具互补，不设固定的全局优先级。可以先用结构化状态验证
+操作结果，再用截图提供视觉证据。当用户明确要求截图、图像或视觉
+验证时，执行截图而不是用状态查询代替。
 
 一个**通用的 Windows UI Automation MCP Server**，供 Codex、Claude Code 等 MCP 客户端通过 stdio 调用。核心能力：
 
