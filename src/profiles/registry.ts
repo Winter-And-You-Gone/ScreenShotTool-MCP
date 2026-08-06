@@ -946,26 +946,42 @@ async function performCompositeProfileAction(
           try {
             const container = await deps.getUiElement({ ...win(), selector: containerSelector, includeProcessPopups: true, timeoutMs: actionTimeout, maxDepth: localMaxDepth });
             if (container.found && container.element?.patterns.some((p) => p.includes("RangeValue"))) {
-              const range = container.element;
-              initialScrollValue = range.rangeValue;
+              // Mutable snapshot: EVERY round computes the next target from
+              // the LATEST range metadata (rangeValue/minimum/maximum/
+              // smallChange/largeChange). A fixed initial snapshot would
+              // repeat the first target forever and stop after one step.
+              let currentRange = container.element;
+              initialScrollValue = currentRange.rangeValue;
               for (let step = 0; step < 8 && Date.now() < deadline; step++) {
                 attemptCount++;
                 const dir = currentDirection();
                 if (dir === "none") break;
                 scrollDirection = dir;
-                const target = nextRangeValueStep(range.rangeValue ?? 0, dir, range);
-                if (target === range.rangeValue) break; // no finite progress possible
+                const previousValue = currentRange.rangeValue ?? 0;
+                const target = nextRangeValueStep(previousValue, dir, currentRange);
+                if (target === previousValue) break; // at minimum/maximum - no progress possible
                 await deps.performUiAction(act({ selector: containerSelector, action: "setRangeValue", rangeValue: target }));
                 await waitSettle(200);
-                const re = await deps.getUiElement({ ...win(), selector: containerSelector, includeProcessPopups: true, timeoutMs: actionTimeout, maxDepth: localMaxDepth }).catch(() => null);
-                const newValue = re?.element?.rangeValue ?? range.rangeValue;
-                if (newValue !== (range.rangeValue ?? 0)) scrollValueChanged = true;
-                else break; // scroll value did not change - stop
+                // Re-resolve the scroll container for a FRESH range snapshot.
+                const refreshed = await deps.getUiElement({ ...win(), selector: containerSelector, includeProcessPopups: true, timeoutMs: actionTimeout, maxDepth: localMaxDepth }).catch(() => null);
+                if (!refreshed?.found || !refreshed.element) break; // container vanished
+                const newValue = refreshed.element.rangeValue ?? previousValue;
+                // Compare against the PREVIOUS round's REAL value (not the
+                // initial snapshot, not this round's target).
+                if (newValue !== previousValue) {
+                  scrollValueChanged = true;
+                  currentRange = refreshed.element; // next round computes from the FRESH state
+                } else {
+                  break; // scroll value did not change - stop
+                }
+                // Re-resolve target element, viewport and visibility: layout
+                // may have changed, and the next direction must be judged
+                // from the CURRENT geometry.
                 element = await readElement();
                 vis = await checkVisible(element);
                 if (vis?.fullyVisible) break;
               }
-              finalScrollValue = (await deps.getUiElement({ ...win(), selector: containerSelector, includeProcessPopups: true, timeoutMs: actionTimeout, maxDepth: localMaxDepth }).catch(() => null))?.element?.rangeValue ?? initialScrollValue;
+              finalScrollValue = currentRange.rangeValue ?? initialScrollValue;
               if (vis?.fullyVisible) {
                 return {
                   profile: profile.id, control: input.control, selectorUsed: selector, confidence: entry.confidence, notes: entry.notes,
