@@ -79,14 +79,30 @@ function validateNode(
   };
 
   // anyOf: at least one branch must validate (checked against a scratch
-  // error list so a failed branch does not pollute the report).
+  // error list so a failed branch does not pollute the report). When every
+  // branch fails, the branch errors are included so the client sees WHY the
+  // value matched neither the success shape nor the error envelope.
   if (schema.anyOf && schema.anyOf.length > 0) {
+    const branchFailures: ValidationError[] = [];
     const branchHits = schema.anyOf.some((b) => {
       const scratch: ValidationError[] = [];
-      return validateNode(value, b, path, scratch, rootSchema);
+      const ok = validateNode(value, b, path, scratch, rootSchema);
+      if (!ok) {
+        for (const e of scratch.slice(0, 4)) branchFailures.push(e);
+      }
+      return ok;
     });
     if (!branchHits) {
       fail(`value at ${path} does not match any anyOf branch`);
+      if (branchFailures.length > 0) {
+        const seen = new Set<string>();
+        for (const e of branchFailures) {
+          const key = `${e.path}:${e.message}`;
+          if (seen.has(key) || errors.length >= 12) continue;
+          seen.add(key);
+          errors.push(e);
+        }
+      }
     }
     return valid;
   }
@@ -110,6 +126,12 @@ function validateNode(
   if (schema.enum !== undefined) {
     if (!schema.enum.some((e) => e === value)) {
       fail(`value at ${path} is not one of the allowed enum values`);
+    }
+  }
+
+  if (schema.const !== undefined) {
+    if (value !== schema.const) {
+      fail(`value at ${path} must equal ${JSON.stringify(schema.const)}`);
     }
   }
 

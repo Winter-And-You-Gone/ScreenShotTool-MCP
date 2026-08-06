@@ -18,7 +18,15 @@ import type * as WindowsModule from "./windows.js";
 import type * as ProfilesModule from "./profiles/registry.js";
 import type { ProfileRunStepsInput } from "./schemas.js";
 import type { UiaDeps } from "./profiles/registry.js";
-import { McpUiError } from "./uia/results.js";
+import { McpUiError, suggestionFor } from "./uia/results.js";
+import { estimateJsonBytes, MAX_STEP_RESULT_BYTES } from "./outputs.js";
+import {
+  autoResolveTarget,
+  bindLaunchTarget,
+  getTarget,
+  resolveTargetRef,
+  type TargetBinding
+} from "./targets.js";
 import { getContract, contracts, toMcpToolDefinition } from "./contracts.js";
 import { executeValidatedTool, type ToolExecutorContext } from "./executor.js";
 import { registry as packRegistry, getAppProfile } from "./app-packs/registry.js";
@@ -136,8 +144,28 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     if (error instanceof McpUiError) {
       // Structured errors: isError + text content (legacy clients) +
       // structuredContent (machine-readable { success, error: { code,
-      // message, details } }).
-      const structured = { success: false, error: { code: error.code, message: error.message, ...(error.details !== undefined ? { details: error.details } : {}) } };
+      // message, details, suggestion?, retryable? } }). Every tool's public
+      // outputSchema accepts this shape (withToolError in contracts.ts), so a
+      // business error can NEVER surface as an outputSchema mismatch.
+      const retryable = error.code === "WINDOW_NOT_FOUND_FOR_PROCESS"
+        || error.code === "STALE_WINDOW_HANDLE"
+        || error.code === "ELEMENT_NOT_AVAILABLE"
+        || error.code === "UIA_ROOT_UNAVAILABLE"
+        || error.code === "TARGET_WINDOW_NOT_READY"
+        || error.code === "POPUP_NOT_READY"
+        || error.code === "PROVIDER_BUSY"
+        || error.code === "TIMEOUT";
+      const suggestion = suggestionFor(error.code, error.suggestion);
+      const structured = {
+        success: false,
+        error: {
+          code: error.code,
+          message: error.message,
+          ...(error.details !== undefined ? { details: error.details } : {}),
+          ...(suggestion !== undefined ? { suggestion } : {}),
+          ...(retryable !== undefined ? { retryable } : {})
+        }
+      };
       return {
         isError: true,
         content: [
@@ -259,7 +287,28 @@ async function appPackDescribeTool(args: unknown, runtime: RuntimeModules) {
       profile_action: ["result", "selectorUsed", "interaction"],
       ui_wait: ["matched", "timedOut"]
     },
-    defaultInteractionMode: pack.profile.interaction?.defaultMode ?? "auto"
+    defaultInteractionMode: pack.profile.interaction?.defaultMode ?? "auto",
+    // Generic model usage guidance - NEVER app-specific (no control names).
+    // Returned by every pack so first-time clients pick the right tool, bind
+    // the right target, and avoid anti-patterns.
+    usageGuidance: {
+      preferredLaunchTool: "profile_launch",
+      preferredTargetBinding: "targetRef",
+      recommendedOrder: [
+        "profile_launch",
+        "profile_action",
+        "scoped ui_query",
+        "ui_catalog",
+        "ui_inspect_tree"
+      ],
+      antiPatterns: [
+        "Do not use launch_app when this pack is available.",
+        "Do not enumerate the full UI tree before trying profile controls.",
+        "Do not manually convert screen coordinates to window coordinates.",
+        "Do not infer a process crash only because no window is currently found.",
+        "Do not reuse an old hwnd after the window was recreated; pass the targetRef."
+      ]
+    }
   };
 }
 
@@ -724,6 +773,86 @@ function withRunTtl(result: import("./pipeline.js").PipelineResult): Record<stri
 
 // ── Single-tool dispatch (also used by pipeline steps) ──
 
+// ── targetRef resolution ──
+//
+// High-level target tools accept targetRef (preferred), hwnd, pid,
+// processName, or titleContains. Resolution priority: explicit hwnd >
+// targetRef binding (auto-rebound when the window was recreated) >
+// pid/processName/titleContains. When a profile is given with NO target at
+// all and exactly one instance is running, the instance is auto-bound
+// (targetAutoResolved:true); several instances never resolve (TARGET_AMBIGUOUS).
+
+type ResolvedTarget = {
+  windowSel: { hwnd?: string | number; pid?: number; processName?: string; titleContains?: string };
+  targetMeta?: Record<string, unknown>;
+  targetBinding?: TargetBinding;
+};
+
+async function resolveTargetInput(
+  input: { targetRef?: string; profile?: string; pid?: number; hwnd?: string | number; processName?: string; titleContains?: string },
+  runtime: RuntimeModules
+): Promise<ResolvedTarget> {
+  // 1. Explicit hwnd always wins.
+  if (input.hwnd !== undefined) {
+    return { windowSel: { hwnd: input.hwnd } };
+  }
+  // 2. targetRef: resolve (and auto-rebind when the window was recreated).
+  if (input.targetRef) {
+    const resolution = await resolveTargetRef(input.targetRef, {
+      checkProcessAlive: (i) => runtime.windows.checkProcessAlive(i),
+      listWindows: (f) => runtime.windows.listWindows(f)
+    });
+    if (!resolution.ok) {
+      throw resolution.error;
+    }
+    return {
+      windowSel: { ...(resolution.target.hwnd !== undefined ? { hwnd: resolution.target.hwnd } : {}), pid: resolution.target.pid },
+      targetMeta: { target: resolution.target }
+    };
+  }
+  // 3. Auto-bind a unique running instance when a profile is specified and
+  //    no pid/processName/titleContains was given. Never picks among
+  //    multiple instances.
+  if (input.profile && input.pid === undefined && input.processName === undefined && input.titleContains === undefined) {
+    const profile = getAppProfile(input.profile);
+    const pack = packRegistry.getPack(input.profile);
+    if (profile) {
+      const binding = await autoResolveTarget({
+        profileId: profile.id,
+        executableNames: profile.executableNames ?? [],
+        processNames: profile.processNames,
+        titleContains: profile.titleContains,
+        mainWindow: pack?.profile.mainWindow,
+        listWindows: (f) => runtime.windows.listWindows(f)
+      });
+      if (binding) {
+        return {
+          windowSel: { ...(binding.hwnd !== undefined ? { hwnd: binding.hwnd } : {}), pid: binding.pid },
+          targetMeta: { targetAutoResolved: true },
+          targetBinding: binding
+        };
+      }
+    }
+  }
+  return { windowSel: { pid: input.pid, processName: input.processName, titleContains: input.titleContains } };
+}
+
+// Large-tree output guard: results that would flood the client are refused
+// with a scoped-query suggestion (TREE_OUTPUT_TOO_LARGE) instead of forcing
+// the model to parse a huge persisted dump.
+function guardLargeTreeResult(nodes: unknown[] | undefined, tool: string): void {
+  if (!nodes || nodes.length === 0) return;
+  const bytes = estimateJsonBytes(nodes);
+  if (bytes > MAX_STEP_RESULT_BYTES) {
+    throw new McpUiError(
+      "TREE_OUTPUT_TOO_LARGE",
+      `The requested tree is too large (${nodes.length} nodes, ~${Math.round(bytes / 1024)} KiB; the per-result budget is ${Math.round(MAX_STEP_RESULT_BYTES / 1024)} KiB).`,
+      { tool, nodes: nodes.length, bytes },
+      "Use ui_query with rootSelector, nameContains, fields, and maxResults, or pass rootSelector/fields to this tool to scope the output."
+    );
+  }
+}
+
 // Raw dispatch: input is ALREADY validated/parsed (the unified executor did
 // it). Orchestration tools (run_steps etc.) receive their parsed input too.
 async function dispatchToolValue(
@@ -767,12 +896,14 @@ async function dispatchToolValue(
       // Interaction mode: explicit > pack default (matched by process name /
       // title) > auto. capture_window itself never hardcodes any app.
       const captureInput = input as import("./schemas.js").CaptureWindowInput;
-      const targetProfile = profiles.findProfileForTarget({ processName: captureInput.processName, titleContains: captureInput.titleContains });
+      const resolved = await resolveTargetInput(captureInput, runtime);
+      const targetProfile = profiles.findProfileForTarget({ processName: resolved.windowSel.processName, titleContains: resolved.windowSel.titleContains });
       const captureMode: InteractionMode = resolveInteractionMode({
         explicit: captureInput.interactionMode,
         packDefault: targetProfile?.interaction?.defaultMode
       });
-      return await windows.captureWindow(captureInput, captureMode);
+      const captureResult = await windows.captureWindow({ ...captureInput, ...resolved.windowSel }, captureMode);
+      return resolved.targetMeta ? { ...captureResult, ...resolved.targetMeta } : captureResult;
     }
     case "capture_screen_region":
       return await windows.captureScreenRegion(input as import("./schemas.js").CaptureScreenRegionInput);
@@ -796,24 +927,54 @@ async function dispatchToolValue(
       return await windows.getWindowState(input as import("./schemas.js").GetWindowStateInput);
     case "wait_for_window":
       return await windows.waitForWindow(input as import("./schemas.js").WaitForWindowInput);
-    case "ui_inspect_tree":
-      return await windows.inspectUiTree(input as import("./schemas.js").UiInspectTreeInput);
-    case "ui_query":
-      return await windows.queryUi(input as import("./schemas.js").UiQueryInput);
-    case "ui_get":
-      return await windows.getUiElement(input as import("./schemas.js").UiGetInput);
-    case "ui_action":
-      return await windows.performUiAction(input as import("./schemas.js").UiActionInput);
-    case "ui_wait":
-      return await windows.waitForUi(input as import("./schemas.js").UiWaitInput);
+    case "ui_inspect_tree": {
+      const treeInput = input as import("./schemas.js").UiInspectTreeInput;
+      const resolved = await resolveTargetInput(treeInput, runtime);
+      const treeResult = await windows.inspectUiTree({ ...treeInput, ...resolved.windowSel });
+      guardLargeTreeResult(treeResult.nodes, "ui_inspect_tree");
+      return resolved.targetMeta ? { ...treeResult, ...resolved.targetMeta } : treeResult;
+    }
+    case "ui_query": {
+      const queryInput = input as import("./schemas.js").UiQueryInput;
+      const resolved = await resolveTargetInput(queryInput, runtime);
+      const queryResult = await windows.queryUi({ ...queryInput, ...resolved.windowSel });
+      return resolved.targetMeta ? { ...queryResult, ...resolved.targetMeta } : queryResult;
+    }
+    case "ui_get": {
+      const getInput = input as import("./schemas.js").UiGetInput;
+      const resolved = await resolveTargetInput(getInput, runtime);
+      const getResult = await windows.getUiElement({ ...getInput, ...resolved.windowSel });
+      return resolved.targetMeta ? { ...getResult, ...resolved.targetMeta } : getResult;
+    }
+    case "ui_action": {
+      const actionInput = input as import("./schemas.js").UiActionInput;
+      const resolved = await resolveTargetInput(actionInput, runtime);
+      const actionResult = await windows.performUiAction({ ...actionInput, ...resolved.windowSel });
+      return resolved.targetMeta ? { ...actionResult, ...resolved.targetMeta } : actionResult;
+    }
+    case "ui_wait": {
+      const waitInput = input as import("./schemas.js").UiWaitInput;
+      const resolved = await resolveTargetInput(waitInput, runtime);
+      const waitResult = await windows.waitForUi({ ...waitInput, ...resolved.windowSel });
+      return resolved.targetMeta ? { ...waitResult, ...resolved.targetMeta } : waitResult;
+    }
     case "profile_list":
       return profiles.profileList();
-    case "profile_resolve":
-      return await profiles.resolveProfileControl(uiaDeps, input as import("./schemas.js").ProfileResolveInput);
-    case "profile_action":
-      return await profiles.performProfileAction(uiaDeps, input as import("./schemas.js").ProfileActionInput);
-    case "profile_launch":
-      return await profiles.launchProfile(
+    case "profile_resolve": {
+      const resolveInput = input as import("./schemas.js").ProfileResolveInput;
+      const resolved = await resolveTargetInput(resolveInput, runtime);
+      const resolveResult = await profiles.resolveProfileControl(uiaDeps, { ...resolveInput, ...resolved.windowSel });
+      return resolved.targetMeta ? { ...resolveResult, ...resolved.targetMeta } : resolveResult;
+    }
+    case "profile_action": {
+      const actionInput = input as import("./schemas.js").ProfileActionInput;
+      const resolved = await resolveTargetInput(actionInput, runtime);
+      const actionResult = await profiles.performProfileAction(uiaDeps, { ...actionInput, ...resolved.windowSel });
+      return resolved.targetMeta ? { ...actionResult, ...resolved.targetMeta } : actionResult;
+    }
+    case "profile_launch": {
+      const launchInput = input as import("./schemas.js").ProfileLaunchInput;
+      const launchResult = await profiles.launchProfile(
         uiaDeps,
         async (i) => windows.launchApp({
           exePath: i.exePath,
@@ -824,15 +985,35 @@ async function dispatchToolValue(
           timeoutMs: i.timeoutMs ?? 30000
         }),
         windows.listWindows,
-        input as import("./schemas.js").ProfileLaunchInput,
+        launchInput,
         windows.getExeManifestLevel
       );
+      // Register the stable target binding so later calls can pass targetRef
+      // instead of pid/hwnd (and survive window recreation via auto-rebind).
+      const profile = getAppProfile(launchInput.profile);
+      const pack = packRegistry.getPack(launchInput.profile);
+      const binding = bindLaunchTarget({
+        profileId: launchResult.profile,
+        executableNames: profile?.executableNames ?? [],
+        processNames: profile?.processNames ?? [],
+        titleContains: profile?.titleContains,
+        mainWindow: pack?.profile.mainWindow,
+        pid: launchResult.pid,
+        ...(launchResult.hwnd ? { hwnd: launchResult.hwnd } : {}),
+        ...(launchResult.title ? { title: launchResult.title } : {})
+      });
+      return { ...launchResult, targetRef: binding.targetRef };
+    }
     case "ui_catalog": {
       const catInput = input as import("./schemas.js").UiCatalogInput;
-      const catalog = await windows.catalogUi(catInput);
-      const profile = profiles.findProfileForTarget({ processName: catInput.processName, titleContains: catInput.titleContains });
-      catalog.controls = profiles.enrichCatalogControls(profile, catalog.controls);
-      return catalog;
+      const resolved = await resolveTargetInput(catInput, runtime);
+      const catalog = await windows.catalogUi({ ...catInput, ...resolved.windowSel });
+      guardLargeTreeResult(catalog.controls, "ui_catalog");
+      const profile = profiles.findProfileForTarget({ processName: resolved.windowSel.processName, titleContains: resolved.windowSel.titleContains });
+      if (!catInput.summaryOnly) {
+        catalog.controls = profiles.enrichCatalogControls(profile, catalog.controls);
+      }
+      return resolved.targetMeta ? { ...catalog, ...resolved.targetMeta } : catalog;
     }
     case "app_pack_list":
       return appPackListTool(input, runtime);

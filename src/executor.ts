@@ -45,12 +45,16 @@ export type ToolExecutorContext = {
 // keep working.
 
 // True for the canonical array-contract shape: an object schema whose only
-// array property is "items" and whose raw value is a bare array.
+// array property is "items" and whose raw value is a bare array. Also
+// recognizes the withToolError wrapper (anyOf whose FIRST branch is the
+// canonical items shape) so array tools keep normalizing after the error
+// contract landed.
 export function isCanonicalArrayContract(schema: JsonSchema | undefined): schema is JsonSchema {
+  const branch = schema?.anyOf && schema.anyOf.length > 0 ? schema.anyOf[0] : schema;
   return (
-    schema?.type === "object"
-    && schema.properties?.items?.type === "array"
-    && (schema.required ?? []).includes("items")
+    branch?.type === "object"
+    && branch.properties?.items?.type === "array"
+    && (branch.required ?? []).includes("items")
   );
 }
 

@@ -17,6 +17,7 @@ export type JsonSchema = {
   items?: JsonSchema;
   enum?: unknown[];
   anyOf?: JsonSchema[];
+  const?: unknown;
   description?: string;
   additionalProperties?: boolean;
   // The validated subset (workflow inputSchemas + output contracts).
@@ -112,11 +113,13 @@ export function toMcpToolDefinition(contract: ToolContract): McpToolDefinition {
 }
 
 // Derive example result paths for tool_contract_describe from the output
-// schema + pipeSafeFields.
+// schema + pipeSafeFields. Success-schema lookups unwrap the withToolError
+// wrapper (the error envelope has no pipe-safe fields).
 export function contractExamples(contract: ToolContract): Array<{ resultPath: string; type: string }> {
   const examples: Array<{ resultPath: string; type: string }> = [];
+  const successSchema = unwrapToolError(contract.outputSchema);
   for (const field of contract.pipeSafeFields) {
-    const prop = contract.outputSchema.properties?.[field];
+    const prop = successSchema?.properties?.[field];
     if (!prop) continue;
     const type = prop.type ?? (prop.anyOf ? "any" : "any");
     examples.push({ resultPath: field, type });
@@ -151,6 +154,63 @@ const en = (values: unknown[], description?: string): JsonSchema => ({
   enum: values,
   ...(description ? { description } : {})
 });
+
+// ── Unified business-error output shape ──
+//
+// Business errors (McpUiError and its subclasses) are returned as MCP
+// isError results whose structuredContent carries { success:false, error:
+// { code, message, details?, suggestion?, retryable? } }. Every tool's
+// outputSchema must ACCEPT this shape (via withToolError) so the client never
+// sees "Structured content does not match the tool's output schema" for a
+// real business failure.
+//
+// Tools whose SUCCESS result already IS a { success:false, error } shape
+// (run_steps / profile_run_steps / run_workflow / continue_run) do NOT wrap:
+// their existing outputSchema already covers both outcomes.
+
+export const toolErrorEnvelope: JsonSchema = obj(
+  {
+    success: { const: false },
+    error: obj(
+      {
+        code: str(),
+        message: str(),
+        details: any(),
+        suggestion: str(),
+        retryable: bool()
+      },
+      ["code", "message"],
+      "Structured business error: code + message always; details, suggestion, and retryable when known."
+    )
+  },
+  ["success", "error"],
+  "Business error envelope: { success:false, error: { code, message, details?, suggestion?, retryable? } }."
+);
+
+// Wrap a success schema so the tool's public outputSchema accepts EITHER the
+// success result OR the unified business-error envelope. The root keeps
+// type:"object" (MCP requires an object-root outputSchema); every branch is
+// an object, so both outcomes validate and the client contract stays honest.
+export function withToolError(successSchema: JsonSchema): JsonSchema {
+  return {
+    type: "object",
+    anyOf: [
+      successSchema,
+      toolErrorEnvelope
+    ],
+    description: `Success result OR business error envelope: { success:false, error: { code, message, details?, suggestion?, retryable? } }.`
+  };
+}
+
+// Unwrap a withToolError-wrapped schema to the SUCCESS branch (the first
+// anyOf branch). Used by tools that derive example paths from the success
+// shape (contractExamples) - the error envelope has no pipe-safe fields.
+export function unwrapToolError(schema: JsonSchema | undefined): JsonSchema | undefined {
+  if (schema?.anyOf && schema.anyOf.length > 0) {
+    return schema.anyOf[0];
+  }
+  return schema;
+}
 
 // Shared fragments ---------------------------------------------------------
 
@@ -197,7 +257,7 @@ const stepResult = obj(
 
 // ── Window / process tools ──
 
-const launchAppOutput = obj(
+const launchAppOutput = withToolError(obj(
   {
     pid: int(),
     window: {
@@ -210,17 +270,17 @@ const launchAppOutput = obj(
   },
   ["pid"],
   "launch_app success result."
-);
+));
 
-const listWindowsOutput = obj(
+const listWindowsOutput = withToolError(obj(
   {
     items: arr(windowInfo, "Window list.")
   },
   ["items"],
   "list_windows success result: { items: WindowInfo[] }. The raw array is also returned as the step result (${N.path} indexes it directly)."
-);
+));
 
-const captureOutput = obj(
+const captureOutput = withToolError(obj(
   {
     path: str(),
     width: int(),
@@ -230,7 +290,7 @@ const captureOutput = obj(
     timestamp: str()
   },
   ["path", "width", "height", "target", "rect", "timestamp"]
-);
+));
 
 // Unified interaction-impact metadata reported by high-level tools and the
 // aggregate pipeline result. Only hwnd values + booleans - never titles,
@@ -255,7 +315,7 @@ const interactionShape = obj(
 
 // capture_window carries the interaction report (capture_screen_region does
 // not: it has no target window and never touches the foreground).
-const captureWindowOutput = obj(
+const captureWindowOutput = withToolError(obj(
   {
     path: str(),
     width: int(),
@@ -266,9 +326,9 @@ const captureWindowOutput = obj(
     interaction: interactionShape
   },
   ["path", "width", "height", "target", "rect", "timestamp", "interaction"]
-);
+));
 
-const clickOutput = obj(
+const clickOutput = withToolError(obj(
   {
     clicked: bool(),
     target: str(),
@@ -285,9 +345,9 @@ const clickOutput = obj(
     timestamp: str()
   },
   ["clicked", "target", "hwnd", "title", "pid", "button", "doubleClick", "method", "timestamp"]
-);
+));
 
-const moveMouseOutput = obj(
+const moveMouseOutput = withToolError(obj(
   {
     moved: bool(),
     target: str(),
@@ -300,9 +360,9 @@ const moveMouseOutput = obj(
     timestamp: str()
   },
   ["moved", "target", "hwnd", "title", "pid", "method", "timestamp"]
-);
+));
 
-const clickMenuItemOutput = obj(
+const clickMenuItemOutput = withToolError(obj(
   {
     clicked: bool(),
     target: str(),
@@ -315,17 +375,17 @@ const clickMenuItemOutput = obj(
     timestamp: str()
   },
   ["clicked", "target", "hwnd", "title", "pid", "method", "menuPath", "commandId", "timestamp"]
-);
+));
 
-const closeAppOutput = obj(
+const closeAppOutput = withToolError(obj(
   {
     pid: int(),
     closed: bool()
   },
   ["pid", "closed"]
-);
+));
 
-const typeTextOutput = obj(
+const typeTextOutput = withToolError(obj(
   {
     typed: bool(),
     target: str(),
@@ -337,9 +397,9 @@ const typeTextOutput = obj(
     timestamp: str()
   },
   ["typed", "target", "hwnd", "title", "pid", "textLength", "skipped", "timestamp"]
-);
+));
 
-const sendKeyOutput = obj(
+const sendKeyOutput = withToolError(obj(
   {
     sent: bool(),
     key: str(),
@@ -351,9 +411,9 @@ const sendKeyOutput = obj(
     timestamp: str()
   },
   ["sent", "key", "modifiers", "target", "hwnd", "title", "pid", "timestamp"]
-);
+));
 
-const readClipboardOutput = obj(
+const readClipboardOutput = withToolError(obj(
   {
     available: bool(),
     text: str(),
@@ -361,18 +421,18 @@ const readClipboardOutput = obj(
     timestamp: str()
   },
   ["available", "text", "length", "timestamp"]
-);
+));
 
-const writeClipboardOutput = obj(
+const writeClipboardOutput = withToolError(obj(
   {
     written: bool(),
     length: int(),
     timestamp: str()
   },
   ["written", "length", "timestamp"]
-);
+));
 
-const windowStateOutput = obj(
+const windowStateOutput = withToolError(obj(
   {
     hwnd: str(),
     title: str(),
@@ -389,9 +449,9 @@ const windowStateOutput = obj(
     timestamp: str()
   },
   ["hwnd", "title", "pid", "processName", "className", "visible", "timestamp"]
-);
+));
 
-const waitForWindowOutput = obj(
+const waitForWindowOutput = withToolError(obj(
   {
     found: bool(),
     mode: str(),
@@ -401,11 +461,11 @@ const waitForWindowOutput = obj(
     timestamp: str()
   },
   ["found", "mode", "window", "elapsedMs", "timestamp"]
-);
+));
 
 // ── UIA tools ──
 
-const inspectTreeOutput = obj(
+const inspectTreeOutput = withToolError(obj(
   {
     roots: arr(any()),
     nodes: arr(any()),
@@ -417,9 +477,9 @@ const inspectTreeOutput = obj(
     elapsedMs: int()
   },
   ["roots", "nodes", "visitedNodes", "returnedNodes", "truncated", "elapsedMs"]
-);
+));
 
-const queryOutput = obj(
+const queryOutput = withToolError(obj(
   {
     found: bool(),
     count: int(),
@@ -429,7 +489,7 @@ const queryOutput = obj(
     elapsedMs: int()
   },
   ["found", "count", "elements", "truncated", "visitedNodes", "elapsedMs"]
-);
+));
 
 // Nullable element fields: UIA providers report null for unsupported
 // patterns (e.g. value/toggleState/selected on a plain Pane), so the schema
@@ -438,7 +498,7 @@ const nullableStr = (): JsonSchema => ({ anyOf: [{ type: "string" }, { type: "nu
 const nullableInt = (): JsonSchema => ({ anyOf: [{ type: "integer" }, { type: "null" }] });
 const nullableBool = (): JsonSchema => ({ anyOf: [{ type: "boolean" }, { type: "null" }] });
 
-const getOutput = obj(
+const getOutput = withToolError(obj(
   {
     found: bool(),
     element: {
@@ -464,9 +524,9 @@ const getOutput = obj(
     elapsedMs: int()
   },
   ["found", "element", "elapsedMs"]
-);
+));
 
-const actionOutput = obj(
+const actionOutput = withToolError(obj(
   {
     success: bool(),
     method: str(),
@@ -479,9 +539,9 @@ const actionOutput = obj(
     elapsedMs: int()
   },
   ["success", "method", "coordinateFallbackUsed", "physicalCursorMoved", "elapsedMs"]
-);
+));
 
-const waitOutput = obj(
+const waitOutput = withToolError(obj(
   {
     matched: bool(),
     condition: str(),
@@ -492,7 +552,7 @@ const waitOutput = obj(
     timedOut: bool()
   },
   ["matched", "condition", "elapsedMs", "timeoutMs", "pollIntervalMs", "timedOut"]
-);
+));
 
 const catalogControl = obj(
   {
@@ -515,7 +575,7 @@ const catalogControl = obj(
   ["controlType", "automationId", "name", "selectorConfidence"]
 );
 
-const catalogOutput = obj(
+const catalogOutput = withToolError(obj(
   {
     totalNodes: int(),
     actionableNodes: int(),
@@ -530,11 +590,11 @@ const catalogOutput = obj(
     elapsedMs: int()
   },
   ["totalNodes", "actionableNodes", "unsupportedNodes", "controls", "truncated", "elapsedMs"]
-);
+));
 
 // ── Profile tools ──
 
-const profileListOutput = obj(
+const profileListOutput = withToolError(obj(
   {
     profiles: arr(
       obj(
@@ -550,9 +610,9 @@ const profileListOutput = obj(
     )
   },
   ["profiles"]
-);
+));
 
-const profileResolveOutput = obj(
+const profileResolveOutput = withToolError(obj(
   {
     profile: str(),
     control: str(),
@@ -565,9 +625,9 @@ const profileResolveOutput = obj(
     element: any()
   },
   ["profile", "control", "found", "candidatesTried"]
-);
+));
 
-const profileActionOutput = obj(
+const profileActionOutput = withToolError(obj(
   {
     profile: str(),
     control: str(),
@@ -578,11 +638,12 @@ const profileActionOutput = obj(
     interaction: interactionShape
   },
   ["profile", "control", "result", "interaction"]
-);
+));
 
-const profileLaunchOutput = obj(
+const profileLaunchOutput = withToolError(obj(
   {
     profile: str(),
+    targetRef: str(),
     pid: int(),
     hwnd: str(),
     title: str(),
@@ -593,8 +654,8 @@ const profileLaunchOutput = obj(
     interaction: interactionShape
   },
   ["profile", "pid", "startedByMcp", "uiaRootAvailable", "interaction"],
-  "profile_launch success result (stable fields: profile, pid, hwnd, title, startedByMcp, reused, uiaRootAvailable)."
-);
+  "profile_launch success result (stable fields: profile, targetRef, pid, hwnd, title, startedByMcp, reused, uiaRootAvailable). targetRef is the preferred target binding for later profile actions."
+));
 
 // ── App Pack tools ──
 
@@ -614,14 +675,14 @@ const appPackSummary = obj(
   ["id", "displayName", "version", "source", "catalogVisibility", "controls", "workflows", "valid"]
 );
 
-const appPackListOutput = obj(
+const appPackListOutput = withToolError(obj(
   {
     packs: arr(appPackSummary)
   },
   ["packs"]
-);
+));
 
-const appPackDescribeOutput = obj(
+const appPackDescribeOutput = withToolError(obj(
   {
     pack: str(),
     displayName: str(),
@@ -633,10 +694,11 @@ const appPackDescribeOutput = obj(
     workflows: arr(any()),
     limitations: arr(str()),
     pipeSafe: any(),
-    defaultInteractionMode: str()
+    defaultInteractionMode: str(),
+    usageGuidance: any()
   },
   ["pack", "displayName", "version", "source", "controls", "workflows"]
-);
+));
 
 const validationIssue = obj(
   {
@@ -649,7 +711,7 @@ const validationIssue = obj(
   ["path", "code", "message"]
 );
 
-const appPackValidateOutput = obj(
+const appPackValidateOutput = withToolError(obj(
   {
     pack: str(),
     valid: bool(),
@@ -658,9 +720,9 @@ const appPackValidateOutput = obj(
     checked: arr(str())
   },
   ["pack", "valid", "errors", "warnings"]
-);
+));
 
-const appPackReloadOutput = obj(
+const appPackReloadOutput = withToolError(obj(
   {
     reloaded: bool(),
     loadedPacks: arr(appPackSummary),
@@ -677,9 +739,9 @@ const appPackReloadOutput = obj(
     )
   },
   ["reloaded", "loadedPacks"]
-);
+));
 
-const appPackProbeOutput = obj(
+const appPackProbeOutput = withToolError(obj(
   {
     pid: int(),
     hwnd: str(),
@@ -696,7 +758,7 @@ const appPackProbeOutput = obj(
     warnings: arr(str())
   },
   ["pid", "controls"]
-);
+));
 
 // ── Pipeline / workflow tools ──
 
@@ -721,7 +783,7 @@ const runStepsOutput = obj(
   ["schemaVersion", "success", "total", "completed", "stoppedAtIndex", "steps"]
 );
 
-const validateStepsOutput = obj(
+const validateStepsOutput = withToolError(obj(
   {
     valid: bool(),
     errors: arr(
@@ -742,9 +804,9 @@ const validateStepsOutput = obj(
     maxSteps: int()
   },
   ["valid", "errors", "warnings", "estimatedMaxDurationMs"]
-);
+));
 
-const workflowCatalogOutput = obj(
+const workflowCatalogOutput = withToolError(obj(
   {
     defaultInteractionMode: str(),
     workflows: arr(
@@ -774,7 +836,7 @@ const workflowCatalogOutput = obj(
     )
   },
   ["workflows"]
-);
+));
 
 const runWorkflowOutput = obj(
   {
@@ -819,7 +881,7 @@ import { toolInputSchemas } from "./schemas.js";
 export const contracts: Record<string, ToolContract> = {
   launch_app: {
     name: "launch_app",
-    description: "Launch a Windows .exe and optionally wait for its first visible window. Use noActivate for best-effort background launch. Returns: pid:number, window:{hwnd,title,pid,processName,className}|null. Pipe-safe: pid, window.hwnd, window.title.",
+    description: "Low-level generic launch tool. Do NOT use when a matching App Pack/Profile is available - prefer profile_launch (it waits for the profile's stable main window and returns a targetRef). May return an initial or splash-window process identity rather than the final profile main window. Launch a Windows .exe and optionally wait for its first visible window. Use noActivate for best-effort background launch. Returns: pid:number, window:{hwnd,title,pid,processName,className}|null. Pipe-safe: pid, window.hwnd, window.title.",
     inputSchema: toolInputSchemas.launch_app as unknown as JsonSchema,
     outputSchema: launchAppOutput,
     schemaVersion: 1,
@@ -945,7 +1007,7 @@ export const contracts: Record<string, ToolContract> = {
   },
   ui_inspect_tree: {
     name: "ui_inspect_tree",
-    description: "Read the UIA control tree of a target window (flat node list: nodeId/parentNodeId, controlType, automationId, name, patterns, boundingRect). Returns: roots[], nodes[], visitedNodes, truncated, elapsedMs. Pipe-safe: roots, nodes, elapsedMs. Prefer over screenshots.",
+    description: "DIAGNOSTIC LAST-RESORT tree inspection. Prefer profile controls (profile_action/profile_resolve) or scoped ui_query. Do NOT enumerate an entire application tree to locate a known semantic control. Read the UIA control tree of a target window (flat node list: nodeId/parentNodeId, controlType, automationId, name, patterns, boundingRect). Returns: roots[], nodes[], visitedNodes, truncated, elapsedMs. Pipe-safe: roots, nodes, elapsedMs.",
     inputSchema: toolInputSchemas.ui_inspect_tree as unknown as JsonSchema,
     outputSchema: inspectTreeOutput,
     schemaVersion: 1,
@@ -954,7 +1016,7 @@ export const contracts: Record<string, ToolContract> = {
   },
   ui_query: {
     name: "ui_query",
-    description: "Find UI elements matching a selector; returns up to maxResults elements with state (value/toggleState/selected/rangeValue). Returns: found, count, elements[], truncated, elapsedMs. Pipe-safe: found, count, elements.",
+    description: "SCOPED UI SEARCH - the recommended way to find elements when a Profile/App Pack control is not available. Scope with rootSelector/ancestorSelector, nameContains, fields, and maxResults instead of enumerating the whole tree. depthStrategy=auto escalates the search depth (8/16/24) until the element is found. Find UI elements matching a selector; returns up to maxResults elements with state (value/toggleState/selected/rangeValue). Returns: found, count, elements[], truncated, elapsedMs. Pipe-safe: found, count, elements.",
     inputSchema: toolInputSchemas.ui_query as unknown as JsonSchema,
     outputSchema: queryOutput,
     schemaVersion: 1,
@@ -972,7 +1034,7 @@ export const contracts: Record<string, ToolContract> = {
   },
   ui_action: {
     name: "ui_action",
-    description: "Perform a UIA action (invoke/toggle/select/expand/collapse/setValue/setRangeValue/setChecked/focus/...). Pattern priority per control type; coordinate fallback OFF by default and never moves the physical cursor. ASYNC-ISH: an invoke only means the action fired - verify the result with ui_wait or an expect. Returns: success, method, physicalCursorMoved, before, after, elapsedMs.",
+    description: "Perform a UIA action (invoke/toggle/select/expand/collapse/setValue/setRangeValue/setChecked/focus/...). Pattern priority per control type; coordinate fallback OFF by default and never moves the physical cursor. windowMessageClick resolves the element by selector and posts a targeted window message (WM_LBUTTONDOWN/UP) at the element center - it does NOT move or click the physical mouse, and does NOT activate the window; the result method is exactly 'WindowMessageElementClick' with physicalCursorMoved=false. ASYNC-ISH: an invoke only means the action fired - verify the result with ui_wait or an expect. Returns: success, method, physicalCursorMoved, before, after, elapsedMs.",
     inputSchema: toolInputSchemas.ui_action as unknown as JsonSchema,
     outputSchema: actionOutput,
     schemaVersion: 1,
@@ -990,7 +1052,7 @@ export const contracts: Record<string, ToolContract> = {
   },
   ui_catalog: {
     name: "ui_catalog",
-    description: "Enumerate actionable controls of a target window with recommendedSelector (pass verbatim to ui_action), supportedActions, patterns, and selector confidence. Auto-labels profileControl when the target matches a loaded App Pack. Returns: controls[], totalNodes, actionableNodes, truncated, elapsedMs. Pipe-safe: controls.",
+    description: "DIAGNOSTIC FALLBACK TOOL. Do not use as the first method when a Profile/App Pack control is available - prefer profile_action or scoped ui_query to avoid large output. Enumerate actionable controls of a target window with recommendedSelector (pass verbatim to ui_action), supportedActions, patterns, and selector confidence. Auto-labels profileControl when the target matches a loaded App Pack. Returns: controls[], totalNodes, actionableNodes, truncated, elapsedMs. Pipe-safe: controls.",
     inputSchema: toolInputSchemas.ui_catalog as unknown as JsonSchema,
     outputSchema: catalogOutput,
     schemaVersion: 1,
@@ -1017,7 +1079,7 @@ export const contracts: Record<string, ToolContract> = {
   },
   profile_action: {
     name: "profile_action",
-    description: "Perform an action on a logical control from an App Pack (tries candidate selectors in order; supports composite actions selectByName/selectByIndex/getSelection/openMenu/openSubmenu that handle same-PID popups and verify before/after state; never moves the physical mouse). Pack defaultExpect applies unless you pass expect:false. ASYNC-ISH: verify the outcome with ui_wait or an expect. In background mode actions declared foregroundRequired are refused up front (FOREGROUND_REQUIRED). Returns: profile, control, selectorUsed, confidence, result, interaction.",
+    description: "Perform an action on a logical control from an App Pack. REQUIRES A BOUND TARGET. Preferred input: targetRef returned by profile_launch (targetRef survives window recreation and refreshes the binding automatically). Alternatives: hwnd, pid, processName, or titleContains. Do NOT reuse an old hwnd after a window was recreated - pass the targetRef instead. Minimal example: {\"profile\":\"example-app\",\"targetRef\":\"target_abc123\",\"control\":\"settingsButton\",\"action\":\"invoke\"}. Tries candidate selectors in order; supports composite actions selectByName/selectByIndex/getSelection/openMenu/openSubmenu/ensureSelected that handle same-PID popups and verify before/after state; never moves the physical mouse. Pack defaultExpect applies unless you pass expect:false. ASYNC-ISH: verify the outcome with ui_wait or an expect. In background mode actions declared foregroundRequired are refused up front (FOREGROUND_REQUIRED). Returns: profile, control, selectorUsed, confidence, result, interaction.",
     inputSchema: toolInputSchemas.profile_action as unknown as JsonSchema,
     outputSchema: profileActionOutput,
     schemaVersion: 1,
@@ -1026,11 +1088,11 @@ export const contracts: Record<string, ToolContract> = {
   },
   profile_launch: {
     name: "profile_launch",
-    description: "Launch a profiled app from an App Pack by pack id, resolving the executable via exePath > pack executableEnv > common build dirs > PATH. interactionMode=background keeps the window behind the current foreground window (no steal, no topmost, no minimize) and reports interaction metadata; foregroundDemo restores+activates the window. Returns: profile, pid, hwnd, title, startedByMcp, reused, uiaRootAvailable, interaction. Pipe-safe: pid, hwnd, title, interaction. Recommended as step 0 of a pipeline.",
+    description: "PREFERRED launch tool for any application that has an App Pack. Use this instead of launch_app when the profile is known or app_pack_list reports a matching pack. Waits for the stable profile main window (not a splash/initial window) and returns targetRef, pid, and hwnd for later profile actions - pass targetRef to profile_action/profile_resolve/ui_query etc. An explicit executable path may be supplied via exePath. interactionMode=background keeps the window behind the current foreground window (no steal, no topmost, no minimize) and reports interaction metadata; foregroundDemo restores+activates the window. Returns: profile, targetRef, pid, hwnd, title, startedByMcp, reused, uiaRootAvailable, interaction. Pipe-safe: targetRef, pid, hwnd, title, interaction. Recommended as step 0 of a pipeline.",
     inputSchema: toolInputSchemas.profile_launch as unknown as JsonSchema,
     outputSchema: profileLaunchOutput,
     schemaVersion: 1,
-    pipeSafeFields: ["profile", "pid", "hwnd", "title", "startedByMcp", "reused", "uiaRootAvailable", "interaction"],
+    pipeSafeFields: ["profile", "targetRef", "pid", "hwnd", "title", "startedByMcp", "reused", "uiaRootAvailable", "interaction"],
     annotations: { idempotent: false, retrySafe: true }
   },
   app_pack_list: {
@@ -1044,7 +1106,7 @@ export const contracts: Record<string, ToolContract> = {
   },
   app_pack_describe: {
     name: "app_pack_describe",
-    description: "Describe a loaded App Pack: launch contract, logical controls, supported actions (incl. backgroundPolicy), visible workflows (incl. backgroundPolicy/foregroundRequiredSteps), defaultInteractionMode, known limitations, and pipe-safe examples. Call this once per pack before building a pipeline - everything a first-time model needs is here. Returns: pack, displayName, version, source, profile, controls[], actions[], workflows[], limitations[], pipeSafe, defaultInteractionMode.",
+    description: "Describe a loaded App Pack: launch contract, logical controls, supported actions (incl. backgroundPolicy), visible workflows (incl. backgroundPolicy/foregroundRequiredSteps), defaultInteractionMode, model usage guidance (usageGuidance: preferred launch tool, target binding, recommended tool order, anti-patterns), known limitations, and pipe-safe examples. Call this once per pack before building a pipeline - everything a first-time model needs is here. Returns: pack, displayName, version, source, profile, controls[], actions[], workflows[], limitations[], pipeSafe, defaultInteractionMode, usageGuidance.",
     inputSchema: toolInputSchemas.app_pack_describe as unknown as JsonSchema,
     outputSchema: appPackDescribeOutput,
     schemaVersion: 1,
@@ -1136,7 +1198,7 @@ export const contracts: Record<string, ToolContract> = {
     name: "tool_contract_list",
     description: "List every tool's public contract: inputSchema, outputSchema, pipeSafeFields, and annotations (readOnly/destructive/idempotent/retrySafe/needsExpect). Model-friendly discovery layer on top of tools/list. Returns: tools[{name, schemaVersion, outputSchema, pipeSafeFields, annotations}]. Pipe-safe: tools.",
     inputSchema: toolInputSchemas.tool_contract_list as unknown as JsonSchema,
-    outputSchema: obj(
+    outputSchema: withToolError(obj(
       {
         tools: arr(
           obj(
@@ -1152,7 +1214,7 @@ export const contracts: Record<string, ToolContract> = {
         )
       },
       ["tools"]
-    ),
+    )),
     schemaVersion: 1,
     pipeSafeFields: ["tools"],
     annotations: { readOnly: true, idempotent: true, retrySafe: true }
@@ -1161,7 +1223,7 @@ export const contracts: Record<string, ToolContract> = {
     name: "tool_contract_describe",
     description: "Describe one tool's full public contract: inputSchema, outputSchema, pipeSafeFields, annotations, and example result paths derived from the schema. Returns: name, schemaVersion, inputSchema, outputSchema, pipeSafeFields, annotations, examples[{resultPath,type}]. Pipe-safe: outputSchema, pipeSafeFields.",
     inputSchema: toolInputSchemas.tool_contract_describe as unknown as JsonSchema,
-    outputSchema: obj(
+    outputSchema: withToolError(obj(
       {
         name: str(),
         schemaVersion: int(),
@@ -1180,7 +1242,7 @@ export const contracts: Record<string, ToolContract> = {
         )
       },
       ["name", "schemaVersion", "inputSchema", "outputSchema", "pipeSafeFields", "examples"]
-    ),
+    )),
     schemaVersion: 1,
     pipeSafeFields: ["outputSchema", "pipeSafeFields"],
     annotations: { readOnly: true, idempotent: true, retrySafe: true }

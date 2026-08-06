@@ -17,7 +17,7 @@
 // Returns structured issues with codes, paths, messages and suggestions.
 
 import type { ToolContract } from "../contracts.js";
-import { getContract } from "../contracts.js";
+import { getContract, unwrapToolError } from "../contracts.js";
 import { isSensitiveFieldName } from "../outputs.js";
 import { extractReferenceHeads } from "../piping.js";
 import type { LoadedPack, PackWorkflow, PackWorkflowStep } from "./types.js";
@@ -339,7 +339,9 @@ function validateStep(
 // Best-effort field existence check against a JSON Schema: returns true when
 // the schema does not declare properties (can't verify), or the field exists.
 function fieldExistsInSchema(contract: ToolContract, segments: string[]): boolean {
-  let node: import("../contracts.js").JsonSchema = contract.outputSchema;
+  // Unwrap the withToolError wrapper: reference/export paths point at the
+  // SUCCESS result, never at the error envelope.
+  let node: import("../contracts.js").JsonSchema = unwrapToolError(contract.outputSchema) ?? {};
   for (const seg of segments) {
     // Numeric segments index into arrays.
     if (/^\d+$/.test(seg)) {
