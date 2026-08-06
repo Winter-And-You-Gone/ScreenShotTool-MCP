@@ -434,10 +434,17 @@ function validateSensitiveData(
       suggestion: "Use executableEnv (an env var name) for the executable location."
     });
   }
-  if (SENSITIVE_VALUE_RE.test(serialized)) {
+  // Sensitive-value scan is scoped to VALUES that could hold a credential:
+  // profile fields (executableEnv/launch/security are plain data, so scan
+  // only string VALUES, never object KEYS). Control ids, aliases and
+  // automationId selectors are IDENTIFIERS - an objectName like
+  // "rtkPasswordEdit" is a stable runtime fact, not a credential, and must
+  // not trip the scan.
+  const sensitiveValues = JSON.stringify(collectStringValues(pack.profile));
+  if (SENSITIVE_VALUE_RE.test(sensitiveValues)) {
     warnings.push({
-      file: "*", path: "*", code: "SENSITIVE_VALUE",
-      message: "Pack data contains a string matching password/token/credential/secret/authorization/cookie. Credentials must never be stored in packs.",
+      file: "profile.json", path: "*", code: "SENSITIVE_VALUE",
+      message: "Profile data contains a string matching password/token/credential/secret/authorization/cookie. Credentials must never be stored in packs.",
       suggestion: "Remove the value; secrets belong in the environment, not the pack."
     });
   }
@@ -452,6 +459,20 @@ function validateSensitiveData(
 }
 
 // ── Semantic map validation (pages.json / components.json + control meta) ──
+
+// Recursively collect all STRING VALUES (never object keys) from a data
+// structure. Used to scope the sensitive-value scan to values a credential
+// could live in, excluding identifiers (object keys, control ids).
+function collectStringValues(value: unknown, out: string[] = []): string[] {
+  if (typeof value === "string") {
+    out.push(value);
+  } else if (Array.isArray(value)) {
+    for (const item of value) collectStringValues(item, out);
+  } else if (value !== null && typeof value === "object") {
+    for (const v of Object.values(value)) collectStringValues(v, out);
+  }
+  return out;
+}
 
 const SCREEN_COORD_KEYS = new Set(["x", "y"]);
 

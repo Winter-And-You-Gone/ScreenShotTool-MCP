@@ -167,6 +167,38 @@ test("rejects absolute paths in profile data", async () => {
   assert.ok(v.errors.some((e) => e.code === "ABSOLUTE_PATH"));
 });
 
+test("sensitive-value scan covers profile VALUES but not control IDENTIFIERS", async () => {
+  // A credential-looking VALUE in the profile must warn...
+  const dir = await makeTempDir();
+  await writePack(dir, "sens-profile", {
+    "manifest.json": VALID_MANIFEST,
+    "profile.json": { ...VALID_PROFILE, executableEnv: "MY_APP_TOKEN_VAULT" }
+  });
+  const loadedProfile = await loadPackFromDir(path.join(dir, "sens-profile"));
+  assert.ok(loadedProfile);
+  const vp = validatePack(loadedProfile);
+  assert.ok(vp.warnings.some((w) => w.code === "SENSITIVE_VALUE"));
+
+  // ...but a control whose IDENTIFIER/selector contains "password" (a
+  // stable runtime objectName, e.g. "rtkPasswordEdit") must NOT warn: it is
+  // an identifier, not a credential value.
+  const dir2 = await makeTempDir();
+  await writePack(dir2, "sens-control", {
+    "manifest.json": VALID_MANIFEST,
+    "profile.json": VALID_PROFILE,
+    "controls.json": {
+      controls: {
+        mainWindow: { selectors: [{ controlType: "Window", name: "Fixture" }] },
+        rtkPasswordEdit: { selectors: [{ automationId: "rtkPasswordEdit$", match: "regex" }], aliases: ["密码"] }
+      }
+    }
+  });
+  const loadedControl = await loadPackFromDir(path.join(dir2, "sens-control"));
+  assert.ok(loadedControl);
+  const vc = validatePack(loadedControl);
+  assert.ok(!vc.warnings.some((w) => w.code === "SENSITIVE_VALUE"), JSON.stringify(vc.warnings));
+});
+
 test("rejects unsafe retry (non-idempotent + retrySafe)", async () => {
   const dir = await makeTempDir();
   await writePack(dir, "unsafe-retry", {
