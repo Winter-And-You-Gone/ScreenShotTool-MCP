@@ -332,8 +332,14 @@ test("semantic aliases resolve across pages and groups", async () => {
   assert.equal(ch1?.group, "channel-group");
   const sensor = res.matches.find((m) => m.control === "tabSensor");
   assert.equal(sensor?.group, "param-group");
+  // Query token order maps channel-group before param-group -> the path is
+  // an ordered action sequence, not ambiguous.
+  assert.equal(res.pathAmbiguous, false, JSON.stringify(res));
   assert.ok(res.suggestedPath.includes("sidebarChannel1"));
-  assert.ok(res.suggestedPath.includes("tabSensor") === false, "path targets the top match only");
+  assert.ok(res.suggestedPath.includes("tabSensor"), "ordered multi-group path includes both targets");
+  const c1 = res.suggestedPath.indexOf("sidebarChannel1");
+  const ts = res.suggestedPath.indexOf("tabSensor");
+  assert.ok(c1 >= 0 && ts > c1, "channel-1 precedes sensor-config in the path");
 });
 
 test("same-named controls under different ancestors are disambiguated by scoped selectors", async () => {
@@ -351,7 +357,37 @@ test("selectionGroup members generate the correct suggested path", async () => {
   await seedRegistry(pack);
   const res = resolveSemanticControl({ profile: "sem-fixture", query: "传感器配置", page: "config" });
   assert.equal(res.matches[0]!.control, "tabSensor");
+  // Path: navigationControl -> page rootControl (component rootControl is the
+  // same control, deduped) -> target. No unrelated component nodes.
   assert.deepEqual(res.suggestedPath, ["sidebarChannel1", "channel1Page", "tabSensor"]);
+  assert.equal(res.pathAmbiguous, false);
+});
+
+test("suggestedPath: target in the second card never pulls the first card", async () => {
+  const pack = await loadFixture();
+  // Add a second component that contains only the deep control; the sensor
+  // tab belongs to the FIRST card. Querying the deep control must yield a
+  // path through its own component, never the sensor card's.
+  const withSecond = JSON.parse(JSON.stringify(pack)) as LoadedPack;
+  withSecond.components!.components.push({
+    id: "second-card",
+    displayName: "第二卡片",
+    page: "config",
+    role: "card",
+    rootControl: "mainScrollArea",
+    children: ["deepControl"]
+  });
+  const dir = pack.dir;
+  const { writeFile } = await import("node:fs/promises");
+  await writeFile(dir + "/components.json", JSON.stringify(withSecond.components));
+  await registry.load(path.dirname(dir), [], false);
+  const res = resolveSemanticControl({ profile: "sem-fixture", query: "deep", within: "second-card" });
+  assert.ok(res.matches.some((m) => m.control === "deepControl"));
+  // The path must NOT contain the sensor card's root (channel1Page) when the
+  // deep control's own component root is mainScrollArea.
+  const res2 = resolveSemanticControl({ profile: "sem-fixture", query: "deep" });
+  assert.equal(res2.pathAmbiguous, false, JSON.stringify(res2));
+  assert.ok(!res2.suggestedPath.includes("tabSensor"), JSON.stringify(res2.suggestedPath));
 });
 
 test("pages describe compactly with page filter", async () => {

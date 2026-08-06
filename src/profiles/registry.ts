@@ -36,6 +36,9 @@ import {
 import type { ProfileResolveInput, ProfileActionInput } from "../schemas.js";
 import { McpUiError } from "../uia/results.js";
 import { evaluateExpect } from "../expect.js";
+import { evaluateControlState, snapshotFromElement, type ControlStateEvaluation } from "./control-state.js";
+import { resolveFallbackPolicy, EXECUTABLE_FALLBACK_METHODS, type FallbackDecision } from "./fallback.js";
+import { evaluateVisibility, isRectFullyVisible, toRect, type RectLike, type VisibilityResult } from "./visibility.js";
 import {
   backgroundPolicyForAction,
   effectiveModeFor,
@@ -810,65 +813,114 @@ async function performCompositeProfileAction(
     const visibility = (entry as ControlEntry & { visibility?: { scrollContainer?: string; strategies?: string[]; margin?: number } }).visibility;
     const scrollContainer = visibility?.scrollContainer;
     const strategies = visibility?.strategies ?? ["ScrollItemPattern", "RangeValueScroll", "WindowMessageWheel"];
+    const margin = Math.max(0, visibility?.margin ?? 0);
+    const waitSettle = (ms: number) => sleep(ms);
 
     const readElement = async (): Promise<UiElementState | null> => {
-      const r = await deps.getUiElement({ ...win(), selector, includeProcessPopups: true, timeoutMs: actionTimeout }).catch(() => null);
+      const r = await deps.getUiElement({ ...win(), selector, includeProcessPopups: true, timeoutMs: actionTimeout, maxDepth: localMaxDepth }).catch(() => null);
       return r?.element ?? null;
     };
 
-    const isFullyVisible = (e: UiElementState | null): boolean => {
-      if (!e) return false;
-      if (!e.offscreen) return true; // provider says visible
-      return false;
+    // Effective viewport: declared scrollContainer boundingRect (screen
+    // space) first, then the page rootControl, then the top-level window's
+    // client rect converted to screen. UIA boundingRect is ALWAYS screen
+    // space, so all rects compare in the same space - no client/screen mix.
+    const resolveViewport = async (): Promise<{ rect: RectLike | null; source: VisibilityResult["viewportSource"] }> => {
+      const tryControl = async (controlId: string): Promise<RectLike | null> => {
+        const entryRef = normalizeControlEntry(profile.controls[controlId]);
+        if (!entryRef) return null;
+        for (const s of entryRef.selectors) {
+          try {
+            const r = await deps.getUiElement({ ...win(), selector: s, includeProcessPopups: true, timeoutMs: actionTimeout, maxDepth: localMaxDepth });
+            if (r.found) return toRect(r.element.boundingRect) ?? null;
+          } catch { /* try next */ }
+        }
+        return null;
+      };
+      if (scrollContainer) {
+        const r = await tryControl(scrollContainer);
+        if (r) return { rect: r, source: "scrollContainer" };
+      }
+      const root = (entry as ControlEntry & { page?: string }).page;
+      if (root) {
+        const page = packRegistry.getPack(profile.id)?.pages?.pages.find((p) => p.id === root);
+        if (page?.rootControl) {
+          const r = await tryControl(page.rootControl);
+          if (r) return { rect: r, source: "pageRoot" };
+        }
+      }
+      // Fall back to the main window's client rect (converted to screen via
+      // the window's own boundingRect - UIA reports window rects in screen
+      // space already).
+      try {
+        const winRect = await deps.getUiElement({ ...win(), selector: { controlType: "Window" }, includeProcessPopups: true, timeoutMs: actionTimeout });
+        if (winRect.found) return { rect: toRect(winRect.element.boundingRect) ?? null, source: "windowClient" };
+      } catch { /* ignore */ }
+      return { rect: null, source: "none" };
     };
 
-    const waitSettle = (ms: number) => sleep(ms);
+    const checkVisible = async (e: UiElementState | null): Promise<VisibilityResult | null> => {
+      if (!e) return null;
+      const vp = await resolveViewport();
+      return evaluateVisibility(e, vp.rect, margin, vp.source);
+    };
 
     let element = await readElement();
     if (!element) {
       throw new McpUiError("ELEMENT_NOT_FOUND", `ensureVisible: control '${input.control}' could not be resolved.`, { control: input.control });
     }
-    if (isFullyVisible(element)) {
+    let vis = await checkVisible(element);
+    if (vis?.fullyVisible) {
       return {
         profile: profile.id, control: input.control, selectorUsed: selector, confidence: entry.confidence, notes: entry.notes,
-        result: { success: true, method: "noop", alreadyVisible: true, scrolled: false }
+        result: { success: true, method: "noop", alreadyVisible: true, scrolled: false, ...vis }
       };
     }
 
+    const attemptedStrategies: string[] = [];
+    let scrollValueChanged = false;
+    const deadline = Date.now() + (input.timeoutMs ?? 15000);
+
     // 1) ScrollItemPattern on the control itself.
     if (strategies.includes("ScrollItemPattern") && element.patterns.some((p) => p.includes("ScrollItem"))) {
+      attemptedStrategies.push("ScrollItemPattern");
       try {
         await deps.performUiAction(act({ selector, action: "scrollIntoView" }));
         await waitSettle(250);
         element = await readElement();
-        if (element && isFullyVisible(element)) {
+        vis = await checkVisible(element);
+        if (vis?.fullyVisible) {
           return {
             profile: profile.id, control: input.control, selectorUsed: selector, confidence: entry.confidence, notes: entry.notes,
-            result: { success: true, method: "ScrollItemPattern", alreadyVisible: false, scrolled: true }
+            result: { success: true, method: "ScrollItemPattern", alreadyVisible: false, scrolled: true, ...vis }
           };
         }
       } catch { /* pattern not supported or scroll did not take - continue */ }
     }
 
-    // 2) Declared scroll container: drive RangeValuePattern (absolute) first,
-    //    then wheel messages on the container window (never the physical mouse).
-    if (scrollContainer && strategies.includes("RangeValueScroll")) {
+    // 2) Declared scroll container: drive RangeValuePattern (absolute). The
+    //    container itself is the viewport; track its scroll value to detect
+    //    no-change stalls.
+    if (scrollContainer && strategies.includes("RangeValueScroll") && Date.now() < deadline) {
+      attemptedStrategies.push("RangeValueScroll");
       const containerEntry = normalizeControlEntry(profile.controls[scrollContainer]);
       if (containerEntry) {
         for (const containerSelector of containerEntry.selectors) {
           try {
-            const container = await deps.getUiElement({ ...win(), selector: containerSelector, includeProcessPopups: true, timeoutMs: actionTimeout });
+            const container = await deps.getUiElement({ ...win(), selector: containerSelector, includeProcessPopups: true, timeoutMs: actionTimeout, maxDepth: localMaxDepth });
             if (container.found && container.element?.patterns.some((p) => p.includes("RangeValue"))) {
-              // Scroll toward the control: if the control is below the
-              // viewport, move the scrollbar to its maximum (bottom); the
-              // wheel path below also handles intermediate positions.
+              const beforeValue = container.element.rangeValue;
               await deps.performUiAction(act({ selector: containerSelector, action: "setRangeValue", rangeValue: Number(container.element.maximum ?? 0) }));
               await waitSettle(250);
               element = await readElement();
-              if (element && isFullyVisible(element)) {
+              const afterContainer = await deps.getUiElement({ ...win(), selector: containerSelector, includeProcessPopups: true, timeoutMs: actionTimeout, maxDepth: localMaxDepth }).catch(() => null);
+              const afterValue = afterContainer?.element?.rangeValue ?? beforeValue;
+              if (afterValue !== beforeValue) scrollValueChanged = true;
+              vis = await checkVisible(element);
+              if (vis?.fullyVisible) {
                 return {
                   profile: profile.id, control: input.control, selectorUsed: selector, confidence: entry.confidence, notes: entry.notes,
-                  result: { success: true, method: "RangeValueScroll", alreadyVisible: false, scrolled: true, scrollContainer }
+                  result: { success: true, method: "RangeValueScroll", alreadyVisible: false, scrolled: true, scrollContainer, ...vis }
                 };
               }
               break;
@@ -878,33 +930,47 @@ async function performCompositeProfileAction(
       }
     }
 
-    // 3) Wheel/step messages on the scroll container. When the container
-    //    itself is a RangeValue control (scrollbar), nudge it step by step
-    //    toward the control's position; re-verify after each step.
-    if (scrollContainer && strategies.includes("WindowMessageWheel")) {
+    // 3) Step messages on the scroll container (window message, never the
+    //    physical mouse). Re-resolve + re-verify after every step; stop when
+    //    the scroll value stops changing or the deadline passes.
+    if (scrollContainer && strategies.includes("WindowMessageWheel") && Date.now() < deadline) {
+      attemptedStrategies.push("WindowMessageWheel");
       const containerEntry = normalizeControlEntry(profile.controls[scrollContainer]);
       if (containerEntry) {
         for (const containerSelector of containerEntry.selectors) {
           try {
-            const container = await deps.getUiElement({ ...win(), selector: containerSelector, includeProcessPopups: true, timeoutMs: actionTimeout });
+            const container = await deps.getUiElement({ ...win(), selector: containerSelector, includeProcessPopups: true, timeoutMs: actionTimeout, maxDepth: localMaxDepth });
             if (!container.found || !container.element?.nativeWindowHandle) continue;
-            const containerRect = container.element.boundingRect;
-            const ctrlRect = (await readElement())?.boundingRect;
+            const containerRect = toRect(container.element.boundingRect);
+            const ctrlRect = toRect((await readElement())?.boundingRect);
             if (!containerRect || !ctrlRect) continue;
             // Positive when the control sits above the viewport (scroll up).
-            const direction = ctrlRect.y < containerRect.y ? 1 : -1;
-            for (let step = 0; step < 6; step++) {
+            const cy = ctrlRect.y ?? 0;
+            const vy = containerRect.y ?? 0;
+            const direction = cy < vy ? 1 : -1;
+            let lastValue = container.element.rangeValue;
+            for (let step = 0; step < 8 && Date.now() < deadline; step++) {
               try {
                 await deps.performUiAction(act({ selector: containerSelector, action: direction > 0 ? "increment" : "decrement" }));
               } catch { /* not a range control; nothing to step */ }
               await waitSettle(120);
+              const re = await deps.getUiElement({ ...win(), selector: containerSelector, includeProcessPopups: true, timeoutMs: actionTimeout, maxDepth: localMaxDepth }).catch(() => null);
+              const newValue = re?.element?.rangeValue;
+              if (newValue !== undefined && newValue !== null && newValue !== lastValue) {
+                scrollValueChanged = true;
+                lastValue = newValue;
+              } else if (newValue !== undefined && newValue !== null) {
+                // No change: stop stepping.
+                break;
+              }
               element = await readElement();
-              if (element && isFullyVisible(element)) break;
+              vis = await checkVisible(element);
+              if (vis?.fullyVisible) break;
             }
-            if (element && isFullyVisible(element)) {
+            if (vis?.fullyVisible) {
               return {
                 profile: profile.id, control: input.control, selectorUsed: selector, confidence: entry.confidence, notes: entry.notes,
-                result: { success: true, method: "WindowMessageWheel", alreadyVisible: false, scrolled: true, scrollContainer }
+                result: { success: true, method: "WindowMessageWheel", alreadyVisible: false, scrolled: true, scrollContainer, ...vis }
               };
             }
           } catch { /* try next container selector */ }
@@ -912,11 +978,25 @@ async function performCompositeProfileAction(
       }
     }
 
+    // Failure: report the geometry truth, not just offscreen.
+    const finalVis = await checkVisible(element);
+    const details: Record<string, unknown> = {
+      control: input.control,
+      ...(finalVis?.elementRect ? { elementRect: finalVis.elementRect } : {}),
+      ...(finalVis?.viewportRect ? { viewportRect: finalVis.viewportRect } : {}),
+      margin,
+      offscreen: finalVis?.offscreen ?? true,
+      visible: finalVis?.visible ?? false,
+      fullyVisible: finalVis?.fullyVisible ?? false,
+      attemptedStrategies,
+      scrollValueChanged,
+      viewportSource: finalVis?.viewportSource ?? "none"
+    };
     throw new McpUiError(
-      "ACTION_FAILED",
-      `ensureVisible: control '${input.control}' could not be scrolled fully into view with the declared strategies.`,
-      { control: input.control, scrollContainer: scrollContainer ?? null, strategies: [...strategies] },
-      "Verify the control exists and its visibility.scrollContainer is declared in the App Pack."
+      "ELEMENT_NOT_FULLY_VISIBLE",
+      `ensureVisible: control '${input.control}' is not fully visible within the viewport (margin ${margin}).`,
+      details,
+      "Verify the control exists, its visibility.scrollContainer is declared, and the scroll strategies are supported."
     );
   }
 
@@ -935,14 +1015,26 @@ async function performCompositeProfileAction(
     const contract = packActions?.contracts.find((c) => c.control === input.control && c.action === "ensureSelected");
     const expect = contract?.defaultExpect;
     const expectEnabled = input.expect !== false;
-    const fallbackAllowed = contract?.fallbackPolicy !== "disabled";
+    // Fallback decision: caller opt-in AND control-level policy AND
+    // action-contract policy AND interactionMode, in that priority.
+    const fallback = resolveFallbackPolicy({
+      controlEntry: entry,
+      actionContract: contract,
+      callOptions: { allowMessageClickFallback: input.allowMessageClickFallback, allowCoordinateFallback: input.allowCoordinateFallback },
+      interactionMode: mode
+    });
+    const fallbackAllowed = fallback.enabled;
     // Control-level semantic postconditions (controls.json postconditions) are
     // evaluated in ADDITION to the action contract's defaultExpect.
     const controlPostconditions = (entry as ControlEntry & { postconditions?: Array<{ profileControl: string; condition: string; timeoutMs?: number; pollIntervalMs?: number; toggleState?: string; expectedValue?: string }> }).postconditions ?? [];
+    // Declared controlState requirement (authoritative when present; the
+    // legacy selected/toggleState default applies only when undeclared).
+    const declaredControlState = (entry as ControlEntry & { controlState?: { any?: Array<{ condition: string; expectedValue?: string; toggleState?: string }>; all?: Array<{ condition: string; expectedValue?: string; toggleState?: string }> } }).controlState;
 
-    // controlState verification: selected=true / toggleState On / SelectionItem.
-    const controlStateTrue = (e: Partial<UiElementState> | null | undefined): boolean =>
-      e != null && (e.selected === true || e.toggleState === "On");
+    // controlState verification: pack-declared conditions when present, else
+    // the legacy default (selected OR toggleState On).
+    const evaluateState = (e: Partial<UiElementState> | null | undefined): ControlStateEvaluation =>
+      evaluateControlState(snapshotFromElement(e), declaredControlState as never);
 
     // Evaluate one postcondition (contract defaultExpect OR control-level).
     // The referenced control's pack-declared `search` scope (maxDepth /
@@ -989,112 +1081,109 @@ async function performCompositeProfileAction(
       return r?.element ?? null;
     };
 
-    let before = await readControl();
-    const controlOk = controlStateTrue(before);
-    if (controlOk) {
-      // Control state says selected - but the declared business postcondition
-      // must ALSO hold, or the action is inconsistent (e.g. a nav toggle that
-      // did not switch the page).
-      const business = await verifyBusiness();
-      if (business.ok) {
-        return {
-          profile: profile.id, control: input.control, selectorUsed: selector, confidence: entry.confidence, notes: entry.notes,
-          result: {
-            success: true, method: "noop", alreadySelected: true, toggleState: before?.toggleState ?? null,
-            controlStateVerified: true, businessStateVerified: true, fallbackUsed: false, physicalCursorMoved: false
-          }
-        };
-      }
-      // controlState=true but businessState=false: inconsistent. Try the
-      // window-message fallback when the pack allows it; otherwise fail with
-      // ACTION_STATE_INCONSISTENT (NEVER a silent success).
-      if (!fallbackAllowed || !(input.allowMessageClickFallback ?? input.allowCoordinateFallback ?? false)) {
-        throw new McpUiError(
-          "ACTION_STATE_INCONSISTENT",
-          "Control reports selected, but the declared postcondition is not satisfied.",
-          { profile: profile.id, control: input.control, action: input.action, controlState: before?.toggleState ?? null, businessState: business.reason },
-          "Verify the actual page/content state; the control may have toggled without switching the underlying view. Re-run with allowMessageClickFallback=true if the pack permits window-message fallback."
-        );
-      }
+    // Run one activation attempt and re-read the control. Returns the method
+    // actually used (or null when the attempt itself failed and no further
+    // attempt should be made on this path).
+    const attemptMethod = async (m: string): Promise<{ method: string; element: Partial<UiElementState> | null; failed: boolean }> => {
+      const actionFor: Record<string, string> = {
+        SelectionItemPattern: "select",
+        TogglePattern: "toggle",
+        InvokePattern: "invoke",
+        WindowMessageElementClick: "windowMessageClick"
+      };
+      const action = actionFor[m] ?? "invoke";
       try {
-        const fb = await deps.performUiAction(act({ selector, action: "windowMessageClick" }));
-        before = await readControl();
-        const businessAfter = await verifyBusiness();
-        if (!controlStateTrue(before) || !businessAfter.ok) {
-          throw new McpUiError(
-            "ACTION_STATE_INCONSISTENT",
-            "Control reports selected, but the declared postcondition is not satisfied (window-message fallback did not help).",
-            { profile: profile.id, control: input.control, action: input.action, controlState: before?.toggleState ?? null, businessState: businessAfter.reason, method: fb.method },
-            "Verify the actual page/content state; the control may have toggled without switching the underlying view."
-          );
-        }
-        return {
-          profile: profile.id, control: input.control, selectorUsed: selector, confidence: entry.confidence, notes: entry.notes,
-          result: {
-            success: true, method: fb.method ?? "WindowMessageElementClick", alreadySelected: true,
-            controlStateVerified: true, businessStateVerified: true, fallbackUsed: true, physicalCursorMoved: false,
-            before: before?.toggleState ?? null, after: before?.toggleState ?? null
-          }
-        };
+        const r = await deps.performUiAction(act({ selector, action }));
+        if (!r.success) throw new McpUiError("ACTION_FAILED", `${m} did not succeed.`, { control: input.control });
+        return { method: r.method ?? m, element: await readControl(), failed: false };
       } catch (error) {
-        if (error instanceof McpUiError && error.code === "ACTION_STATE_INCONSISTENT") throw error;
-        throw new McpUiError(
-          "ACTION_STATE_INCONSISTENT",
-          "Control reports selected, but the declared postcondition is not satisfied (window-message fallback failed).",
-          { profile: profile.id, control: input.control, action: input.action, fallbackError: error instanceof McpUiError ? error.code : String(error) },
-          "Verify the actual page/content state; the control may have toggled without switching the underlying view."
-        );
-      }
-    }
-
-    // Control state says not selected: act (pattern first, then the allowed
-    // window-message fallback), then verify control AND business state.
-    const perform = async (): Promise<{ method: string; element: Partial<UiElementState> | null }> => {
-      let actionResult: ActionResult;
-      try {
-        actionResult = await deps.performUiAction(act({ selector, action: "invoke" }));
-        if (!actionResult.success) {
-          throw new McpUiError("ACTION_FAILED", `ensureSelected invoke did not succeed: ${actionResult.method ?? "unknown"}.`, { control: input.control });
-        }
-      } catch (error) {
-        // Pattern path failed: window-message fallback only when the pack
-        // allows it and the caller opted in.
-        if (!fallbackAllowed || !(input.allowMessageClickFallback ?? input.allowCoordinateFallback ?? false)) {
-          throw error;
-        }
         if (error instanceof McpUiError && (error.code === "PATTERN_NOT_SUPPORTED" || error.code === "ACTION_FAILED")) {
-          const fb = await deps.performUiAction(act({ selector, action: "windowMessageClick" }));
-          return { method: fb.method ?? "WindowMessageElementClick", element: await readControl() };
+          return { method: m, element: null, failed: true };
         }
         throw error;
       }
-      return { method: actionResult.method ?? "invoke", element: await readControl() };
     };
 
-    const { method, element: after } = await perform();
-    const nowSelected = controlStateTrue(after);
-    if (!nowSelected) {
+    // The primary attempt is InvokePattern (or the first declared fallback
+    // method when the pack declares an explicit method list); subsequent
+    // declared methods are tried in order. Every attempt re-verifies control
+    // state AND business postconditions; success stops immediately.
+    const methods = fallback.methods.length > 0 ? fallback.methods : ["InvokePattern"];
+    const attemptedMethods: string[] = [];
+    let successfulMethod: string | undefined;
+    let after: Partial<UiElementState> | null = null;
+    const before = await readControl();
+
+    // Idempotent shortcut: if the control already satisfies the declared
+    // state AND the business postconditions, no action is needed.
+    const beforeEval = evaluateState(before);
+    if (beforeEval.matched && (await verifyBusiness()).ok) {
+      return {
+        profile: profile.id, control: input.control, selectorUsed: selector, confidence: entry.confidence, notes: entry.notes,
+        result: {
+          success: true, method: "noop", alreadySelected: true, toggleState: before?.toggleState ?? null,
+          controlStateVerified: true, controlStateUsedDefault: beforeEval.usedDefault,
+          controlStateEvaluation: { conditions: beforeEval.conditions },
+          businessStateVerified: true,
+          fallbackPolicyResolved: { enabled: fallback.enabled, methods: fallback.methods, source: fallback.source },
+          attemptedMethods: [], successfulMethod: null, fallbackUsed: false, physicalCursorMoved: false
+        }
+      };
+    }
+
+    for (const m of methods) {
+      attemptedMethods.push(m);
+      const attempt = await attemptMethod(m);
+      if (attempt.failed) continue;
+      after = attempt.element;
+      const stateEval = evaluateState(after);
+      const business = await verifyBusiness();
+      if (stateEval.matched && business.ok) {
+        successfulMethod = attempt.method;
+        break;
+      }
+    }
+
+    if (!successfulMethod) {
+      // Everything attempted and nothing verified: report the failing
+      // conditions with the actual values.
+      const stateEval = evaluateState(after);
+      const business = await verifyBusiness();
+      const failedConditions = stateEval.conditions.filter((c) => !c.matched).map((c) => ({ condition: c.condition, expected: c.expected, actual: c.actual }));
+      const details: Record<string, unknown> = {
+        profile: profile.id, control: input.control, action: input.action,
+        attemptedMethods, successfulMethod: null,
+        controlStateEvaluation: stateEval, businessState: business.reason,
+        fallbackUsed: attemptedMethods.length > 1, physicalCursorMoved: false
+      };
+      if (failedConditions.length > 0) details.failedControlStateConditions = failedConditions;
+      if (business.reason) details.failedPostconditions = [business.reason];
       throw new McpUiError(
         "ACTION_STATE_INCONSISTENT",
-        `ensureSelected did not take: control still reports not-selected after '${method}'.`,
-        { profile: profile.id, control: input.control, action: input.action, before: before?.toggleState ?? null, after: after?.toggleState ?? null, method },
-        "Re-run the action and verify the outcome with ui_wait/expect; the control may not accept pattern toggles."
+        `ensureSelected did not verify: control state and/or business postconditions not satisfied after [${attemptedMethods.join(", ")}].`,
+        details,
+        "Verify the actual page/content state; the control may not accept the declared methods, or the content did not switch."
       );
     }
+
+    const stateEval = evaluateState(after);
     const business = await verifyBusiness();
-    if (!business.ok) {
-      throw new McpUiError(
-        "ACTION_STATE_INCONSISTENT",
-        `Control reports selected, but the declared postcondition is not satisfied (after '${method}').`,
-        { profile: profile.id, control: input.control, action: input.action, controlState: after?.toggleState ?? null, businessState: business.reason, method },
-        "Verify the actual page/content state; the control may have toggled without switching the underlying view."
-      );
-    }
+    const fallbackUsed = attemptedMethods.length > 1;
+    const preState = before?.toggleState ?? null;
     return {
       profile: profile.id, control: input.control, selectorUsed: selector, confidence: entry.confidence, notes: entry.notes,
       result: {
-        success: true, method, alreadySelected: false, before: before?.toggleState ?? null, after: after?.toggleState ?? null,
-        controlStateVerified: true, businessStateVerified: true, fallbackUsed: method.startsWith("WindowMessage"), physicalCursorMoved: false
+        success: true, method: successfulMethod, alreadySelected: attemptedMethods[0] === "InvokePattern" && fallback.methods.length === 0 ? false : undefined,
+        before: preState, after: after?.toggleState ?? null,
+        controlStateVerified: stateEval.matched,
+        controlStateUsedDefault: stateEval.usedDefault,
+        controlStateEvaluation: { conditions: stateEval.conditions },
+        businessStateVerified: business.ok,
+        fallbackPolicyResolved: { enabled: fallback.enabled, methods: fallback.methods, source: fallback.source },
+        attemptedMethods,
+        successfulMethod,
+        fallbackUsed,
+        physicalCursorMoved: false
       }
     };
   }

@@ -6,6 +6,7 @@
 import { z } from "zod";
 
 import { hasLocator, normalizeControlType, validateRegex } from "../uia/selectors.js";
+import { CONTROL_STATE_CONDITIONS, FALLBACK_METHODS, FORBIDDEN_FALLBACK_METHODS } from "./enums.js";
 
 const packIdPattern = /^[a-z][a-z0-9._-]{0,63}$/;
 const nonEmptyStr = z.string().min(1).max(256);
@@ -174,13 +175,10 @@ const packBusinessPostconditionSchema: z.ZodType<import("./types.js").PackBusine
 
 // Control-state conditions apply to the control ITSELF - no profileControl
 // or selector references (unlike business postconditions which reference
-// content markers via profileControl).
+// content markers via profileControl). Conditions come from the SHARED enum
+// (src/app-packs/enums.ts) - the executor implements exactly these.
 const packControlStateConditionSchema = z.object({
-  condition: z.enum([
-    "selected", "notSelected", "toggleStateEquals", "expanded", "collapsed",
-    "exists", "notExists", "visible", "hidden", "enabled", "disabled",
-    "valueEquals", "valueContains"
-  ]),
+  condition: z.enum(CONTROL_STATE_CONDITIONS),
   expectedValue: z.string().max(4000).optional(),
   toggleState: z.enum(["On", "Off", "Indeterminate"]).optional()
 }).strict().refine(
@@ -209,16 +207,13 @@ const packSearchScopeSchema = z.object({
 const packVisibilitySchema = z.object({
   scrollContainer: nonEmptyStr.optional(),
   strategies: z.array(z.enum(["ScrollItemPattern", "RangeValueScroll", "WindowMessageWheel"])).min(1).max(3).optional(),
-  margin: z.number().int().min(0).max(256).optional()
+  margin: z.number().finite().min(0).max(256).optional()
 }).strict();
 
 const packFallbackPolicySchema = z.object({
   enabled: z.boolean().optional().default(true),
-  methods: z.array(z.enum([
-    "SelectionItemPattern", "TogglePattern", "InvokePattern",
-    "WindowMessageElementClick", "KeyboardNavigation"
-  ])).min(1).max(6).optional(),
-  forbidden: z.array(z.enum(["PhysicalMouse", "GlobalKeyboard"])).max(2).optional()
+  methods: z.array(z.enum(FALLBACK_METHODS)).min(1).max(6).optional(),
+  forbidden: z.array(z.enum(FORBIDDEN_FALLBACK_METHODS)).max(3).optional()
 }).strict();
 
 const packControlRoleSchema = z.enum([

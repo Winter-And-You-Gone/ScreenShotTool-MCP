@@ -21,6 +21,7 @@ import { getContract, unwrapToolError } from "../contracts.js";
 import { isSensitiveFieldName } from "../outputs.js";
 import { extractReferenceHeads } from "../piping.js";
 import type { LoadedPack, PackWorkflow, PackWorkflowStep } from "./types.js";
+import { CONTROL_STATE_CONDITIONS, FALLBACK_METHODS, FORBIDDEN_FALLBACK_METHODS } from "./enums.js";
 
 export type ValidationIssue = {
   file: string;
@@ -587,19 +588,36 @@ function validateSemanticMap(
     }
     if (meta.fallbackPolicy) {
       const f = meta.fallbackPolicy;
-      // PhysicalMouse/GlobalKeyboard are ALWAYS forbidden by the core; a pack
-      // may declare them in `forbidden` as an explicit statement (allowed),
-      // but may never ENABLE them in `methods`.
-      const alwaysForbidden = new Set(["PhysicalMouse", "GlobalKeyboard"]);
+      // PhysicalMouse/GlobalKeyboard/SetCursorPos are ALWAYS forbidden by the
+      // core; a pack may declare them in `forbidden` as an explicit statement
+      // (allowed), but may never ENABLE them in `methods`.
+      const validMethods = new Set<string>(FALLBACK_METHODS);
+      const alwaysForbidden = new Set<string>(FORBIDDEN_FALLBACK_METHODS);
       for (const method of f.methods ?? []) {
         if (alwaysForbidden.has(method)) {
           errors.push({ file: "controls.json", path: `${where}.fallbackPolicy.methods`, code: "FORBIDDEN_FALLBACK_METHOD", message: `Control '${name}' lists '${method}' in fallbackPolicy.methods - it is never allowed (the core never moves the physical cursor or uses global keyboard input).`, suggestion: `Remove '${method}' from methods; declare it in forbidden instead if you want to state it explicitly.` });
           continue;
         }
-        if (!["SelectionItemPattern", "TogglePattern", "InvokePattern", "WindowMessageElementClick", "KeyboardNavigation"].includes(method)) {
-          errors.push({ file: "controls.json", path: `${where}.fallbackPolicy.methods`, code: "INVALID_FALLBACK_METHOD", message: `Control '${name}' fallback method '${method}' is not a known method.`, suggestion: "Valid: SelectionItemPattern, TogglePattern, InvokePattern, WindowMessageElementClick, KeyboardNavigation." });
+        if (!validMethods.has(method)) {
+          errors.push({ file: "controls.json", path: `${where}.fallbackPolicy.methods`, code: "INVALID_FALLBACK_METHOD", message: `Control '${name}' fallback method '${method}' is not a known method.`, suggestion: `Valid: ${FALLBACK_METHODS.join(", ")}.` });
         }
       }
+    }
+    // controlState conditions: the executor implements exactly the shared
+    // enum (schema already restricts them); a condition outside the enum is
+    // impossible here, but assert defensively so schema/executor drift is a
+    // validation error, not a runtime surprise.
+    for (const req of [...(meta.controlState?.any ?? []), ...(meta.controlState?.all ?? [])]) {
+      const cond = (req as { condition?: string }).condition ?? "";
+      if (!CONTROL_STATE_CONDITIONS.includes(cond as (typeof CONTROL_STATE_CONDITIONS)[number])) {
+        errors.push({ file: "controls.json", path: `${where}.controlState`, code: "UNSUPPORTED_CONTROL_STATE_CONDITION", message: `Control '${name}' controlState condition '${cond}' is not implemented by the executor.`, suggestion: `Supported: ${CONTROL_STATE_CONDITIONS.join(", ")}.` });
+      }
+    }
+    // visibility.margin must be finite and non-negative (schema enforces it
+    // too; double-check for direct-constructed packs).
+    const margin = (meta.visibility as { margin?: unknown } | undefined)?.margin;
+    if (margin !== undefined && (typeof margin !== "number" || !Number.isFinite(margin) || margin < 0)) {
+      errors.push({ file: "controls.json", path: `${where}.visibility.margin`, code: "INVALID_VISIBILITY_MARGIN", message: `Control '${name}' visibility.margin must be a finite non-negative number.`, suggestion: "Use a finite number >= 0." });
     }
   }
 

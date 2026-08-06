@@ -769,14 +769,34 @@ const semanticMatch = obj(
   ["control", "score", "reason"]
 );
 
+const semanticScope = obj(
+  {
+    within: str(),
+    resolved: bool()
+  },
+  ["resolved"]
+);
+
+const relationshipEvidence = obj(
+  {
+    from: str(),
+    to: str(),
+    relation: str()
+  },
+  ["from", "to", "relation"]
+);
+
 const resolveSemanticControlOutput = withToolError(obj(
   {
     profile: str(),
     query: str(),
     matches: arr(semanticMatch),
-    suggestedPath: arr(str())
+    suggestedPath: arr(str()),
+    pathAmbiguous: bool(),
+    scope: semanticScope,
+    relationshipEvidence: arr(relationshipEvidence)
   },
-  ["profile", "query", "matches"]
+  ["profile", "query", "matches", "pathAmbiguous"]
 ));
 
 const validationIssue = obj(
