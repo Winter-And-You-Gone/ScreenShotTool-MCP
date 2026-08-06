@@ -92,7 +92,8 @@ export const launchAppSchema = z.object({
   waitForWindow: z.boolean().optional().default(true),
   timeoutMs: optionalTimeout.default(10000),
   startMinimized: z.boolean().optional().default(false),
-  noActivate: z.boolean().optional().default(false)
+  noActivate: z.boolean().optional().default(false),
+  ...interactionParams
 }).strict();
 
 export const listWindowsSchema = z.object({
@@ -174,7 +175,8 @@ export const typeTextSchema = z.object({
   text: z.string().min(1).max(maxTypeTextLength),
   delayMs: z.number().int().min(0).max(10000).optional().default(50),
   pressMs: z.number().int().min(0).max(5000).optional().default(30),
-  noActivate: z.boolean().optional().default(false)
+  noActivate: z.boolean().optional().default(false),
+  ...interactionParams
 }).strict().refine(
   (value) => value.hwnd !== undefined || value.pid !== undefined || value.processName !== undefined || value.titleContains !== undefined,
   "Provide at least one of hwnd, pid, processName, or titleContains."
@@ -192,7 +194,8 @@ export const sendKeySchema = z.object({
   modifiers: z.array(z.enum(["alt", "ctrl", "shift", "win"])).optional().default([]),
   delayMs: z.number().int().min(0).max(10000).optional().default(50),
   pressMs: z.number().int().min(0).max(5000).optional().default(30),
-  noActivate: z.boolean().optional().default(false)
+  noActivate: z.boolean().optional().default(false),
+  ...interactionParams
 }).strict().refine(
   (value) => value.hwnd !== undefined || value.pid !== undefined || value.processName !== undefined || value.titleContains !== undefined,
   "Provide at least one of hwnd, pid, processName, or titleContains."
@@ -737,7 +740,8 @@ export const toolInputSchemas = {
       waitForWindow: { type: "boolean", default: true, description: "Wait for the first visible window for the process." },
       timeoutMs: { type: "integer", minimum: 100, maximum: 120000, default: 10000 },
       startMinimized: { type: "boolean", default: false, description: "After the first window is found, request minimized/background presentation. Some apps may briefly show during startup." },
-      noActivate: { type: "boolean", default: false, description: "Best-effort background launch: restore the previous foreground window and push the new window to the bottom of the z-order without activation when possible." }
+      noActivate: { type: "boolean", default: false, description: "Best-effort background launch: restore the previous foreground window and push the new window to the bottom of the z-order without activation when possible." },
+      ...interactionParamsJson
     },
     required: ["exePath"],
     additionalProperties: false
@@ -868,7 +872,8 @@ export const toolInputSchemas = {
       text: { type: "string", minLength: 1, maxLength: maxTypeTextLength, description: "Text to type into the target window. Sent via SendInput Unicode, so any Unicode character including CJK is supported. For standard Edit/RichEdit controls the helper may use EM_REPLACESEL, which replaces the current selection (if any) rather than appending at the caret; send an empty selection-clearing keystroke first if you need a pure insert." },
       delayMs: { type: "integer", minimum: 0, maximum: 10000, default: 50, description: "Delay between keystrokes in milliseconds." },
       pressMs: { type: "integer", minimum: 0, maximum: 5000, default: 30, description: "Duration of each key press in milliseconds." },
-      noActivate: { type: "boolean", default: false, description: "When true, sends WM_CHAR messages via PostMessage instead of SendInput, so the target window never needs focus. Some applications may not respond to posted messages." }
+      noActivate: { type: "boolean", default: false, description: "When true, sends WM_CHAR messages via PostMessage instead of SendInput, so the target window never needs focus. Some applications may not respond to posted messages." },
+      ...interactionParamsJson
     },
     required: ["text"],
     additionalProperties: false,
@@ -891,7 +896,8 @@ export const toolInputSchemas = {
       modifiers: { type: "array", items: { type: "string", enum: ["alt", "ctrl", "shift", "win"] }, description: "Modifier keys to hold during the keypress." },
       delayMs: { type: "integer", minimum: 0, maximum: 10000, default: 50 },
       pressMs: { type: "integer", minimum: 0, maximum: 5000, default: 30 },
-      noActivate: { type: "boolean", default: false, description: "When true, sends WM_KEYDOWN/WM_KEYUP via PostMessage instead of keybd_event, so the target window never needs focus. Some applications may not respond to posted messages." }
+      noActivate: { type: "boolean", default: false, description: "When true, sends WM_KEYDOWN/WM_KEYUP via PostMessage instead of keybd_event, so the target window never needs focus. Some applications may not respond to posted messages." },
+      ...interactionParamsJson
     },
     required: ["key"],
     additionalProperties: false,

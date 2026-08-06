@@ -219,6 +219,13 @@ function resolveReference(head: string, tailDot: string, ctx: PipeContext): Reso
       }
       current = current[idx];
     } else if (typeof current === "object") {
+      // CANONICAL-ARRAY COMPAT: array tools now return { items: [...] }
+      // everywhere (outputSchema, structuredContent, pipeline results). Old
+      // pipelines that reference the bare array directly (${0.0.hwnd}) keep
+      // working: a top-level numeric segment is translated to items.N.
+      if (/^\d+$/.test(seg) && Array.isArray((current as Record<string, unknown>).items)) {
+        current = (current as Record<string, unknown>).items;
+      }
       current = (current as Record<string, unknown>)[seg];
       if (current === undefined) {
         return {

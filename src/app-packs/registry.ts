@@ -26,32 +26,53 @@ export class AppPackRegistry {
 
   async load(cliDir?: string, envDirs?: string[], includeDefaults = true): Promise<ReloadResult> {
     const result = await loadAllPacks(cliDir, envDirs, includeDefaults);
-    // Validate every loaded pack; validation failures do NOT block loading
-    // (they are reported via app_pack_validate), but schema failures already
-    // blocked loading in the loader.
-    this.validationCache = new Map();
+    // ATOMIC RELOAD: schema validation (loader) AND semantic validation
+    // (validatePack) must BOTH pass before the new config replaces the active
+    // registry. A candidate pack with ANY semantic error is excluded from the
+    // active registry (warnings are allowed). On any error the previous
+    // registry AND its validation cache are kept verbatim - a reload can
+    // never mix a new candidate into the old active set, and the validation
+    // cache always matches the ACTIVE registry.
+    const candidateValidation = new Map<string, ValidationIssue[]>();
+    const candidateIssues: LoadIssue[] = [...result.issues];
+    const candidatePacks: LoadedPack[] = [];
+    const seenIds = new Set<string>();
     for (const pack of result.packs) {
+      if (seenIds.has(pack.manifest.id)) continue; // duplicate ids already an issue
+      seenIds.add(pack.manifest.id);
       const v = validatePack(pack);
-      this.validationCache.set(pack.manifest.id, v.errors);
+      candidateValidation.set(pack.manifest.id, v.errors);
+      if (v.errors.length > 0) {
+        candidateIssues.push({
+          source: pack.source,
+          pack: pack.manifest.id,
+          code: "PACK_INVALID",
+          message: `Pack '${pack.manifest.id}' failed semantic validation (${v.errors.length} error(s)); it was not loaded.`
+        });
+        continue;
+      }
+      candidatePacks.push(pack);
     }
-    // Atomic swap: a reload with load issues (malformed packs, duplicate ids,
-    // escapes) keeps the PREVIOUS config intact and reports the issues.
-    // A clean reload replaces the whole set.
-    if (result.issues.length > 0) {
+
+    if (candidateIssues.length > 0) {
+      // Keep the OLD registry and the OLD validation cache - never a mix of
+      // the new candidate's validation results with the old active set.
       return {
         reloaded: false,
         loadedPacks: this.packs,
-        issues: result.issues,
+        issues: candidateIssues,
         validationIssues: Object.fromEntries(this.validationCache)
       };
     }
-    this.packs = result.packs;
-    this.order = result.packs.map((p) => p.manifest.id);
+    // Clean swap: registry AND validation cache are replaced together.
+    this.packs = candidatePacks;
+    this.order = candidatePacks.map((p) => p.manifest.id);
+    this.validationCache = candidateValidation;
     return {
       reloaded: true,
-      loadedPacks: result.packs,
+      loadedPacks: candidatePacks,
       issues: [],
-      validationIssues: Object.fromEntries(this.validationCache)
+      validationIssues: Object.fromEntries(candidateValidation)
     };
   }
 

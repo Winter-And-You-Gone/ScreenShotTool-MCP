@@ -582,21 +582,14 @@ async function runWorkflowTool(args: unknown, runtime: RuntimeModules, uiaDeps: 
     }
   }
 
-  // foregroundDemo: the workflow's profile_launch step must present the app
-  // in the foreground. The pipeline's interaction context is not visible to
-  // individual steps, so the resolved mode is injected into every launch
-  // step's args (constants are safe to inject server-side).
-  const steps = workflow.steps.map((s) => {
-    if (mode === "foregroundDemo" && s.tool === "profile_launch" && typeof s.args.profile === "string") {
-      return { ...s, args: { ...s.args, interactionMode: "foregroundDemo" as const } };
-    }
-    return s;
-  });
-  const workflowToRun = { ...workflow, steps };
+  // The pipeline engine injects the resolved interaction context into every
+  // interaction-aware step (profile_launch / profile_action / capture_window
+  // / launch_app / type_text / send_key), so a foregroundDemo workflow keeps
+  // its presentation across the whole run - not just the launch step.
 
   const result = await runWorkflow({
     pack,
-    workflow: workflowToRun,
+    workflow,
     inputs: input.inputs ?? {},
     profile,
     dispatch: (tool, toolArgs) => executeValidatedTool(tool, toolArgs, makeExecutor(runtime, uiaDeps)),

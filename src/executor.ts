@@ -16,7 +16,7 @@
 
 import { ErrorCode, McpError } from "@modelcontextprotocol/sdk/types.js";
 
-import { getContract } from "./contracts.js";
+import { getContract, type JsonSchema } from "./contracts.js";
 import { validateAgainstSchema, type ValidationError } from "./outputs.js";
 import { McpUiError } from "./uia/results.js";
 
@@ -28,6 +28,44 @@ export type ToolExecutorContext = {
   // Dispatch a tool with ALREADY-PARSED input.
   dispatch: (tool: string, input: unknown) => Promise<unknown>;
 };
+
+// ── Canonical array output normalization ──
+//
+// MCP requires an object-root structuredContent, so array tools (list_windows,
+// profile_list, app_pack_list, workflow_catalog, tool_contract_list) declare
+// `{ items: [...] }` in their outputSchema while their raw dispatch result is
+// the bare array. normalizeToolOutput makes the PUBLIC result shape and the
+// pipeline result shape IDENTICAL: every consumer (outputSchema validation,
+// structuredContent, pipeline ${id.path} references, exports, run snapshots,
+// plain tools/call) sees the canonical `{ items: [...] }` object.
+//
+// Backward compatibility: ${N} / ${N.path} references against a bare-array
+// step result are translated to the canonical object in the pipeline's
+// reference resolver (resolvePlaceholdersEx items-compat), so old pipelines
+// keep working.
+
+// True for the canonical array-contract shape: an object schema whose only
+// array property is "items" and whose raw value is a bare array.
+export function isCanonicalArrayContract(schema: JsonSchema | undefined): schema is JsonSchema {
+  return (
+    schema?.type === "object"
+    && schema.properties?.items?.type === "array"
+    && (schema.required ?? []).includes("items")
+  );
+}
+
+// Normalize a raw dispatch result to the canonical public result.
+//   raw array   -> { items: raw }
+//   anything else -> unchanged
+// A bare-array value whose contract is NOT the canonical array shape is left
+// untouched (its contract would reject it at validation anyway).
+export function normalizeToolOutput(toolName: string, rawValue: unknown, contract?: { outputSchema: JsonSchema }): unknown {
+  void toolName;
+  if (Array.isArray(rawValue) && contract && isCanonicalArrayContract(contract.outputSchema)) {
+    return { items: rawValue };
+  }
+  return rawValue;
+}
 
 export class ToolOutputSchemaMismatchError extends McpUiError {
   readonly tool: string;
@@ -67,9 +105,14 @@ export async function executeValidatedTool(
 
   // 2. Dispatch. Business errors propagate untouched (they are not success
   //    values and must not be forced through the success outputSchema).
-  const result = await ctx.dispatch(toolName, parsed.value);
+  const rawResult = await ctx.dispatch(toolName, parsed.value);
 
-  // 3. Output validation. A malformed SUCCESS value must never flow onward.
+  // 3. Canonical normalize: array tools return { items: [...] } everywhere
+  //    (outputSchema validation, structuredContent, pipeline references,
+  //    exports, run snapshots, plain tools/call).
+  const result = normalizeToolOutput(toolName, rawResult, contract);
+
+  // 4. Output validation. A malformed SUCCESS value must never flow onward.
   const check = validateAgainstSchema(result, contract.outputSchema);
   if (!check.ok) {
     throw new ToolOutputSchemaMismatchError(toolName, contract.schemaVersion, check.errors);

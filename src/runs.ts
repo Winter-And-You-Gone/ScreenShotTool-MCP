@@ -65,6 +65,24 @@ export type RunSnapshot = {
   // The RESOLVED interaction context of the original run. continue_run reuses
   // it verbatim (never re-derives the mode from current pack defaults).
   interaction?: StoredInteractionContext;
+  // Lifecycle bookkeeping for continue_run: which finally steps already
+  // executed in the original run (a continuation never runs cleanup twice),
+  // and the ORIGINAL run's captured state (restore replays it at the end of
+  // the continuation and re-verifies). Captured password values are never
+  // stored (protected entries carry an empty placeholder state).
+  finallyRan?: string[];
+  capturedState?: Array<{
+    key: string;
+    stepId?: string;
+    state: unknown;
+    kind?: string;
+    captureFailed?: boolean;
+    protected: boolean;
+    readTool: string;
+    readArgs: Record<string, unknown>;
+    stepTool?: string;
+    stepArgs?: Record<string, unknown>;
+  }>;
   // Continuability: false when the snapshot had to be truncated beyond what
   // can honestly be resumed.
   continuable: boolean;

@@ -24,8 +24,29 @@
 // The core knows NO specific application: packs declare their defaults
 // (profile.json interaction / actions.json backgroundPolicy) as data.
 
+// ── Interaction-context injection into pipeline steps ──
+//
+// High-level entries (run_workflow / profile_run_steps / run_steps) resolve a
+// SINGLE interaction context for the whole pipeline. Individual steps must
+// inherit that resolved context instead of re-deriving a mode from pack
+// defaults (e.g. a foregroundDemo workflow whose profile_action steps would
+// otherwise fall back to the pack's background default).
+//
+// Injection priority per step:
+//   1. the step's OWN explicit interactionMode / foregroundDemo args (never
+//      overridden),
+//   2. the pipeline's resolved interaction context (passed by the caller),
+//   3. the tool's own resolution (pack default / auto) at dispatch time.
+//
+// Injected args are constants (the tool zod schemas accept them), so steps
+// keep working exactly like direct tools/call calls. ${...} placeholders are
+// resolved against the pipeline context after injection.
+
 import type { PackActions } from "./app-packs/types.js";
 import { McpUiError } from "./uia/results.js";
+import { validateReferences } from "./piping.js";
+
+export { validateReferences };
 
 export const INTERACTION_MODES = ["auto", "background", "foregroundDemo"] as const;
 export type InteractionMode = (typeof INTERACTION_MODES)[number];
@@ -286,8 +307,57 @@ export function aggregateInteractions(
   return { foregroundChangedDuringRun, targetActivated, physicalCursorMoved };
 }
 
-// ── Stored interaction context (continue_run inheritance) ──
+// The subset of tools whose args accept interactionMode + foregroundDemo, and
+// must therefore receive the pipeline's resolved interaction context. Only
+// tools with real interaction semantics are listed - never invented support.
+// ui_action is deliberately absent: it has no interaction params in its
+// schema; its background constraints are enforced by the pipeline preflight.
+const INTERACTION_AWARE_TOOLS = new Set([
+  "profile_launch",
+  "profile_action",
+  "capture_window",
+  "launch_app",
+  "type_text",
+  "send_key"
+]);
 
+export type InteractionAwareStep = { tool: string; args?: Record<string, unknown> };
+
+// Build a step copy with the pipeline's resolved interaction context injected
+// into its args (for interaction-aware tools). The step's OWN explicit values
+// always win; nothing is injected into other tools. The step's remaining
+// fields (id, expect, retry, captureBefore, ...) pass through untouched.
+export function prepareStepForInteraction<T extends InteractionAwareStep>(
+  step: T,
+  interaction: StoredInteractionContext
+): T {
+  if (!INTERACTION_AWARE_TOOLS.has(step.tool)) return step;
+  const args = { ...(step.args ?? {}) };
+  // 1. Step-explicit mode wins (never overridden).
+  const hasExplicitMode = args.interactionMode !== undefined;
+  // 2. Pipeline-resolved mode (stored: requestedMode === effectiveMode).
+  const pipelineMode: InteractionMode = interaction.requestedMode ?? "auto";
+  const mode = hasExplicitMode ? (args.interactionMode as InteractionMode) : pipelineMode;
+
+  if (!hasExplicitMode && mode !== "auto") {
+    args.interactionMode = mode;
+  }
+  // foregroundDemo options: inherit the pipeline's options unless the step
+  // declares its own.
+  if (mode === "foregroundDemo") {
+    const demo = interaction.foregroundDemo;
+    const hasExplicitDemo = args.foregroundDemo !== undefined;
+    if (demo && !hasExplicitDemo) {
+      args.foregroundDemo = {
+        ...(demo.restorePreviousForeground !== undefined ? { restorePreviousForeground: demo.restorePreviousForeground } : {}),
+        ...(demo.stepDelayMs !== undefined ? { stepDelayMs: demo.stepDelayMs } : {})
+      };
+    }
+  }
+  return { ...step, args } as T;
+}
+
+// ── Stored interaction context (continue_run inheritance) ──
 // The RESOLVED interaction context of a run, saved in its snapshot so
 // continue_run reuses it verbatim instead of re-deriving the mode from the
 // CURRENT pack defaults (which may have changed since the original run).

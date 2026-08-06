@@ -68,12 +68,16 @@ test("invalid output raises TOOL_OUTPUT_SCHEMA_MISMATCH with structured errors",
 });
 
 test("array tools validate against the object-root {items} schema", async () => {
-  // list_windows declares { items: [...] } publicly but returns a bare array.
+  // list_windows declares { items: [...] } publicly; the unified executor
+  // normalizes the raw array to the canonical { items: [...] } object so
+  // plain calls, structuredContent, pipeline references and exports all see
+  // the SAME shape (old ${0.0.hwnd} references stay compatible via the
+  // reference resolver's items-compat).
   const ctx = makeCtx({
     dispatch: async () => [{ hwnd: "1", title: "a", pid: 1, processName: "p", className: "c", rect: { x: 0, y: 0, width: 1, height: 1 } }]
   });
   const result = await executeValidatedTool("list_windows", {}, ctx);
-  assert.ok(Array.isArray(result), "raw array result is preserved for ${N.path} references");
+  assert.deepEqual(result, { items: [{ hwnd: "1", title: "a", pid: 1, processName: "p", className: "c", rect: { x: 0, y: 0, width: 1, height: 1 } }] }, "the canonical {items} object is returned");
 
   const bad = makeCtx({ dispatch: async () => [{ hwnd: 42 }] }); // missing fields + wrong type
   await assert.rejects(

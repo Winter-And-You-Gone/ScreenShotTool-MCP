@@ -24,6 +24,7 @@ import {
   interactionOf,
   pipelineInteractionReport,
   pipelineNotBackgroundSafeError,
+  prepareStepForInteraction,
   type InteractionMode,
   type InteractionOptions,
   type InteractionReport,
@@ -122,6 +123,10 @@ export type StepExecutionResult = {
   error?: { code?: string; message: string; details?: unknown };
   expectResult?: ExpectResult | null;
   stateSettled?: boolean;
+  // True when the step was skipped because the pipeline deadline was
+  // exceeded (never attempted). Skipped finally steps stay executable: a
+  // continuation re-attempts them with its fresh deadline.
+  skipped?: boolean;
 };
 
 export type PipelineResult = {
@@ -1001,6 +1006,10 @@ export type RestoreResult = {
   actual?: unknown;
   message?: string;
   valueCaptured?: boolean;
+  // True when the entry was skipped because the pipeline deadline was
+  // exceeded (never attempted). Skipped entries stay restorable: a
+  // continuation re-attempts them with its fresh deadline.
+  skipped?: boolean;
   // Interaction report of the restore action (for pipeline-level
   // aggregation).
   interaction?: unknown;
@@ -1013,15 +1022,17 @@ async function runRestore(
   ctx: ExecutionContext,
   byId: Map<string, unknown>,
   byIndex: unknown[],
-  deadline: number
+  deadline: number,
+  skipKeys?: Set<string>
 ): Promise<RestoreResult[]> {
   const mode = input.restore ?? "never";
   if (mode === "never" || (mode === "onFailure" && success)) return [];
   const results: RestoreResult[] = [];
   for (const entry of captured.values()) {
     const entryKind = entry.state?.kind ?? entry.kind ?? "unknown";
+    if (skipKeys?.has(entry.key)) continue;
     if (Date.now() > deadline) {
-      results.push({ key: entry.key, stepId: entry.stepId, kind: entryKind, attempted: false, success: false, verified: false, message: "Restore skipped: pipeline time budget exceeded.", valueCaptured: !entry.protected });
+      results.push({ key: entry.key, stepId: entry.stepId, kind: entryKind, attempted: false, success: false, verified: false, skipped: true, message: "Restore skipped: pipeline time budget exceeded.", valueCaptured: !entry.protected });
       continue;
     }
     if (entry.captureFailed || entry.state === null) {
@@ -1176,15 +1187,26 @@ export async function runPipeline(input: PipelineInput, ctx: ExecutionContext): 
   const captured = new Map<string, CapturedValue>();
   const completedIds: string[] = [];
 
+  // The pipeline's resolved interaction context, injected into every
+  // interaction-aware step (profile_launch / profile_action / capture_window /
+  // launch_app / type_text / send_key / ui_action) BEFORE the step executes.
+  // A step's own explicit interactionMode/foregroundDemo args always win;
+  // everything else inherits the pipeline context, so a foregroundDemo run
+  // never falls back to the pack's background default mid-pipeline.
+  const storedInteraction = storedInteractionContext(ctx);
+  const steps = input.steps.map((s) => prepareStepForInteraction(s, storedInteraction));
+  const finallySteps = (input.finally ?? []).map((s) => prepareStepForInteraction(s, storedInteraction));
+  const effectiveInput: PipelineInput = { ...input, steps, finally: finallySteps };
+
   // Pipeline-level foreground snapshot: prefer the pre-launch value captured
   // by the outer profile_launch (profile_run_steps), else read the real
   // foreground NOW, before any step runs.
   const foregroundBefore = ctx.interaction?.foregroundBefore ?? await readPipelineForeground(ctx);
 
   // Structural pre-check before any step runs.
-  const refCheck = validateReferences(input.steps.map((s) => ({ id: s.id, tool: s.tool, args: s.args ?? {} })), { pack: ctx.pack ? { id: ctx.pack.id } : undefined, inputs: ctx.inputs });
+  const refCheck = validateReferences(effectiveInput.steps.map((s) => ({ id: s.id, tool: s.tool, args: s.args ?? {} })), { pack: ctx.pack ? { id: ctx.pack.id } : undefined, inputs: ctx.inputs });
   if (!refCheck.ok) {
-    return pipelineFailure(runId, input, stepResults, exports, 0, undefined, { code: "INVALID_REFERENCES", message: refCheck.message }, [], warnings, undefined);
+    return pipelineFailure(runId, effectiveInput, stepResults, exports, 0, undefined, { code: "INVALID_REFERENCES", message: refCheck.message }, [], warnings, undefined);
   }
 
   // Background preflight: a pipeline that contains foregroundRequired steps
@@ -1192,15 +1214,15 @@ export async function runPipeline(input: PipelineInput, ctx: ExecutionContext): 
   // mid-run foreground steal. Covers BOTH the main steps and the finally
   // steps. bestEffort steps are allowed and surface their own failures.
   const backgroundPreflight = backgroundUnsafePipelineSteps(
-    input.steps,
-    input.finally ?? [],
+    effectiveInput.steps,
+    effectiveInput.finally ?? [],
     (profileId) => ctx.resolvePackActions?.(profileId),
     ctx.pack?.actions
   );
   if (ctx.interactionMode === "background" && backgroundPreflight.length > 0) {
     const err = pipelineNotBackgroundSafeError("background", backgroundPreflight);
     return pipelineFailure(
-      runId, input, stepResults, exports, 0, undefined,
+      runId, effectiveInput, stepResults, exports, 0, undefined,
       { code: "PIPELINE_NOT_BACKGROUND_SAFE", message: err.message, details: err.details },
       [], warnings, undefined,
       pipelineInteractionReport("background", {
@@ -1216,7 +1238,7 @@ export async function runPipeline(input: PipelineInput, ctx: ExecutionContext): 
 
   // Pipeline-level captureBefore: read values before the main steps. Failed
   // captures are recorded too (restore reports RESTORE_STATE_UNAVAILABLE).
-  for (const entry of input.captureBefore ?? []) {
+  for (const entry of effectiveInput.captureBefore ?? []) {
     const capturedValue = await captureValue(entry, ctx, byId, byIndex);
     captured.set(entry.saveAs, capturedValue ?? { key: entry.saveAs, state: null, kind: "value", captureFailed: true, protected: false, readTool: "ui_get", readArgs: {} });
   }
@@ -1228,13 +1250,13 @@ export async function runPipeline(input: PipelineInput, ctx: ExecutionContext): 
     inputs: ctx.inputs
   };
 
-  for (let i = 0; i < input.steps.length; i++) {
+  for (let i = 0; i < effectiveInput.steps.length; i++) {
     if (Date.now() > deadline) {
       stoppedAtIndex = i;
       stopError = { code: "PIPELINE_TIMEOUT", message: `Pipeline exceeded the total time budget of ${maxTotalMs}ms at step ${i}.` };
       break;
     }
-    const step = input.steps[i]!;
+    const step = effectiveInput.steps[i]!;
 
     // Step-level captureBefore: read the control's state before acting.
     // Failed captures are recorded too (RESTORE_STATE_UNAVAILABLE).
@@ -1291,8 +1313,9 @@ export async function runPipeline(input: PipelineInput, ctx: ExecutionContext): 
   }
 
   const success = stoppedAtIndex === null;
-  const restoreResults = await runRestore(input, success, captured, ctx, byId, byIndex, deadline);
-  const finallyResults = await runFinally(input, ctx, pipeCtx, exports, deadline, warnings);
+  const restoreResults = await runRestore(effectiveInput, success, captured, ctx, byId, byIndex, deadline);
+  const ranFinallyIds: string[] = [];
+  const finallyResults = await runFinally(effectiveInput, ctx, pipeCtx, exports, deadline, warnings, undefined, ranFinallyIds);
 
   // Pipeline-level interaction report: re-read the real foreground AFTER
   // steps + restore + finally all finished, and aggregate what the steps
@@ -1305,12 +1328,12 @@ export async function runPipeline(input: PipelineInput, ctx: ExecutionContext): 
   // fields later steps reference + pipe-safe fields + that step's exports
   // (pipeProjection). Oversized snapshots are marked not-continuable, never
   // silently presented as resumable.
-  const futureRefs = collectFutureReferences(input);
+  const futureRefs = collectFutureReferences(effectiveInput);
   const stepSnapshots: StepSnapshot[] = [];
-  for (let i = 0; i < input.steps.length; i++) {
+  for (let i = 0; i < effectiveInput.steps.length; i++) {
     const exec = stepResults[i];
     if (!exec) break; // steps after the stop point never ran
-    const step = input.steps[i]!;
+    const step = effectiveInput.steps[i]!;
     const contract = getContract(step.tool);
     stepSnapshots.push({
       id: step.id,
@@ -1329,7 +1352,7 @@ export async function runPipeline(input: PipelineInput, ctx: ExecutionContext): 
     kind: "run_steps",
     createdAtMs: Date.now(),
     expiresAtMs: Date.now() + 10 * 60 * 1000,
-    input: input as unknown,
+    input: effectiveInput as unknown,
     packId: ctx.pack?.id,
     packVersion: ctx.pack?.version,
     pid: ctx.autoContext?.pid,
@@ -1338,14 +1361,32 @@ export async function runPipeline(input: PipelineInput, ctx: ExecutionContext): 
     profile: ctx.autoContext?.profile,
     steps: stepSnapshots,
     exports,
-    stoppedAtStep: stoppedAtIndex ?? input.steps.length,
+    stoppedAtStep: stoppedAtIndex ?? effectiveInput.steps.length,
     error: stopError,
     inputs: ctx.inputs,
-    maxSteps: input.steps.length,
+    maxSteps: effectiveInput.steps.length,
     totalTimeoutMs: maxTotalMs,
     // Save the RESOLVED interaction context so continue_run reuses it instead
     // of re-deriving the mode from current pack defaults.
-    interaction: storedInteractionContext(ctx),
+    interaction: storedInteraction,
+    // Cleanup lifecycle bookkeeping for continue_run: which finally steps /
+    // restore keys already executed in the original run. A continuation never
+    // runs cleanup twice (already-done finally steps are reported as
+    // alreadyRan). The ORIGINAL captured state is stored so the continuation
+    // can replay the restore with the same snapshot and re-verify.
+    finallyRan: ranFinallyIds,
+    capturedState: [...captured.values()].map((c) => ({
+      key: c.key,
+      ...(c.stepId ? { stepId: c.stepId } : {}),
+      state: c.state,
+      ...(c.kind ? { kind: c.kind } : {}),
+      ...(c.captureFailed ? { captureFailed: true } : {}),
+      protected: c.protected,
+      readTool: c.readTool,
+      readArgs: c.readArgs,
+      ...(c.stepTool ? { stepTool: c.stepTool } : {}),
+      ...(c.stepArgs ? { stepArgs: c.stepArgs } : {})
+    })),
     continuable: false,
     continuationReason: null
   };
@@ -1356,10 +1397,10 @@ export async function runPipeline(input: PipelineInput, ctx: ExecutionContext): 
     success,
     runId,
     status: success ? "completed" : "failed",
-    total: input.steps.length,
-    completed: success ? input.steps.length : (stoppedAtIndex ?? input.steps.length),
+    total: effectiveInput.steps.length,
+    completed: success ? effectiveInput.steps.length : (stoppedAtIndex ?? effectiveInput.steps.length),
     stoppedAtIndex,
-    ...(stoppedAtIndex !== null && input.steps[stoppedAtIndex] !== undefined && input.steps[stoppedAtIndex]!.id ? { stoppedAt: input.steps[stoppedAtIndex]!.id } : {}),
+    ...(stoppedAtIndex !== null && effectiveInput.steps[stoppedAtIndex] !== undefined && effectiveInput.steps[stoppedAtIndex]!.id ? { stoppedAt: effectiveInput.steps[stoppedAtIndex]!.id } : {}),
     completedSteps: completedIds,
     steps: stepResults,
     exports,
@@ -1823,12 +1864,21 @@ async function runFinally(
   pipeCtx: PipeContext,
   exports: Record<string, unknown>,
   deadline: number,
-  warnings: string[]
+  warnings: string[],
+  alreadyRan?: string[],
+  ranIds: string[] = []
 ): Promise<StepExecutionResult[]> {
   const results: StepExecutionResult[] = [];
   for (const step of input.finally ?? []) {
+    // Lifecycle dedup: a finally step that ALREADY completed in the original
+    // run is never re-executed by a continuation (its result is preserved).
+    const stepKey = step.id ?? `${step.tool}:${JSON.stringify(step.args ?? {})}`;
+    if (alreadyRan?.includes(stepKey)) {
+      results.push({ tool: step.tool, success: true, result: { skipped: true, alreadyRan: true }, skipped: true });
+      continue;
+    }
     if (Date.now() > deadline) {
-      results.push({ tool: step.tool, success: false, error: { code: "PIPELINE_TIMEOUT", message: "Finally skipped: pipeline time budget exceeded." } });
+      results.push({ tool: step.tool, success: false, error: { code: "PIPELINE_TIMEOUT", message: "Finally skipped: pipeline time budget exceeded." }, skipped: true });
       continue;
     }
     const resolution = resolvePlaceholdersEx(step.args ?? {}, pipeCtx);
@@ -1840,12 +1890,14 @@ async function runFinally(
       // Output validation happens once in the unified executor, same as for
       // main steps.
       const result = await ctx.dispatch(step.tool, resolution.value);
+      ranIds.push(stepKey);
       results.push({ tool: step.tool, success: true, result });
     } catch (error) {
       const normalized = normalizeStepError(error);
       const ignoreCodes = step.ignoreCodes ?? [];
       if (normalized.code && ignoreCodes.includes(normalized.code)) {
         warnings.push(`Finally step '${step.id ?? ""}' ignored error ${normalized.code} (ignoreCodes).`);
+        ranIds.push(stepKey);
         results.push({ tool: step.tool, success: true, result: { skipped: true, ignoredCode: normalized.code } });
       } else {
         results.push({ tool: step.tool, success: false, error: normalized });
@@ -1975,6 +2027,15 @@ export async function continuePipeline(opts: ContinueOptions): Promise<PipelineR
     return fail(runId, "RUN_STATE_STALE", `Continuation index ${fromIndex} is out of range (0..${input.steps.length - 1}).`);
   }
 
+  // ── Unified continuation lifecycle ──
+  //
+  // The continuation is ONE run with ONE time budget, computed ONCE here:
+  // main steps, expect, retry, restore, finally and foregroundDemo step
+  // delays all share this single deadline. No step re-computes
+  // Date.now() + totalTimeoutMs.
+  const continuationBudgetMs = snapshot.totalTimeoutMs ?? DEFAULT_MAX_TOTAL_MS;
+  const deadline = Date.now() + continuationBudgetMs;
+
   // Background preflight on the REMAINING main steps AND the finally steps
   // (same rule as runPipeline, using the stored interaction mode): a
   // background continuation never resumes into a foregroundRequired step.
@@ -2001,6 +2062,13 @@ export async function continuePipeline(opts: ContinueOptions): Promise<PipelineR
   const foregroundBefore = opts.ctx.interaction?.foregroundBefore ?? await readPipelineForeground(opts.ctx);
   const warnings: string[] = [];
 
+  // The continuation inherits the RESOLVED interaction context of the
+  // original run; every interaction-aware remaining step is re-prepared with
+  // it (same rule as runPipeline).
+  const storedInteraction = storedInteractionContext(opts.ctx);
+  const remainingSteps = input.steps.slice(fromIndex).map((s) => prepareStepForInteraction(s, storedInteraction));
+  const finallySteps = (input.finally ?? []).map((s) => prepareStepForInteraction(s, storedInteraction));
+
   // Re-execute from the continuation point, reusing stored results for the
   // completed prefix. The stored results act as the pipe context, so steps
   // before fromIndex are NOT re-run.
@@ -2019,7 +2087,10 @@ export async function continuePipeline(opts: ContinueOptions): Promise<PipelineR
 
   const stepResults: StepExecutionResult[] = [];
   const exports = { ...snapshot.exports };
-  const stepExportValues: Array<Record<string, unknown>> = [];
+  // Per-step exported values keyed by GLOBAL step index (the continuation
+  // segment starts at fromIndex, so a 0-based array would misalign the
+  // snapshot exports for later continues).
+  const stepExportsByIndex: Record<number, Record<string, unknown>> = {};
   let stoppedAtIndex: number | null = null;
   let stopError: { code?: string; message: string; details?: unknown } | undefined;
 
@@ -2030,9 +2101,49 @@ export async function continuePipeline(opts: ContinueOptions): Promise<PipelineR
     inputs: snapshot.inputs
   };
 
+  // Captured state for restore: the ORIGINAL run's captures are replayed
+  // verbatim from the snapshot (never re-read - the pre-action state no
+  // longer exists). Step-level captures of the CONTINUED steps are added as
+  // they run.
+  const captured = new Map<string, CapturedValue>();
+  for (const c of snapshot.capturedState ?? []) {
+    captured.set(c.key, {
+      key: c.key,
+      ...(c.stepId ? { stepId: c.stepId } : {}),
+      state: c.state as CapturedState | null,
+      ...(c.kind ? { kind: c.kind as CapturedState["kind"] } : {}),
+      ...(c.captureFailed ? { captureFailed: true } : {}),
+      protected: c.protected,
+      readTool: c.readTool,
+      readArgs: c.readArgs,
+      ...(c.stepTool ? { stepTool: c.stepTool } : {}),
+      ...(c.stepArgs ? { stepArgs: c.stepArgs as Record<string, unknown> } : {})
+    });
+  }
+
   for (let i = fromIndex; i < input.steps.length; i++) {
-    const step = input.steps[i]!;
-    const exec = await executeStep(step, i, opts.ctx, pipeCtx, Date.now() + (snapshot.totalTimeoutMs ?? DEFAULT_MAX_TOTAL_MS), new Map(), warnings);
+    const step = remainingSteps[i - fromIndex]!;
+    if (Date.now() > deadline) {
+      stoppedAtIndex = i;
+      stopError = { code: "PIPELINE_TIMEOUT", message: `Pipeline exceeded the total time budget of ${continuationBudgetMs}ms at step ${i} (continued run).` };
+      break;
+    }
+    // Step-level captureBefore on continued steps (same rule as runPipeline).
+    if (step.captureBefore?.saveAs) {
+      const capturedValue = await captureValue(step.captureBefore, opts.ctx, byId, results, step);
+      if (capturedValue) {
+        captured.set(step.captureBefore.saveAs, capturedValue);
+      } else {
+        const intendedKind = captureKindForAction(step.args?.action as string | undefined);
+        captured.set(step.captureBefore.saveAs, {
+          key: step.captureBefore.saveAs, stepId: step.id,
+          kind: intendedKind === "auto" ? undefined : intendedKind,
+          state: null, captureFailed: true, protected: false, readTool: "ui_get", readArgs: {},
+          stepTool: step.tool, stepArgs: step.args as Record<string, unknown>
+        });
+      }
+    }
+    const exec = await executeStep(step, i, opts.ctx, pipeCtx, deadline, captured, warnings);
     stepResults.push(exec);
     if (exec.success) {
       results.push(exec.result);
@@ -2040,13 +2151,14 @@ export async function continuePipeline(opts: ContinueOptions): Promise<PipelineR
         byId.set(step.id, exec.result);
         completedIds.push(step.id);
       }
-      // foregroundDemo: keep the demo pacing on the continued steps too.
+      // foregroundDemo: keep the demo pacing on the continued steps too, under
+      // the SAME deadline.
       const stepDelayMs = opts.ctx.interactionMode === "foregroundDemo" ? (opts.ctx.interaction?.stepDelayMs ?? 0) : 0;
-      if (stepDelayMs > 0) {
+      if (stepDelayMs > 0 && Date.now() + stepDelayMs <= deadline) {
         await sleep(stepDelayMs);
       }
       const exportOutcome = applyExports(step, exec.result!, exports);
-      stepExportValues.push(exportOutcome.values);
+      stepExportsByIndex[i] = exportOutcome.values;
       if (exportOutcome.errors.length > 0) {
         stoppedAtIndex = i;
         stopError = exportOutcome.errors[0]!;
@@ -2058,6 +2170,37 @@ export async function continuePipeline(opts: ContinueOptions): Promise<PipelineR
       break;
     }
   }
+
+  // Restore phase: replay the ORIGINAL captured state (plus continuation
+  // captures) and re-verify - never silently skipped. When the snapshot
+  // carries no captured state but the input declares captures, the restore
+  // reports RESTORE_STATE_UNAVAILABLE instead of pretending success.
+  const success = stoppedAtIndex === null;
+  let restoreResults: RestoreResult[] = [];
+  if (restoreRequired(input.restore, success) && declaredCaptureKeys(input).length > 0) {
+    if (captured.size === 0) {
+      // The snapshot has no captured state at all (legacy run): the original
+      // state cannot be restored - report honestly per declared capture.
+      restoreResults = declaredCaptureKeys(input).map((key) => ({
+        key,
+        kind: "unknown",
+        attempted: false,
+        success: false,
+        verified: false,
+        code: "RESTORE_STATE_UNAVAILABLE",
+        message: "The original state was not saved in the run snapshot; no restore was attempted (RESTORE_STATE_UNAVAILABLE).",
+        valueCaptured: false
+      }));
+    } else {
+      restoreResults = await runRestore(input, success, captured, opts.ctx, byId, results, deadline);
+    }
+  }
+
+  // Finally phase: runs on continuation success AND failure. Steps that
+  // already completed in the original run are reported as alreadyRan (never
+  // executed twice); steps the original run never reached run once here.
+  const ranFinallyIds: string[] = [...(snapshot.finallyRan ?? [])];
+  const finallyResults = await runFinally(input, opts.ctx, pipeCtx, exports, deadline, warnings, snapshot.finallyRan, ranFinallyIds);
 
   // Save the updated snapshot (with a fresh TTL) so the run can be continued
   // again. Completed prefix steps keep their original projections; newly
@@ -2081,7 +2224,7 @@ export async function continuePipeline(opts: ContinueOptions): Promise<PipelineR
       pipeProjection: exec.success && contract
         ? buildPipeProjection(i, step.id, exec.result, futureRefs, step.exports ?? {}, contract)
         : null,
-      exports: stepExportValues[i] ?? {},
+      exports: stepExportsByIndex[i] ?? {},
       success: exec.success,
       error: exec.error
     });
@@ -2094,21 +2237,33 @@ export async function continuePipeline(opts: ContinueOptions): Promise<PipelineR
     exports,
     stoppedAtStep: stoppedAtIndex ?? input.steps.length,
     error: stopError,
+    finallyRan: ranFinallyIds,
+    capturedState: [...captured.values()].map((c) => ({
+      key: c.key,
+      ...(c.stepId ? { stepId: c.stepId } : {}),
+      state: c.state,
+      ...(c.kind ? { kind: c.kind } : {}),
+      ...(c.captureFailed ? { captureFailed: true } : {}),
+      protected: c.protected,
+      readTool: c.readTool,
+      readArgs: c.readArgs,
+      ...(c.stepTool ? { stepTool: c.stepTool } : {}),
+      ...(c.stepArgs ? { stepArgs: c.stepArgs } : {})
+    })),
     continuable: false,
     continuationReason: null
   };
   const saved = saveRun(fresh);
 
-  const success = stoppedAtIndex === null;
-
   // Pipeline-level interaction report for the continuation segment: re-read
   // the real foreground at the end, aggregate the continued steps AND the
-  // completed prefix projections (which carry their interaction reports).
+  // completed prefix projections (which carry their interaction reports),
+  // plus the restore + finally interactions of this continuation.
   const interaction = await finalizePipelineInteraction(
     opts.ctx,
     stepResults,
-    [],
-    [],
+    finallyResults,
+    restoreResults,
     foregroundBefore,
     warnings
   );
@@ -2137,13 +2292,31 @@ export async function continuePipeline(opts: ContinueOptions): Promise<PipelineR
     steps: stepResults,
     exports,
     ...(stopError ? { error: stopError } : {}),
-    finallyResults: [],
-    restoreResults: [],
+    finallyResults,
+    restoreResults,
     warnings,
     ...(interaction ? { interaction } : {}),
     continuable: saved.continuable,
     continuationReason: saved.continuationReason
   };
+}
+
+// Whether the pipeline's restore mode requires restoring on this outcome.
+function restoreRequired(mode: PipelineInput["restore"], success: boolean): boolean {
+  return mode === "always" || (mode === "onFailure" && !success);
+}
+
+// Every capture key declared by the pipeline (pipeline-level + step-level).
+function declaredCaptureKeys(input: PipelineInput): string[] {
+  const keys: string[] = [];
+  for (const c of input.captureBefore ?? []) keys.push(c.saveAs);
+  for (const s of input.steps) {
+    if (s.captureBefore?.saveAs) keys.push(s.captureBefore.saveAs);
+  }
+  for (const f of input.finally ?? []) {
+    if (f.captureBefore?.saveAs) keys.push(f.captureBefore.saveAs);
+  }
+  return keys;
 }
 
 function fail(

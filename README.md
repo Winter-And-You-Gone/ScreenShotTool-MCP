@@ -164,7 +164,7 @@ $env:SCREENSHOT_MCP_APP_PACK_DIRS = "X:\Private\AppPacks;D:\Team\AppPacks"
 - 同名 Pack 报 `PACK_ID_CONFLICT`，不静默覆盖。
 - 引用文件必须位于 Pack 根目录内；`../` 与符号链接逃逸被拒绝（`PATH_ESCAPE`）。
 - Pack 只包含 JSON，**不执行任何代码**。
-- `app_pack_reload` 原子重载：新配置校验失败时保留旧配置；正在运行的管道继续使用启动时快照。
+- `app_pack_reload` 原子重载：新配置校验失败时保留旧配置；正在运行的管道继续使用启动时快照。**语义校验也是原子的**：候选 Pack 存在任何 error（未知工具/不存在的 control/未知动作/错误 workflow 引用/无效输出路径/不安全 retry/重复 ID/目录逃逸/Schema 错误）时整体 `reloaded=false`，旧 Registry 与旧 validation cache 原样保留——`app_pack_list` / `app_pack_describe` / `app_pack_validate` / `workflow_catalog` / `run_workflow` / `profile_launch` / `profile_action` 始终看到同一活动版本；warning 允许加载。
 
 ## 验证 Pack
 
@@ -361,6 +361,14 @@ restorePreviousForeground / stepDelayMs / allowForegroundFallback），不根据
 
 续接前检查：run 未过期（内存保留 10 分钟，最多 20 个）→ Pack 版本未变（`RUN_PACK_VERSION_CHANGED`）→ 进程仍存在（`RUN_PROCESS_EXITED`）→ HWND 仍有效（`RUN_WINDOW_RECREATED`）→ 快照可续接（`RUN_NOT_CONTINUABLE`）。续接从失败步骤重放，已完成步骤的**最小投影**（后续步骤引用的字段 + pipe-safe 字段 + exports）复用，不重复执行、不保存完整原始结果。超大的快照（含被引用的巨型字段）如实标记 `continuable:false` + `continuationReason:"RUN_SNAPSHOT_TRUNCATED"`，绝不伪装成可恢复。
 
+### 续跑的统一生命周期
+
+续跑是一条**单一 run**：开始计算一次总截止时间（沿用原 `maxTotalMs`），剩余主步骤、expect、retry、restore、finally 与 foregroundDemo 的 `stepDelayMs` 全部共享该 deadline——**不允许每个步骤重新获得完整预算**。续跑结束时：
+
+- **restore**：用 RunSnapshot 中保存的**原运行捕获状态**重放恢复动作并重新验证 UI；快照没有可用状态时如实返回 `RESTORE_STATE_UNAVAILABLE`，绝不静默跳过并谎报 cleanup 成功。已由原运行执行的 finally/restore 不会重复执行：RunSnapshot 记录 `finallyRan`（finally 步骤 key）与 `capturedState`（原捕获值），续跑只执行原运行未到达的 finally 步骤、只重放并验证 restore。
+- **finally**：续跑成功**或**失败都执行一次；原失败运行在进入 finally 前停止时，由续跑执行；原运行已执行完成的 finally 步骤报告为 `alreadyRan`，不重复执行。
+- 续跑段 exports 按**全局步骤索引**记录（不是从 0 开始的段内索引），多次续接不会错位。
+
 ## 输出 Schema 与 structuredContent
 
 每个工具在 `src/contracts.ts` 有统一 `ToolContract`：`description`、`inputSchema`、`outputSchema`、`pipeSafeFields`、`annotations`（readOnly / destructive / idempotent / retrySafe / needsExpect）。
@@ -369,6 +377,7 @@ restorePreviousForeground / stepDelayMs / allowForegroundFallback），不根据
 
 - 工具成功结果同时返回 `content`（JSON 文本，保持兼容）与 `structuredContent`（机器可读对象）。
 - 管道中每个步骤的结果都会用该工具的 `outputSchema` 做运行时校验，不符合返回 `TOOL_OUTPUT_SCHEMA_MISMATCH`，**无效结果不会流入后续步骤**。
+- **数组工具的 canonical 输出**：`list_windows` / `profile_list` / `app_pack_list` / `workflow_catalog` / `tool_contract_list` 等数组型工具在普通调用、structuredContent、管道步骤结果、exports 与 run snapshot 中**统一返回 `{ items: [...] }`**，与 `tools/list` 的 outputSchema 完全一致：`${step.items.0.hwnd}` 可静态验证并运行。旧的 `${0.0.hwnd}` 裸数组引用保持兼容（引用解析器自动把顶层数字段映射到 `items.N`）。
 
 ## 安全限制
 
