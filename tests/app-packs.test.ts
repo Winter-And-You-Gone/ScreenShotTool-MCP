@@ -431,13 +431,13 @@ test("non-regex title matching stays case-insensitive (plain string normalizatio
   const dir = await makeTempDir();
   await writePack(dir, "regex-app", {
     "manifest.json": REGEX_PACK_MANIFEST,
-    "profile.json": { ...REGEX_PACK_PROFILE, mainWindow: { title: "VaporView", titleMatch: "contains" } }
+    "profile.json": { ...REGEX_PACK_PROFILE, mainWindow: { title: "SampleApp", titleMatch: "contains" } }
   });
   const reg = new AppPackRegistry();
   await reg.load(dir, [], false);
   // Plain contains matching normalizes both sides and is case-insensitive.
-  assert.ok(reg.findPackForTarget({ titleContains: "vaporview" }), "lowercase target matches mixed-case plain title");
-  assert.ok(reg.findPackForTarget({ titleContains: "VAPORVIEW" }), "uppercase target matches mixed-case plain title");
+  assert.ok(reg.findPackForTarget({ titleContains: "sampleapp" }), "lowercase target matches mixed-case plain title");
+  assert.ok(reg.findPackForTarget({ titleContains: "SAMPLEAPP" }), "uppercase target matches mixed-case plain title");
 });
 
 test("an invalid regex never crashes title matching; the pack simply does not match by title", async () => {
