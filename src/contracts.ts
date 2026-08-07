@@ -341,7 +341,8 @@ const captureWindowOutput = withToolError(obj(
     target: str(),
     rect: any(),
     timestamp: str(),
-    interaction: interactionShape
+    interaction: interactionShape,
+    geometry: any()
   },
   ["path", "width", "height", "target", "rect", "timestamp", "interaction"]
 ));
@@ -1021,7 +1022,7 @@ export const contracts: Record<string, ToolContract> = {
   },
   capture_window: {
     name: "capture_window",
-    description: "Captures the visual contents of a target window as an image file. Use when the task requires visual content, layout inspection, rendering verification, or an image artifact - including when the user explicitly asks for a screenshot. 'print' mode uses PrintWindow (works occluded/minimized, misses separate popup/tooltip windows); 'screen' mode copies the visible screen. Capture latency depends on the target application, rendering backend, window state, and capture method; PrintWindow may require the target window to process a synchronous WM_PRINT/WM_PRINTCLIENT request. interactionMode=background forces the non-activating PrintWindow path and reports interaction metadata; capture never auto-upgrades to foreground (BACKGROUND_CAPTURE_UNAVAILABLE instead). OMIT outputPath unless the user specified a target file - the server writes to its default writable outputs/ directory and returns the path (never invent a path like X:\\...). Returns: path,width,height,target,rect,timestamp,interaction. Pipe-safe: path, interaction.",
+    description: "Captures the visual contents of a target window as an image file. Use when the task requires visual content, layout inspection, rendering verification, or an image artifact - including when the user explicitly asks for a screenshot. Use the targetRef as the authoritative target session: do NOT call list_windows merely because a capture backend fails or returns CAPTURE_GEOMETRY_MISMATCH - retry against the same targetRef with an appropriate capture method (e.g. captureMethod='screen' when visible-screen capture is acceptable). 'print' mode uses PrintWindow (works occluded/minimized, misses separate popup/tooltip windows); 'screen' mode copies the visible screen. Capture latency depends on the target application, rendering backend, window state, and capture method; PrintWindow may require the target window to process a synchronous WM_PRINT/WM_PRINTCLIENT request. interactionMode=background forces the non-activating PrintWindow path and reports interaction metadata; capture never auto-upgrades to foreground (BACKGROUND_CAPTURE_UNAVAILABLE instead). Capture failures should be described by observable evidence (blank frame, geometry mismatch, target disappearance, etc.) - do not infer toolkit-specific root causes without diagnostic evidence. OMIT outputPath unless the user specified a target file - the server writes to its default writable outputs/ directory and returns the path (never invent a path like X:\\...). Returns: path,width,height,target,rect,timestamp,interaction,geometry. Pipe-safe: path, interaction.",
     inputSchema: toolInputSchemas.capture_window as unknown as JsonSchema,
     outputSchema: captureWindowOutput,
     schemaVersion: 1,
@@ -1210,7 +1211,7 @@ export const contracts: Record<string, ToolContract> = {
   },
   profile_launch: {
     name: "profile_launch",
-    description: "PREFERRED launch tool for any application that has an App Pack. Use this instead of launch_app when the profile is known or app_pack_list reports a matching pack. Waits for the stable profile main window (not a splash/initial window) and returns targetRef, pid, and hwnd for later profile actions - pass targetRef to profile_action/profile_resolve/ui_query etc. An explicit executable path may be supplied via exePath. interactionMode=background keeps the window behind the current foreground window (no steal, no topmost, no minimize) and reports interaction metadata; foregroundDemo restores+activates the window. Returns: profile, targetRef, pid, hwnd, title, startedByMcp, reused, uiaRootAvailable, interaction. Pipe-safe: targetRef, pid, hwnd, title, interaction. Recommended as step 0 of a pipeline.",
+    description: "PREFERRED launch tool for any application that has an App Pack. Use this instead of launch_app when the profile is known or app_pack_list reports a matching pack. Waits for the stable profile main window (not a splash/initial window) and returns targetRef, pid, and hwnd for later profile actions - pass targetRef to profile_action/profile_resolve/ui_query etc. If the user explicitly supplied an executable path for the target application, pass that exact path as exePath on the first profile_launch call. Do not omit it merely because the profile also declares executableEnv or executableNames. interactionMode=background keeps the window behind the current foreground window (no steal, no topmost, no minimize) and reports interaction metadata; foregroundDemo restores+activates the window. Returns: profile, targetRef, pid, hwnd, title, startedByMcp, reused, uiaRootAvailable, interaction. Pipe-safe: targetRef, pid, hwnd, title, interaction. Recommended as step 0 of a pipeline.",
     inputSchema: toolInputSchemas.profile_launch as unknown as JsonSchema,
     outputSchema: profileLaunchOutput,
     schemaVersion: 1,

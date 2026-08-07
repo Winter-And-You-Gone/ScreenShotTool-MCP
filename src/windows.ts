@@ -55,8 +55,8 @@ export type WaitAndSuppressInput = {
 // with existing call sites. `String(error)` on a structured error no longer
 // degrades to "[object Object]" because Error provides a useful toString.
 export class HelperError extends McpUiError {
-  constructor(message: string, code: string, details?: unknown) {
-    super(code, message, details);
+  constructor(message: string, code: string, details?: unknown, suggestion?: string) {
+    super(code, message, details, suggestion);
     this.name = "HelperError";
   }
 }
@@ -94,6 +94,122 @@ export type CaptureResult = {
   // sample). Present only on the PrintWindow path.
   blankFrame?: boolean;
 };
+
+// ── Capture geometry validation ──
+//
+// For a FULL-WINDOW capture_window (no user region/crop), the server knows the
+// target window's real geometry from an INDEPENDENT source (getWindowState's
+// Win32 GetWindowRect) and the captured bitmap's geometry. A captured image
+// whose size is implausible relative to the target (e.g. 2560x1600 target but
+// a 2560x71 bitmap) is an observable capture failure - reported structurally,
+// NEVER attributed to a toolkit root cause without evidence.
+//
+// Tolerance model (dimension/area ratios, not exact equality):
+//   - Windows frames/shadows/DWM extended frames/DPI scaling legitimately
+//     change sizes by a few percent;
+//   - a collapse of one dimension to a few percent of the target is NOT
+//     legitimate for a full-window capture.
+export type CaptureGeometryInfo = {
+  targetWidth?: number;
+  targetHeight?: number;
+  capturedWidth?: number;
+  capturedHeight?: number;
+  validated?: boolean;
+};
+
+export type CaptureGeometryValidation = {
+  valid: boolean;
+  reason?: string;
+  expected?: { width?: number; height?: number };
+  actual?: { width?: number; height?: number };
+  widthRatio?: number;
+  heightRatio?: number;
+  areaRatio?: number;
+};
+
+// Minimum plausible fraction of the target dimension a full-window capture
+// may legitimately shrink to (frame/client-area differences, DWM shadow
+// margins). Anything below this is an implausible collapse, not a frame
+// difference. 0.25 = a 2560px-wide target must produce at least 640px width.
+const MIN_DIMENSION_RATIO = 0.25;
+// Maximum plausible GROWTH of a captured dimension over the target
+// (capture backends should never produce a bitmap much larger than the
+// window; DPI/high-DPI handling can add a bounded amount).
+const MAX_DIMENSION_RATIO = 2.0;
+// Area sanity: a full-window capture should not shrink below ~10% of the
+// target area (e.g. 2560x1600 -> 2560x71 is 4.4% - caught by both the
+// height ratio AND the area ratio).
+const MIN_AREA_RATIO = 0.1;
+
+// Validate a full-window capture's geometry against the target window's
+// real geometry. Pure function (no Win32 calls) so tests can drive it with
+// fixtures. `requestedRegion` present => the capture is a crop of the window;
+// crop geometry is intentionally NOT compared against the full window size.
+export function validateCaptureGeometry(input: {
+  targetRect: { width: number; height: number } | undefined;
+  capturedWidth: number;
+  capturedHeight: number;
+  captureMethod: string;
+  requestedRegion?: { width: number; height: number } | undefined;
+}): CaptureGeometryValidation {
+  const { targetRect, capturedWidth, capturedHeight, requestedRegion } = input;
+  // Region/crop capture: the user asked for a specific sub-rectangle; the
+  // full-window size is not the comparison baseline.
+  if (requestedRegion) {
+    return { valid: true };
+  }
+  // Unknown target geometry: no basis to judge - never fabricate a mismatch.
+  if (!targetRect || targetRect.width <= 0 || targetRect.height <= 0) {
+    return { valid: true };
+  }
+  const targetWidth = targetRect.width;
+  const targetHeight = targetRect.height;
+  const widthRatio = capturedWidth / targetWidth;
+  const heightRatio = capturedHeight / targetHeight;
+  const areaRatio = (capturedWidth * capturedHeight) / (targetWidth * targetHeight);
+
+  if (widthRatio < MIN_DIMENSION_RATIO || heightRatio < MIN_DIMENSION_RATIO) {
+    return {
+      valid: false,
+      reason: "captured image geometry does not plausibly match target geometry",
+      expected: { width: targetWidth, height: targetHeight },
+      actual: { width: capturedWidth, height: capturedHeight },
+      widthRatio,
+      heightRatio,
+      areaRatio
+    };
+  }
+  if (widthRatio > MAX_DIMENSION_RATIO || heightRatio > MAX_DIMENSION_RATIO) {
+    return {
+      valid: false,
+      reason: "captured image geometry does not plausibly match target geometry",
+      expected: { width: targetWidth, height: targetHeight },
+      actual: { width: capturedWidth, height: capturedHeight },
+      widthRatio,
+      heightRatio,
+      areaRatio
+    };
+  }
+  if (areaRatio < MIN_AREA_RATIO) {
+    return {
+      valid: false,
+      reason: "captured image area does not plausibly match target area",
+      expected: { width: targetWidth, height: targetHeight },
+      actual: { width: capturedWidth, height: capturedHeight },
+      widthRatio,
+      heightRatio,
+      areaRatio
+    };
+  }
+  return {
+    valid: true,
+    expected: { width: targetWidth, height: targetHeight },
+    actual: { width: capturedWidth, height: capturedHeight },
+    widthRatio,
+    heightRatio,
+    areaRatio
+  };
+}
 
 export type ClickResult = {
   clicked: boolean
@@ -1192,7 +1308,7 @@ export async function listWindows(filters: ListWindowsInput = {}): Promise<Windo
   return runHelper<WindowInfo[]>({ action: "list-windows", filters });
 }
 
-export async function captureWindow(input: CaptureWindowInput, resolvedMode?: InteractionMode): Promise<CaptureResult & { interaction?: InteractionReport }> {
+export async function captureWindow(input: CaptureWindowInput, resolvedMode?: InteractionMode): Promise<CaptureResult & { interaction?: InteractionReport; geometry?: CaptureGeometryInfo }> {
   const outputPath = await ensureOutputPath(input.outputPath);
   const { outputPath: _outputPath, ...target } = input;
   const mode = resolvedMode ?? "auto";
@@ -1269,6 +1385,51 @@ export async function captureWindow(input: CaptureWindowInput, resolvedMode?: In
     );
   }
 
+  // Full-window geometry sanity: for capture_window WITHOUT a user region, the
+  // captured bitmap size is compared (dimension/area ratios, tolerant of
+  // frame/client/DPI differences) against the target window's REAL geometry
+  // from an independent Win32 read. A non-blank but implausibly-sized capture
+  // (e.g. a 2560x1600 window captured as 2560x71) is a structured failure -
+  // the model must not have to discover the anomaly itself via list_windows.
+  // The failure is reported as an OBSERVED mismatch, never as a toolkit root
+  // cause. Region/crop captures and unknown target geometry are exempt.
+  const targetHwnd = target.hwnd !== undefined ? String(target.hwnd) : undefined;
+  let targetRect: { width: number; height: number } | undefined;
+  if (targetHwnd !== undefined) {
+    try {
+      const state = await getWindowState({ hwnd: targetHwnd });
+      if (state.rect && state.rect.width > 0 && state.rect.height > 0) {
+        targetRect = { width: state.rect.width, height: state.rect.height };
+      }
+    } catch {
+      targetRect = undefined; // unknown geometry: no basis to judge
+    }
+  }
+  const geometryValidation = validateCaptureGeometry({
+    targetRect,
+    capturedWidth: result.width,
+    capturedHeight: result.height,
+    captureMethod: result.rect ? "print" : (target.captureMethod ?? "print"),
+    ...(target.region ? { requestedRegion: target.region } : {})
+  });
+  if (!geometryValidation.valid) {
+    const details: Record<string, unknown> = {
+      captureMethod: "PrintWindow",
+      ...(target.pid !== undefined || target.hwnd !== undefined ? { target: { ...(target.pid !== undefined ? { pid: target.pid } : {}), ...(target.hwnd !== undefined ? { hwnd: target.hwnd } : {}) } } : {}),
+      ...(geometryValidation.expected ? { expectedGeometry: geometryValidation.expected } : {}),
+      ...(geometryValidation.actual ? { capturedGeometry: geometryValidation.actual } : {}),
+      ...(geometryValidation.widthRatio !== undefined ? { widthRatio: geometryValidation.widthRatio } : {}),
+      ...(geometryValidation.heightRatio !== undefined ? { heightRatio: geometryValidation.heightRatio } : {}),
+      ...(geometryValidation.areaRatio !== undefined ? { areaRatio: geometryValidation.areaRatio } : {})
+    };
+    throw new HelperError(
+      "The captured image geometry does not plausibly match the resolved target window.",
+      "CAPTURE_GEOMETRY_MISMATCH",
+      details,
+      'Retry capture_window against the same targetRef with captureMethod="screen" if the user needs a visible screenshot and screen capture semantics are acceptable.'
+    );
+  }
+
   const interaction: InteractionReport = captureInteractionReport(mode, {
     ...(foregroundBefore !== undefined ? { foregroundBefore } : {}),
     ...(foregroundAfter !== undefined ? { foregroundAfter } : {}),
@@ -1277,7 +1438,16 @@ export async function captureWindow(input: CaptureWindowInput, resolvedMode?: In
     targetActivated: mode === "foregroundDemo" && (target.captureMethod ?? "print") === "screen"
   });
 
-  return { ...result, interaction };
+  // Lightweight geometry diagnostics on the SUCCESS path so the model never
+  // needs a separate list_windows to confirm the image matches the target.
+  const geometry: CaptureGeometryInfo = {
+    ...(geometryValidation.expected ? { targetWidth: geometryValidation.expected.width, targetHeight: geometryValidation.expected.height } : {}),
+    capturedWidth: result.width,
+    capturedHeight: result.height,
+    validated: geometryValidation.valid
+  };
+
+  return { ...result, interaction, geometry };
 }
 
 export async function captureScreenRegion(input: CaptureScreenRegionInput): Promise<CaptureResult> {

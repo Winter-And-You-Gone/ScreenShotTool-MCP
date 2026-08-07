@@ -614,6 +614,29 @@ test("profile_launch is described as the preferred launch tool; launch_app as th
   assert.match(contracts.launch_app!.description, /prefer profile_launch/);
 });
 
+test("profile_launch guidance: explicit user executable path must be passed as exePath on the FIRST call", () => {
+  const desc = contracts.profile_launch!.description;
+  // Keyword combination (stable, not a full-sentence snapshot): the contract
+  // must tell the model to forward a user-supplied explicit path on the first
+  // call instead of relying on env/auto resolution first.
+  assert.match(desc, /explicitly supplied an executable path/i);
+  assert.match(desc, /pass that exact path as exePath/i);
+  assert.match(desc, /on the first profile_launch call/i);
+  assert.match(desc, /Do not omit it merely because the profile also declares executableEnv or executableNames/i);
+});
+
+test("profile_launch input schema keeps exePath OPTIONAL (auto resolution stays legal)", () => {
+  const schema = toolZodSchemas.profile_launch as unknown as { shape?: Record<string, unknown> };
+  const shape = (schema as { shape?: Record<string, unknown> }).shape;
+  // exePath must remain optional - profile auto resolution (env var /
+  // executableNames / reuse) is still a legitimate path.
+  assert.ok(shape, "zod schema has a shape");
+  const zod = toolZodSchemas.profile_launch!.parse({ profile: "fixture" }) as { exePath?: string };
+  assert.equal(zod.exePath, undefined, "profile_launch without exePath must still parse (optional field)");
+  const withPath = toolZodSchemas.profile_launch!.parse({ profile: "fixture", exePath: "C:\\app.exe" }) as { exePath?: string };
+  assert.equal(withPath.exePath, "C:\\app.exe");
+});
+
 test("profile_action description requires a bound target and prefers targetRef", () => {
   const desc = contracts.profile_action!.description;
   assert.match(desc, /REQUIRES A BOUND TARGET/);

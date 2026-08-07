@@ -92,7 +92,9 @@ app_pack_describe → profile_launch → 使用 targetRef 的 profile_action
 ```
 
 用户已明确指定 Profile 时可直接 `profile_launch → profile_action`，不强制先调用
-`app_pack_list`。`profile_launch` 返回的 `targetRef` 是后续动作的首选目标绑定：
+`app_pack_list`。**用户已经明确提供目标 EXE 绝对路径时，首次 `profile_launch` 应直接
+传 `exePath`；不要先依赖 `executableEnv` 或自动解析再失败重试。**
+`profile_launch` 返回的 `targetRef` 是后续动作的首选目标绑定：
 窗口重建后它会自动重新绑定到新窗口，无需手工换 HWND。**targetRef 是 session 身份**：
 只要拿到 targetRef，后续目标窗口工具（profile_action / ui_query / capture_window /
 click_window / get_window_state / type_text / send_key 等）一律复用 targetRef，而不是

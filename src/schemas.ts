@@ -1188,7 +1188,7 @@ export const toolInputSchemas = {
     type: "object",
     properties: {
       profile: { type: "string", minLength: 1, description: "App Pack id, e.g. \"notepad\" (from app_pack_list)." },
-      exePath: { type: "string", description: "Optional explicit path to the executable. Overrides all other resolution." },
+      exePath: { type: "string", description: "Optional explicit absolute path to the executable. When the user explicitly supplied the target application's executable path, pass that exact path here on the FIRST profile_launch call - do not omit it to try executableEnv/executableNames first. Overrides all other resolution." },
       args: { type: "array", items: { type: "string" }, description: "Process arguments." },
       waitForWindow: { type: "boolean", default: true },
       noActivate: { type: "boolean", default: true, description: "Best-effort background launch (recommended)." },
