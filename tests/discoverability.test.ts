@@ -644,6 +644,27 @@ test("profile_action description requires a bound target and prefers targetRef",
   assert.match(desc, /Do NOT reuse an old hwnd/);
 });
 
+test("profile_action guidance: verified actions need no redundant re-verification", () => {
+  // When ensureSelected (or another semantic action) returns
+  // controlStateVerified=true AND businessStateVerified=true, the action is
+  // already verified - the model must not append profile_resolve/ui_query/
+  // ui_wait to re-check the same state.
+  const desc = contracts.profile_action!.description;
+  assert.match(desc, /controlStateVerified=true AND businessStateVerified=true/);
+  assert.match(desc, /do NOT immediately append profile_resolve, ui_query, or ui_wait/);
+  assert.match(desc, /VERIFIED ACTIONS NEED NO RE-CHECK/);
+});
+
+test("ui_query guidance: nameContains is a TOP-LEVEL filter with a correct example", () => {
+  // The description must show nameContains OUTSIDE the selector object (a
+  // top-level filter), with a correct call example - it must never suggest
+  // putting nameContains inside the selector.
+  const desc = contracts.ui_query!.description;
+  assert.match(desc, /TOP-LEVEL filter/);
+  assert.match(desc, /NOT a field inside the selector object/);
+  assert.match(desc, /"selector":\{"controlType":"Button"\},"nameContains":"通道"/);
+});
+
 test("app_pack_describe output schema accepts usageGuidance and the implementation returns the recommended order", () => {
   // outputSchema accepts usageGuidance.
   const ok = validateAgainstSchema(

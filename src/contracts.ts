@@ -1143,7 +1143,7 @@ export const contracts: Record<string, ToolContract> = {
   },
   ui_query: {
     name: "ui_query",
-    description: "SCOPED UI SEARCH - the recommended way to find elements when a Profile/App Pack control is not available. Scope with rootSelector/ancestorSelector, nameContains, fields, and maxResults instead of enumerating the whole tree. depthStrategy=auto escalates the search depth (8/16/24) until the element is found. Find UI elements matching a selector; returns up to maxResults elements with state (value/toggleState/selected/rangeValue). Returns: found, count, elements[], truncated, elapsedMs. Pipe-safe: found, count, elements.",
+    description: "SCOPED UI SEARCH - the recommended way to find elements when a Profile/App Pack control is not available. Scope with rootSelector/ancestorSelector, nameContains, fields, and maxResults instead of enumerating the whole tree. depthStrategy=auto escalates the search depth (8/16/24) until the element is found. Find UI elements matching a selector; returns up to maxResults elements with state (value/toggleState/selected/rangeValue). nameContains is a TOP-LEVEL filter, NOT a field inside the selector object - correct example: {\"targetRef\":\"target_abc123\",\"selector\":{\"controlType\":\"Button\"},\"nameContains\":\"通道\",\"maxResults\":10}. Returns: found, count, elements[], truncated, elapsedMs. Pipe-safe: found, count, elements, elapsedMs.",
     inputSchema: toolInputSchemas.ui_query as unknown as JsonSchema,
     outputSchema: queryOutput,
     schemaVersion: 1,
@@ -1197,7 +1197,7 @@ export const contracts: Record<string, ToolContract> = {
   },
   profile_resolve: {
     name: "profile_resolve",
-    description: "Resolve a logical control name from an App Pack to a concrete element, trying candidate selectors in order. Returns: profile, control, found, selectorUsed, confidence, candidatesTried, element. Pipe-safe: found, element.",
+    description: "Resolve a logical control name from an App Pack to a concrete element, trying candidate selectors in order with the pack's declared search scope (entry.search.rootControl / maxDepth / depthStrategy - same semantics as profile_action). Returns: profile, control, found, selectorUsed, confidence, candidatesTried, element. On failure the error details carry the control's semantic context (page/component/parent/group, searchApplied, diagnosticScope, suggestedDiagnostic) - diagnose within that scope, do not enumerate the whole tree. Pipe-safe: found, element.",
     inputSchema: toolInputSchemas.profile_resolve as unknown as JsonSchema,
     outputSchema: profileResolveOutput,
     schemaVersion: 1,
@@ -1206,7 +1206,7 @@ export const contracts: Record<string, ToolContract> = {
   },
   profile_action: {
     name: "profile_action",
-    description: "Perform an action on a logical control from an App Pack. REQUIRES A BOUND TARGET. Preferred input: targetRef returned by profile_launch (targetRef survives window recreation and refreshes the binding automatically). Alternatives: hwnd, pid, processName, or titleContains. Do NOT reuse an old hwnd after a window was recreated - pass the targetRef instead. Minimal example: {\"profile\":\"example-app\",\"targetRef\":\"target_abc123\",\"control\":\"settingsButton\",\"action\":\"invoke\"}. Tries candidate selectors in order; supports composite actions selectByName/selectByIndex/getSelection/openMenu/openSubmenu/ensureSelected that handle same-PID popups and verify before/after state; never moves the physical mouse. Pack defaultExpect applies unless you pass expect:false. ASYNC-ISH: verify the outcome with ui_wait or an expect. In background mode actions declared foregroundRequired are refused up front (FOREGROUND_REQUIRED). Returns: profile, control, selectorUsed, confidence, result, interaction.",
+    description: "Perform an action on a logical control from an App Pack. REQUIRES A BOUND TARGET. Preferred input: targetRef returned by profile_launch (targetRef survives window recreation and refreshes the binding automatically). Alternatives: hwnd, pid, processName, or titleContains. Do NOT reuse an old hwnd after a window was recreated - pass the targetRef instead. Minimal example: {\"profile\":\"example-app\",\"targetRef\":\"target_abc123\",\"control\":\"settingsButton\",\"action\":\"invoke\"}. Tries candidate selectors in order; supports composite actions selectByName/selectByIndex/getSelection/openMenu/openSubmenu/ensureSelected that handle same-PID popups and verify before/after state; never moves the physical mouse. Pack defaultExpect applies unless you pass expect:false. ASYNC-ISH: verify the outcome with ui_wait or an expect. In background mode actions declared foregroundRequired are refused up front (FOREGROUND_REQUIRED). VERIFIED ACTIONS NEED NO RE-CHECK: when a semantic action (e.g. ensureSelected) returns controlStateVerified=true AND businessStateVerified=true, the action is already verified - do NOT immediately append profile_resolve, ui_query, or ui_wait to re-verify the same state. Only continue diagnostics when a verification field is missing/false or the task explicitly requires reading a specific value. Returns: profile, control, selectorUsed, confidence, result, interaction.",
     inputSchema: toolInputSchemas.profile_action as unknown as JsonSchema,
     outputSchema: profileActionOutput,
     schemaVersion: 1,

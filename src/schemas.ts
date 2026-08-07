@@ -1046,7 +1046,7 @@ export const toolInputSchemas = {
       selector: uiElementSelectorJsonSchema,
       rootSelector: { ...uiElementSelectorJsonSchema, description: "Restrict the search to the subtree under this element (scoped query; keeps output small)." },
       ancestorSelector: { ...uiElementSelectorJsonSchema, description: "Only return elements that have a matching ancestor." },
-      nameContains: { type: "string", description: "Case-insensitive substring filter on the element name (a FILTER, not a selector root - it never replaces selector/rootSelector/ancestorSelector)." },
+      nameContains: { type: "string", description: "Case-insensitive substring filter on the element name. TOP-LEVEL filter of ui_query - it does NOT go inside the selector object and never replaces selector/rootSelector/ancestorSelector. Example: {\"targetRef\":\"target_abc123\",\"selector\":{\"controlType\":\"Button\"},\"nameContains\":\"通道\",\"maxResults\":10}." },
       fields: { type: "array", items: { type: "string" }, maxItems: 32, description: "Projection: only these element fields are returned (e.g. [\"name\",\"automationId\",\"controlType\",\"toggleState\",\"selected\",\"boundingRect\"])." },
       depthStrategy: { type: "string", enum: ["fixed", "auto"], default: "fixed", description: "fixed: use maxDepth as-is. auto: start at the default depth and escalate (8/16/24) until matches are found or maxDepthAutoLimit is reached." },
       maxDepthAutoLimit: { type: "integer", minimum: 1, maximum: 30, default: 24 },

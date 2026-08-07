@@ -193,28 +193,38 @@ export async function resolveProfileControl(
   const windowSel = profileWindowSelector(profile, { hwnd: input.hwnd, pid: input.pid, processName: input.processName, titleContains: input.titleContains });
   const candidatesTried: Array<{ selector: UiElementSelector; outcome: string; message?: string }> = [];
 
-  const severeCodes = new Set([
-    "WINDOW_NOT_FOUND",
-    "WINDOW_AMBIGUOUS",
-    "UIA_ROOT_UNAVAILABLE",
-    "UIA_ASSEMBLY_UNAVAILABLE",
-    "TARGET_PROCESS_EXITED",
-    "INVALID_SELECTOR"
-  ]);
+  // Declared control search: profile_resolve uses the EXACT same search
+  // semantics as profile_action (entry.search.rootControl / maxDepth /
+  // depthStrategy > caller explicit params > generic default). A control that
+  // profile_action resolves deep in the tree MUST resolve here too.
+  const declared = resolveDeclaredControlSearch(profile, entry, input);
+  const searchApplied = {
+    ...(declared.rootControl !== undefined ? { rootControl: declared.rootControl } : {}),
+    ...(declared.maxDepth !== undefined ? { maxDepth: declared.maxDepth } : {}),
+    ...(declared.depthStrategy !== undefined ? { depthStrategy: declared.depthStrategy } : {})
+  };
+  const maxDepth = effectiveSearchMaxDepth(declared, input);
+  const depthStrategy = effectiveSearchDepthStrategy(declared);
+
+  const severeCodes = severeErrorCodes();
 
   for (let i = 0; i < candidates.length; i++) {
     const selector = candidates[i]!;
+    // Compose the declared rootControl into the selector as an ancestor -
+    // identical to profile_action's scoping.
+    const scopedSelector = scopeSelectorToDeclaredSearch(selector, declared);
     try {
       const result = await deps.getUiElement({
         hwnd: windowSel.hwnd,
         pid: windowSel.pid,
         processName: windowSel.processName,
         titleContains: windowSel.titleContains,
-        selector,
+        selector: scopedSelector,
         includeProcessPopups: input.includeProcessPopups,
-        maxDepth: input.maxDepth,
+        maxDepth,
         maxNodes: input.maxNodes,
-        timeoutMs: input.timeoutMs
+        timeoutMs: input.timeoutMs,
+        ...(depthStrategy === "auto" ? { depthStrategy: "auto" as const } : {})
       });
       if (result.found) {
         candidatesTried.push({ selector, outcome: "found" });
@@ -244,17 +254,29 @@ export async function resolveProfileControl(
     }
   }
 
-  // All candidates exhausted without a unique match.
+  // All candidates exhausted without a unique match. Surface the SAME
+  // semantic failure context profile_action reports (page/component/parent/
+  // group/confidence/attempts + structured diagnosticScope + suggestedDiagnostic),
+  // so the model diagnoses within the nearest known scope instead of
+  // enumerating the whole tree.
+  const semanticDetails = semanticFailureContext(entry, {
+    profile: profile.id,
+    control: input.control,
+    candidatesTried: candidatesTried.slice(0, 10),
+    searchApplied
+  });
   throw new McpUiError(
-    "PROFILE_CONTROL_NOT_FOUND",
-    `Profile '${input.profile}' could not resolve control '${input.control}' to a unique element.`,
-    {
+    "PROFILE_CONTROL_UNRESOLVED",
+    `Profile control '${input.control}' could not be resolved to a unique element on the live UI.`,
+    semanticDetails ?? {
       profile: profile.id,
       control: input.control,
       confidence,
       notes: entry.notes,
-      attempts: candidatesTried.slice(0, 10)
-    }
+      attempts: candidatesTried.slice(0, 10),
+      searchApplied
+    },
+    "Use scoped ui_query within the nearest known profile control (rootSelector + nameContains + maxResults). Avoid ui_inspect_tree unless scoped search also fails."
   );
 }
 
@@ -311,14 +333,7 @@ export async function performProfileAction(
   const candidatesTried: Array<{ selector: UiElementSelector; outcome: string; message?: string }> = [];
   let lastError: unknown = null;
 
-  const severeCodes = new Set([
-    "WINDOW_NOT_FOUND",
-    "WINDOW_AMBIGUOUS",
-    "UIA_ROOT_UNAVAILABLE",
-    "UIA_ASSEMBLY_UNAVAILABLE",
-    "TARGET_PROCESS_EXITED",
-    "INVALID_SELECTOR"
-  ]);
+  const severeCodes = severeErrorCodes();
 
   // Composite actions (selectByName/selectByIndex/getSelection/openMenu/
   // openSubmenu/ensureSelected) need to resolve the control first, then
@@ -355,6 +370,18 @@ export async function performProfileAction(
   }
 
   const foregroundBefore = await readForeground(deps);
+  // Declared control search for the non-composite path (pack entry.search >
+  // caller explicit params > generic default) - same helper as
+  // profile_resolve, so both tools search the same depth/scope for the same
+  // control.
+  const declared = resolveDeclaredControlSearch(profile, entry, input);
+  const maxDepth = effectiveSearchMaxDepth(declared, input);
+  const depthStrategy = effectiveSearchDepthStrategy(declared);
+  const searchApplied = {
+    ...(declared.rootControl !== undefined ? { rootControl: declared.rootControl } : {}),
+    ...(declared.maxDepth !== undefined ? { maxDepth: declared.maxDepth } : {}),
+    ...(declared.depthStrategy !== undefined ? { depthStrategy: declared.depthStrategy } : {})
+  };
   for (let i = 0; i < candidates.length; i++) {
     const selector = candidates[i]!;
     try {
@@ -363,10 +390,7 @@ export async function performProfileAction(
       // stacks) need a deeper walk than the global default 15. The declared
       // rootControl is composed into the selector as an ancestor so the walk
       // stays scoped to that subtree.
-      const searchScope = entry.search;
-      const scopedSelector: UiElementSelector = searchScope?.rootControl && profile
-        ? { ...selector, ancestor: firstSelectorOf(profile, searchScope.rootControl) }
-        : selector;
+      const scopedSelector = scopeSelectorToDeclaredSearch(selector, declared);
       const result = await deps.performUiAction({
         hwnd: windowSel.hwnd,
         pid: windowSel.pid,
@@ -380,10 +404,10 @@ export async function performProfileAction(
         allowMessageClickFallback: input.allowMessageClickFallback,
         forceCoordinateClick: input.forceCoordinateClick,
         includeProcessPopups: input.includeProcessPopups,
-        maxDepth: searchScope?.maxDepth ?? input.maxDepth,
+        maxDepth,
         maxNodes: input.maxNodes,
         timeoutMs: input.timeoutMs,
-        ...(searchScope?.depthStrategy === "auto" ? { depthStrategy: "auto" as const } : {})
+        ...(depthStrategy === "auto" ? { depthStrategy: "auto" as const } : {})
       });
       let foregroundAfter = await readForeground(deps);
       let foregroundChanged = foregroundBefore !== undefined && foregroundAfter !== undefined && foregroundBefore !== foregroundAfter;
@@ -430,13 +454,15 @@ export async function performProfileAction(
 
   if (lastError instanceof McpUiError) {
     // Enrich an unresolved-control failure with the control's SEMANTIC
-    // context (page/component/parent/group + candidatesTried + a structured
-    // diagnostic scope), so the model diagnoses within the nearest known
-    // scope instead of enumerating the whole tree or re-deriving selectors.
+    // context (page/component/parent/group + candidatesTried + searchApplied +
+    // a structured diagnostic scope), so the model diagnoses within the
+    // nearest known scope instead of enumerating the whole tree or
+    // re-deriving selectors.
     const semanticDetails = semanticFailureContext(entry, {
       profile: profile.id,
       control: input.control,
-      candidatesTried: candidatesTried.slice(0, 10)
+      candidatesTried: candidatesTried.slice(0, 10),
+      searchApplied
     });
     if (lastError.code === "ELEMENT_NOT_FOUND" && semanticDetails) {
       throw new McpUiError(
@@ -465,15 +491,106 @@ export async function performProfileAction(
   });
 }
 
+// ── Shared declared-control-search resolution ──
+//
+// profile_action and profile_resolve MUST resolve the same control with the
+// same search semantics: the pack-declared entry.search (rootControl /
+// maxDepth / depthStrategy) scopes and deepens the walk, caller-provided
+// maxDepth/depthStrategy are only a fallback, and the declared rootControl is
+// composed into the selector as an ancestor so the walk stays inside that
+// subtree. One helper - two callers - one invariant.
+export type DeclaredControlSearch = {
+  // The entry's declared search bounds, normalized.
+  maxDepth?: number;
+  depthStrategy?: "fixed" | "auto";
+  maxResults?: number;
+  // The declared rootControl resolved to its first candidate selector (the
+  // ancestor used to scope the walk), when both declared and resolvable.
+  rootSelector?: UiElementSelector;
+  rootControl?: string;
+};
+
+export function resolveDeclaredControlSearch(
+  profile: AppProfile | undefined,
+  entry: Pick<ControlEntry, "selectors" | "search">,
+  input?: { maxDepth?: number }
+): DeclaredControlSearch {
+  const search = entry.search;
+  const rootControl = search?.rootControl;
+  // A missing profile (or one without controls) simply cannot resolve a
+  // declared rootControl - the walk stays unscoped, never a crash.
+  const rootSelector = rootControl && profile?.controls ? firstSelectorOf(profile, rootControl) : undefined;
+  return {
+    ...(search?.maxDepth !== undefined ? { maxDepth: search.maxDepth } : {}),
+    ...(search?.depthStrategy !== undefined ? { depthStrategy: search.depthStrategy } : {}),
+    ...(search?.maxResults !== undefined ? { maxResults: search.maxResults } : {}),
+    ...(rootSelector ? { rootSelector, rootControl } : {})
+  };
+}
+
+// Apply the declared search scope to a base selector: the declared
+// rootControl (when resolvable) becomes the ancestor so the walk stays scoped
+// to that subtree. Identical composition in every caller.
+export function scopeSelectorToDeclaredSearch(
+  selector: UiElementSelector,
+  search: DeclaredControlSearch
+): UiElementSelector {
+  return search.rootSelector ? { ...selector, ancestor: search.rootSelector } : selector;
+}
+
+// Effective maxDepth for a control resolution: pack-declared entry.search
+// wins, then the caller's explicit maxDepth, then the generic default. This
+// mirrors the non-composite profile_action path exactly.
+export function effectiveSearchMaxDepth(
+  declared: DeclaredControlSearch,
+  input?: { maxDepth?: number },
+  fallback = 15
+): number {
+  return declared.maxDepth ?? input?.maxDepth ?? fallback;
+}
+
+export function effectiveSearchDepthStrategy(
+  declared: DeclaredControlSearch
+): "fixed" | "auto" {
+  return declared.depthStrategy ?? "fixed";
+}
+
+export function severeErrorCodes(): Set<string> {
+  return new Set([
+    "WINDOW_NOT_FOUND",
+    "WINDOW_AMBIGUOUS",
+    "UIA_ROOT_UNAVAILABLE",
+    "UIA_ASSEMBLY_UNAVAILABLE",
+    "TARGET_PROCESS_EXITED",
+    "INVALID_SELECTOR"
+  ]);
+}
+
+// Record one candidate outcome in the candidatesTried list (shared by
+// profile_action and profile_resolve so both report the same attempt trace).
+export function recordCandidateAttempt(
+  candidatesTried: Array<{ selector: UiElementSelector; outcome: string; message?: string }>,
+  selector: UiElementSelector,
+  outcome: string,
+  message?: string
+): void {
+  candidatesTried.push(message !== undefined ? { selector, outcome, message } : { selector, outcome });
+}
+
 // Build the semantic diagnostic context for a failed control resolution:
 // the control's declared page/component/parent/group, the candidates tried,
 // and a machine-usable diagnosticScope pointing at the nearest RESOLVABLE
 // container (the control's own search.rootControl when declared - a logical
 // control that the profile can resolve - falling back to parent/group, then
 // page). Never app-specific; reads only the entry's declared metadata.
-function semanticFailureContext(
+export function semanticFailureContext(
   entry: ControlEntry,
-  base: { profile: string; control: string; candidatesTried: unknown[] }
+  base: {
+    profile: string;
+    control: string;
+    candidatesTried: unknown[];
+    searchApplied?: { rootControl?: string; maxDepth?: number; depthStrategy?: string };
+  }
 ): Record<string, unknown> | undefined {
   const parent = entry.parent ?? entry.group;
   // search.rootControl is the strongest diagnostic root: it is a logical
@@ -490,6 +607,7 @@ function semanticFailureContext(
     ...(entry.parent ? { parent: entry.parent } : {}),
     ...(entry.group ? { group: entry.group } : {}),
     candidatesTried: base.candidatesTried,
+    ...(base.searchApplied ? { searchApplied: base.searchApplied } : {}),
     ...(diagnosticScope ? { diagnosticScope } : {}),
     suggestedDiagnostic: diagnosticScope
       ? { tool: "ui_query", withinControl: diagnosticScope.rootControl, maxResults: 10 }
@@ -595,22 +713,22 @@ async function resolveUniqueSelector(
   input: { includeProcessPopups?: boolean; maxDepth?: number; maxNodes?: number; timeoutMs?: number },
   profile?: AppProfile
 ): Promise<UiElementSelector> {
-  const severeCodes = new Set(["WINDOW_NOT_FOUND", "WINDOW_AMBIGUOUS", "UIA_ROOT_UNAVAILABLE", "UIA_ASSEMBLY_UNAVAILABLE", "TARGET_PROCESS_EXITED", "INVALID_SELECTOR"]);
-  const search = entry.search;
-  const rootSelector = search?.rootControl && profile
-    ? firstSelectorOf(profile, search.rootControl)
-    : undefined;
-  // depthStrategy auto escalates only for THIS control's resolution.
-  const depthStrategy = search?.depthStrategy ?? (search?.maxDepth ? "fixed" : "fixed");
+  const severeCodes = severeErrorCodes();
+  // The composite path resolves the control with the SAME declared search
+  // semantics as profile_action/profile_resolve (entry.search.rootControl /
+  // maxDepth / depthStrategy > caller params > generic default). A missing
+  // profile simply cannot resolve a declared rootControl (same as the
+  // non-composite path).
+  const declared = resolveDeclaredControlSearch(profile as AppProfile, entry, input);
+  const maxDepth = effectiveSearchMaxDepth(declared, input);
+  const depthStrategy = effectiveSearchDepthStrategy(declared);
   for (const base of entry.selectors) {
-    const selector: UiElementSelector = rootSelector
-      ? { ...base, ancestor: rootSelector }
-      : base;
+    const selector = scopeSelectorToDeclaredSearch(base, declared);
     try {
       const r = await deps.getUiElement({
         hwnd: windowSel.hwnd, pid: windowSel.pid, processName: windowSel.processName, titleContains: windowSel.titleContains,
         selector, includeProcessPopups: input.includeProcessPopups,
-        maxDepth: search?.maxDepth ?? input.maxDepth,
+        maxDepth,
         maxNodes: input.maxNodes, timeoutMs: input.timeoutMs,
         ...(depthStrategy === "auto" ? { depthStrategy: "auto" as const } : {})
       });
