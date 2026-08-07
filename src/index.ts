@@ -24,6 +24,7 @@ import {
   autoResolveTarget,
   bindLaunchTarget,
   getTarget,
+  rebindTargetByRules,
   recordTargetOperation,
   resolveTargetRef,
   type TargetBinding,
@@ -1164,85 +1165,97 @@ async function finalizeOperationRecord(
   record.finishedAt = Date.now();
   if (opts.interactionMethod) record.interactionMethod = opts.interactionMethod;
 
+  // UNIFIED window-lifecycle finalization for every outcome (success /
+  // business-error / protocol-error share ONE rebind policy; no branch may
+  // maintain its own window-selection logic):
+  //   Case A: previous hwnd still valid  -> no rebind, keep previousHwnd.
+  //   Case B: process alive, previous hwnd gone -> profile-aware rebind
+  //           (only windows matching the profile main-window rules qualify).
+  //   Case C: process dead -> never rebind (target-disappeared).
+  const windowState = await finalizeTargetWindowState(runtime, record, targetRef, pid, after);
+
   const err = opts.error;
   if (err === undefined) {
-    // Success: if the before hwnd went stale but the process survived and a
-    // new window can be resolved, the session is still alive - record the
-    // rebound, never a disappearance.
-    const rebound = await captureRebound(runtime, record, tool, targetRef, pid, after);
-    if (rebound) {
-      record.result = "success";
-      record.windowRebound = true;
-      record.after = { ...after, hwnd: rebound, windowAlive: true };
-    } else {
-      record.result = "success";
-      record.after = after;
-    }
+    record.result = "success";
+    record.after = windowState.after;
+    if (windowState.rebound) record.windowRebound = true;
     return;
   }
 
   if (err instanceof McpUiError) {
     record.errorCode = err.code;
-    if (after.processAlive === false) {
+    if (windowState.processExited) {
       record.result = "target-disappeared";
-      record.after = after;
+      record.after = windowState.after;
       return;
     }
-    // Window lost but the process is alive: check whether the target session
-    // rebound to a new window - that is NOT a disappearance.
-    if (after.processAlive === true && after.windowAlive === false) {
-      const rebound = await captureRebound(runtime, record, tool, targetRef, pid, after);
-      if (rebound) {
-        record.result = "business-error";
-        record.windowRebound = true;
-        record.after = { ...after, hwnd: rebound, windowAlive: true };
-        return;
-      }
-    }
     record.result = "business-error";
-    record.after = after;
+    record.after = windowState.after;
+    if (windowState.rebound) record.windowRebound = true;
     return;
   }
 
   // Non-structured error: internal/protocol. Only classify as
   // target-disappeared when the process was alive before and is provably dead
   // after; otherwise protocol-error.
-  if (opts.before?.processAlive === true && after.processAlive === false) {
+  if (opts.before?.processAlive === true && windowState.after.processAlive === false) {
     record.result = "target-disappeared";
-    record.after = after;
+    record.after = windowState.after;
     return;
   }
   record.result = "protocol-error";
-  record.after = after;
+  record.after = windowState.after;
+  if (windowState.rebound) record.windowRebound = true;
 }
 
-// Re-resolve the main window when the before hwnd went stale but the process
-// survived. Returns the new hwnd, or undefined when no window matches right
-// now. Best-effort: never throws into the record finalization.
-async function captureRebound(
+// Shared window-lifecycle finalization for operation records. Returns the
+// post-operation window state; MAY update binding.hwnd (only to a window that
+// satisfies the profile main-window rules, and only when the previous hwnd is
+// genuinely gone). Best-effort: a diagnostics failure never overrides the
+// caller's outcome.
+async function finalizeTargetWindowState(
   runtime: RuntimeModules,
   record: TargetOperationRecord,
-  tool: string,
   targetRef: string,
   pid: number | undefined,
   after: { processAlive?: boolean; windowAlive?: boolean; hwnd?: string }
-): Promise<string | undefined> {
-  if (pid === undefined) return undefined;
+): Promise<{ after: typeof after; rebound: boolean; processExited: boolean }> {
+  const processExited = after.processAlive === false;
+
+  // Case A: previous hwnd still valid -> never rebind, never touch binding.
+  if (after.processAlive === true && after.windowAlive === true) {
+    return { after, rebound: false, processExited: false };
+  }
+
+  // Case C: process dead -> never attempt a window rebind.
+  if (processExited) {
+    return { after, rebound: false, processExited: true };
+  }
+
+  // Case B: process alive but the previous window is gone -> profile-aware
+  // rebind (single shared algorithm: matchesMainWindow via targets.ts).
   const binding = getTarget(targetRef);
-  if (!binding) return undefined;
-  if (record.before?.hwnd === undefined) return undefined;
+  if (!binding || record.before?.hwnd === undefined) {
+    return { after, rebound: false, processExited: false };
+  }
   try {
-    const windows = await runtime.windows.listWindows({ pid });
-    const matched = windows.find((w: { hwnd: string }) => w.hwnd !== record.before!.hwnd);
-    if (matched) {
-      binding.hwnd = matched.hwnd;
-      binding.lastResolvedAt = Date.now();
-      return matched.hwnd;
+    const rebound = await rebindTargetByRules(binding, {
+      checkProcessAlive: (i) => runtime.windows.checkProcessAlive(i),
+      listWindows: (f) => runtime.windows.listWindows(f)
+    });
+    if (rebound) {
+      return {
+        after: { processAlive: true, windowAlive: true, hwnd: rebound.hwnd! },
+        rebound: true,
+        processExited: false
+      };
     }
   } catch {
-    // best-effort
+    // best-effort: rebind failure keeps the current after state.
   }
-  return undefined;
+  // No valid main window matched -> window-lost-process-alive (never binds a
+  // secondary/popup window, never classified as process exit).
+  return { after, rebound: false, processExited: false };
 }
 
 // Large-tree output guard: results that would flood the client are refused

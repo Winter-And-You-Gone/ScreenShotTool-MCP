@@ -6,6 +6,7 @@ import test from "node:test";
 
 import {
   bindLaunchTarget,
+  getTarget,
   resolveTargetRef,
   recordTargetOperation,
   lastTargetOperation,
@@ -196,6 +197,10 @@ function makeRuntime(overrides: {
   windowAlive?: boolean;
   aliveAfter?: boolean;
   windowAliveAfter?: boolean;
+  // Which hwnds are alive for the AFTER probe (windowAlive is judged per
+  // hwnd, like the real helper's IsWindow). When provided, the AFTER probe
+  // reports windowAlive=true only for hwnds in this set.
+  aliveHwndsAfter?: string[];
   windows?: Array<{ hwnd: string; title: string; pid: number; processName: string }>;
   clickResult?: Record<string, unknown>;
   clickError?: Error;
@@ -211,6 +216,7 @@ function makeRuntime(overrides: {
   const beforeWindow = overrides.windowAlive ?? true;
   const afterAlive = overrides.aliveAfter ?? beforeAlive;
   const afterWindow = overrides.windowAliveAfter ?? beforeWindow;
+  const aliveHwndsAfter = overrides.aliveHwndsAfter;
   // REAL helper semantics:
   //  - windowAlive is only judged when a hwnd is passed (IsWindow on that
   //    handle); WITHOUT a hwnd the helper reports windowAlive=false (it has
@@ -226,10 +232,22 @@ function makeRuntime(overrides: {
       calls++;
       const withHwnd = input.hwnd !== undefined;
       const isAfter = calls >= 3;
+      const hwndStr = withHwnd ? String(input.hwnd) : undefined;
+      let windowAlive: boolean;
+      if (isAfter) {
+        if (aliveHwndsAfter !== undefined) {
+          // Per-hwnd after semantics: only the listed hwnds are alive.
+          windowAlive = hwndStr !== undefined && aliveHwndsAfter.includes(hwndStr);
+        } else {
+          windowAlive = withHwnd ? afterWindow : false;
+        }
+      } else {
+        windowAlive = withHwnd ? beforeWindow : false;
+      }
       return {
         pid: 4242,
         processAlive: isAfter ? afterAlive : beforeAlive,
-        windowAlive: isAfter ? (withHwnd ? afterWindow : false) : (withHwnd ? beforeWindow : false)
+        windowAlive
       };
     },
     listWindows: async () => overrides.windows ?? [],
@@ -561,4 +579,114 @@ test("regression: process exited -> target-disappeared keeps exit diagnostics", 
   assert.equal(rec.result, "target-disappeared");
   assert.equal(rec.after?.processAlive, false);
   assert.equal(rec.errorCode, "TARGET_WINDOW_NOT_READY");
+});
+
+// ── Multi-window rebind regression tests ──
+//
+// A single GUI process can own the MAIN window plus secondary windows
+// (settings, dialogs, popups, tool windows). Rebind must:
+//   1. NEVER run when the previous hwnd is still healthy (a healthy success
+//      must not re-point the binding at a secondary window);
+//   2. only bind to a window satisfying the PROFILE main-window rules;
+//   3. never bind a secondary window when no valid main window exists.
+
+test("rebind: healthy main window + secondary window -> NO rebind, binding keeps the main hwnd", async () => {
+  resetTargetBindings();
+  // launchFixture profile: mainWindow title regex ^Fixture App$; processNames
+  // FixtureApp. Window 100 = main, 200 = settings (secondary).
+  const binding = launchFixture(1000, "100");
+  const runtime = makeRuntime({
+    windows: [
+      { hwnd: "100", title: "Fixture App", pid: 1000, processName: "FixtureApp" },
+      { hwnd: "200", title: "Settings", pid: 1000, processName: "FixtureApp" }
+    ],
+    // AFTER probe: hwnd 100 still alive.
+    aliveHwndsAfter: ["100"]
+  });
+  const result = await dispatchToolValue("click_window", { targetRef: binding.targetRef, x: 0, y: 0 }, runtime, {} as never);
+  assert.equal((result as Record<string, unknown>).clicked, true);
+  const rec = lastTargetOperation(binding.targetRef);
+  assert.ok(rec);
+  assert.equal(rec.after?.processAlive, true);
+  assert.equal(rec.after?.windowAlive, true);
+  assert.equal(rec.after?.hwnd, "100", "after hwnd stays the healthy main window");
+  assert.ok(rec.windowRebound === undefined || rec.windowRebound === false, "healthy main window must NOT rebind");
+  assert.equal(rec.result, "success");
+  // THE INVARIANT: a healthy operation never mutates binding.hwnd.
+  const bindingAfter = getTarget(binding.targetRef);
+  assert.ok(bindingAfter, "binding still registered");
+  assert.equal(bindingAfter.hwnd, "100", "binding.hwnd must stay 100");
+});
+
+test("rebind: old main gone; secondary listed FIRST + valid new main listed LAST -> binds the VALID main window", async () => {
+  resetTargetBindings();
+  const binding = launchFixture(1000, "100");
+  // AFTER probe: hwnd 100 is gone. listWindows intentionally returns the
+  // secondary window FIRST - the old first-different-hwnd algorithm would
+  // have bound 200 and this test would FAIL.
+  const runtime = makeRuntime({
+    aliveHwndsAfter: [], // 100 no longer alive
+    windows: [
+      { hwnd: "200", title: "Settings", pid: 1000, processName: "FixtureApp" },
+      { hwnd: "300", title: "Fixture App", pid: 1000, processName: "FixtureApp" }
+    ]
+  });
+  const result = await dispatchToolValue("click_window", { targetRef: binding.targetRef, x: 0, y: 0 }, runtime, {} as never);
+  assert.equal((result as Record<string, unknown>).clicked, true);
+  const rec = lastTargetOperation(binding.targetRef);
+  assert.ok(rec);
+  assert.equal(rec.after?.processAlive, true);
+  assert.equal(rec.after?.windowAlive, true);
+  assert.equal(rec.after?.hwnd, "300", "must rebind to the window matching the profile main-window rules, NOT the first different hwnd");
+  assert.equal(rec.windowRebound, true);
+  const bindingAfter = getTarget(binding.targetRef);
+  assert.ok(bindingAfter);
+  assert.equal(bindingAfter.hwnd, "300", "binding.hwnd must be the valid main window");
+});
+
+test("rebind: old main gone; only secondary windows exist -> NO rebind, window-lost-process-alive", async () => {
+  resetTargetBindings();
+  const binding = launchFixture(1000, "100");
+  const runtime = makeRuntime({
+    aliveHwndsAfter: [],
+    windows: [
+      { hwnd: "200", title: "Settings", pid: 1000, processName: "FixtureApp" },
+      { hwnd: "201", title: "Dialog", pid: 1000, processName: "FixtureApp" }
+    ]
+  });
+  const result = await dispatchToolValue("click_window", { targetRef: binding.targetRef, x: 0, y: 0 }, runtime, {} as never);
+  assert.equal((result as Record<string, unknown>).clicked, true);
+  const rec = lastTargetOperation(binding.targetRef);
+  assert.ok(rec);
+  assert.equal(rec.after?.processAlive, true);
+  assert.equal(rec.after?.windowAlive, false, "no valid main window -> window lost");
+  assert.ok(rec.windowRebound === undefined || rec.windowRebound === false, "secondary windows must never be bound");
+  assert.notEqual(rec.result, "target-disappeared");
+  assert.equal(rec.result, "success");
+  const bindingAfter = getTarget(binding.targetRef);
+  assert.ok(bindingAfter);
+  assert.equal(bindingAfter.hwnd, "100", "binding.hwnd must NOT be polluted with a secondary hwnd");
+});
+
+test("rebind: healthy window success must not even call the rebind helper", async () => {
+  resetTargetBindings();
+  const binding = launchFixture(1000, "100");
+  const runtime = makeRuntime({
+    windows: [
+      { hwnd: "100", title: "Fixture App", pid: 1000, processName: "FixtureApp" },
+      { hwnd: "200", title: "Settings", pid: 1000, processName: "FixtureApp" }
+    ],
+    aliveHwndsAfter: ["100"]
+  });
+  // Count listWindows calls: resolveTargetRef does not call it when the hwnd
+  // is valid, and a healthy finalize must not either.
+  let listCalls = 0;
+  const origList = (runtime.windows as unknown as { listWindows: () => unknown }).listWindows;
+  (runtime.windows as unknown as { listWindows: () => unknown }).listWindows = async () => {
+    listCalls++;
+    return origList();
+  };
+  const result = await dispatchToolValue("click_window", { targetRef: binding.targetRef, x: 0, y: 0 }, runtime, {} as never);
+  assert.equal((result as Record<string, unknown>).clicked, true);
+  assert.equal(listCalls, 0, "listWindows (the rebind helper's lookup) must not be called when the previous hwnd is healthy");
 });
