@@ -17,7 +17,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
-import { captureBackendToInteractionMethod, validateCaptureGeometry } from "../src/windows.js";
+import { captureBackendToInteractionMethod, printWindowRecoverySuggestion, validateCaptureGeometry } from "../src/windows.js";
 import { McpUiError } from "../src/uia/results.js";
 import { dispatchToolValue } from "../src/index.js";
 import { registry } from "../src/app-packs/registry.js";
@@ -296,4 +296,108 @@ test("backend E: profile default background + captureMethod=screen (no explicit 
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }
+});
+
+// ── Blank-frame branch: unified backend identity + recovery ──
+
+// Capture dispatch mock for the blank-frame scenario: the helper reports a
+// blank PrintWindow frame (blankFrame=true, captureBackend="print").
+function makeBlankRuntime() {
+  let probe = 0;
+  const windows = {
+    checkProcessAlive: async (input: { pid?: number; hwnd?: string | number }) => {
+      probe++;
+      const withHwnd = input.hwnd !== undefined;
+      const isAfter = probe >= 3;
+      return { pid: 1000, processAlive: true, windowAlive: isAfter ? (withHwnd ? true : false) : (withHwnd ? true : false) };
+    },
+    listWindows: async () => [],
+    getWindowState: async () => ({
+      hwnd: "100", title: "Fixture App", pid: 1000, processName: "FixtureApp", className: "Qt", visible: true,
+      minimized: false, maximized: false, foreground: false, enabled: true, topmost: false, cloaked: false,
+      timestamp: "t",
+      rect: { x: 0, y: 0, width: 1200, height: 800 }
+    }),
+    captureWindow: async (input: Record<string, unknown>, resolvedMode?: string) => {
+      // Mirror the REAL captureWindow blank-frame path.
+      void input;
+      const mode = resolvedMode ?? "auto";
+      throw new McpUiError(
+        "BACKGROUND_CAPTURE_UNAVAILABLE",
+        "PrintWindow produced a blank/fully-transparent frame; the window does not render in the background.",
+        {
+          requestedMode: mode,
+          effectiveMode: "background",
+          captureBackend: "print",
+          interactionMethod: "PrintWindow",
+          captureMethod: "PrintWindow",
+          foregroundChanged: false,
+          suggestedMode: "foregroundDemo"
+        },
+        printWindowRecoverySuggestion()
+      );
+    }
+  };
+  return {
+    version: "test",
+    schemas: {} as never,
+    windows: windows as never,
+    profiles: {} as never
+  };
+}
+
+test("blank-frame: BACKGROUND_CAPTURE_UNAVAILABLE carries backend identity and the shared PrintWindow recovery suggestion", async () => {
+  resetTargetBindings();
+  const binding = launchFixture();
+  const runtime = makeBlankRuntime();
+  let caught: unknown;
+  try {
+    await dispatchToolValue("capture_window", { targetRef: binding.targetRef, hwnd: 100, interactionMode: "background" }, runtime as never, {} as never);
+  } catch (error) {
+    caught = error;
+  }
+  assert.ok(caught instanceof McpUiError);
+  const err = caught as McpUiError;
+  assert.equal(err.code, "BACKGROUND_CAPTURE_UNAVAILABLE");
+  const details = err.details as Record<string, unknown>;
+  assert.equal(details.captureBackend, "print");
+  assert.equal(details.interactionMethod, "PrintWindow");
+  // Suggestion: same targetRef + screen + foregroundDemo (shared helper).
+  assert.match(err.suggestion ?? "", /same targetRef/);
+  assert.match(err.suggestion ?? "", /captureMethod="screen"/);
+  assert.match(err.suggestion ?? "", /interactionMode="foregroundDemo"/);
+  assert.ok(!/list_windows/.test(err.suggestion ?? ""), "suggestion must not direct to list_windows");
+  // Operation ring: business-error, errorCode, actual backend method.
+  const rec = lastTargetOperation(binding.targetRef);
+  assert.ok(rec);
+  assert.equal(rec.result, "business-error");
+  assert.equal(rec.errorCode, "BACKGROUND_CAPTURE_UNAVAILABLE");
+  assert.equal(rec.interactionMethod, "PrintWindow");
+});
+
+// ── outputSchema: captureBackend declared ──
+
+test("outputSchema: capture_window success accepts captureBackend=print and =screen", async () => {
+  const { contracts } = await import("../src/contracts.js");
+  const { validateAgainstSchema } = await import("../src/outputs.js");
+  const base = {
+    path: "C:/outputs/x.png",
+    width: 1200,
+    height: 800,
+    target: "Fixture",
+    rect: { x: 0, y: 0, width: 1200, height: 800 },
+    timestamp: "t",
+    interaction: {
+      requestedMode: "background",
+      effectiveMode: "background",
+      foregroundChanged: false,
+      targetActivated: false,
+      physicalCursorMoved: false,
+      method: "PrintWindow"
+    }
+  };
+  const print = validateAgainstSchema({ ...base, captureBackend: "print" }, contracts.capture_window!.outputSchema);
+  assert.ok(print.ok, `captureBackend=print must validate: ${print.ok ? "" : print.reason}`);
+  const screen = validateAgainstSchema({ ...base, captureBackend: "screen", interaction: { ...base.interaction, method: "CopyFromScreen" } }, contracts.capture_window!.outputSchema);
+  assert.ok(screen.ok, `captureBackend=screen must validate: ${screen.ok ? "" : screen.reason}`);
 });

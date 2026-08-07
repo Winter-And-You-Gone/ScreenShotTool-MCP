@@ -113,6 +113,16 @@ export function captureBackendToInteractionMethod(backend: CaptureBackend | unde
   return undefined;
 }
 
+// Recovery guidance for a PrintWindow (print backend) capture failure
+// (blank frame or implausible geometry). Shared by both failure branches so
+// the wording can never drift apart. Background mode intentionally forces
+// non-activating PrintWindow, so changing captureMethod alone is NOT
+// sufficient while the effective interactionMode remains background - the
+// recovery needs an EXPLICIT interactionMode=foregroundDemo.
+export function printWindowRecoverySuggestion(): string {
+  return 'Retry capture_window against the same targetRef with captureMethod="screen" and interactionMode="foregroundDemo" if visible-screen capture is acceptable. Background mode intentionally forces non-activating PrintWindow capture, so changing captureMethod alone is not sufficient while the effective interactionMode remains background.';
+}
+
 // ── Capture geometry validation ──
 //
 // For a FULL-WINDOW capture_window (no user region/crop), the server knows the
@@ -1397,6 +1407,10 @@ export async function captureWindow(input: CaptureWindowInput, resolvedMode?: In
 
   // background mode: a blank/fully-transparent frame is a failed background
   // capture - refuse with BACKGROUND_CAPTURE_UNAVAILABLE instead of saving it.
+  // The backend identity and recovery guidance are EXACTLY the same as the
+  // geometry-mismatch branch (shared helper): a blank PrintWindow frame is a
+  // print-backend failure, and recovery requires an explicit
+  // captureMethod="screen" AND interactionMode="foregroundDemo".
   if (isBackground && result.blankFrame === true) {
     throw new HelperError(
       "PrintWindow produced a blank/fully-transparent frame; the window does not render in the background.",
@@ -1404,10 +1418,13 @@ export async function captureWindow(input: CaptureWindowInput, resolvedMode?: In
       {
         requestedMode: mode,
         effectiveMode: "background",
-        captureMethod: actualInteractionMethod,
+        captureBackend: "print",
+        interactionMethod: "PrintWindow",
+        captureMethod: "PrintWindow",
         foregroundChanged,
         suggestedMode: "foregroundDemo"
-      }
+      },
+      printWindowRecoverySuggestion()
     );
   }
 
@@ -1452,11 +1469,12 @@ export async function captureWindow(input: CaptureWindowInput, resolvedMode?: In
     //  - print (PrintWindow) failed: background mode intentionally forces
     //    non-activating PrintWindow, so changing captureMethod alone is NOT
     //    sufficient while the effective interactionMode remains background.
-    //    Recovery needs an EXPLICIT interactionMode=foregroundDemo.
+    //    Recovery needs an EXPLICIT interactionMode=foregroundDemo (shared
+    //    helper with the blank-frame branch).
     //  - screen (CopyFromScreen) failed: never repeat the same screen
     //    fallback (dead loop); point at the diagnostics instead.
     const suggestion = actualBackend === "print"
-      ? 'Retry capture_window against the same targetRef with captureMethod="screen" and interactionMode="foregroundDemo" if visible-screen capture is acceptable. Background mode intentionally forces non-activating PrintWindow capture, so changing captureMethod alone is not sufficient while the effective interactionMode remains background.'
+      ? printWindowRecoverySuggestion()
       : "The screen capture backend failed for the resolved target. Inspect the returned target/window diagnostics before retrying.";
     throw new HelperError(
       "The captured image geometry does not plausibly match the resolved target window.",

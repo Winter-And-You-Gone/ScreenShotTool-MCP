@@ -342,7 +342,11 @@ const captureWindowOutput = withToolError(obj(
     rect: any(),
     timestamp: str(),
     interaction: interactionShape,
-    geometry: any()
+    geometry: any(),
+    // ACTUAL capture backend that executed (print = PrintWindow, screen =
+    // CopyFromScreen); may differ from the requested captureMethod when
+    // background mode forces print.
+    captureBackend: en(["print", "screen"])
   },
   ["path", "width", "height", "target", "rect", "timestamp", "interaction"]
 ));
