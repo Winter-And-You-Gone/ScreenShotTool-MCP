@@ -211,18 +211,25 @@ function makeRuntime(overrides: {
   const beforeWindow = overrides.windowAlive ?? true;
   const afterAlive = overrides.aliveAfter ?? beforeAlive;
   const afterWindow = overrides.windowAliveAfter ?? beforeWindow;
-  // Call sequence per dispatch: 1) resolveTargetRef hwnd check, 2) wrapper
-  // before probe, 3) wrapper after probe. Resolve must observe the BEFORE
-  // state or it would fail the operation before it starts.
+  // REAL helper semantics:
+  //  - windowAlive is only judged when a hwnd is passed (IsWindow on that
+  //    handle); WITHOUT a hwnd the helper reports windowAlive=false (it has
+  //    no window to judge).
+  //  - call sequence per dispatch: 1) resolveTargetRef hwnd check, 2) wrapper
+  //    BEFORE probe, 3) wrapper AFTER probe. The AFTER probe reflects the
+  //    after fixture state; the earlier calls the before fixture state.
+  // If the implementation regresses to dropping the hwnd from the AFTER
+  // probe, the healthy-window regression test FAILS (windowAlive=false).
   let calls = 0;
   const windows = {
-    checkProcessAlive: async () => {
+    checkProcessAlive: async (input: { pid?: number; hwnd?: string | number }) => {
       calls++;
+      const withHwnd = input.hwnd !== undefined;
       const isAfter = calls >= 3;
       return {
         pid: 4242,
         processAlive: isAfter ? afterAlive : beforeAlive,
-        windowAlive: isAfter ? afterWindow : beforeWindow
+        windowAlive: isAfter ? (withHwnd ? afterWindow : false) : (withHwnd ? beforeWindow : false)
       };
     },
     listWindows: async () => overrides.windows ?? [],
@@ -472,4 +479,86 @@ test("wrapper: startedByMcp and lifetime are separate on bindings", async () => 
   // An independent target is NOT a managed child: nothing anywhere marks it
   // as server-owned for cleanup.
   assert.notEqual(binding.lifetime, "managed");
+});
+
+// ── AFTER-window diagnostics regression (the BEFORE hwnd MUST be passed to
+// the AFTER probe) ──
+
+test("regression: healthy window keeps after.windowAlive=true (AFTER probe passes the previous hwnd)", async () => {
+  resetTargetBindings();
+  const binding = launchFixture(1000, "100");
+  const runtime = makeRuntime({});
+  const result = await dispatchToolValue("click_window", { targetRef: binding.targetRef, x: 0, y: 0 }, runtime, {} as never);
+  assert.equal((result as Record<string, unknown>).clicked, true);
+  const rec = lastTargetOperation(binding.targetRef);
+  assert.ok(rec);
+  // before hwnd=100; after probe receives the SAME hwnd -> windowAlive=true.
+  assert.equal(rec.before?.hwnd, "100");
+  assert.equal(rec.after?.processAlive, true);
+  assert.equal(rec.after?.windowAlive, true, "healthy window must NOT be recorded as windowAlive=false");
+  assert.equal(rec.after?.hwnd, "100");
+  assert.ok(rec.windowRebound === undefined || rec.windowRebound === false, "no rebind when the old hwnd is still valid");
+  assert.equal(rec.result, "success");
+});
+
+test("regression: window recreated -> after.windowAlive=true with the NEW hwnd, windowRebound=true", async () => {
+  resetTargetBindings();
+  const binding = launchFixture(1000, "100");
+  const runtime = makeRuntime({
+    aliveAfter: true,
+    windowAliveAfter: false,
+    windows: [{ hwnd: "200", title: "Fixture App", pid: 1000, processName: "FixtureApp" }]
+  });
+  const result = await dispatchToolValue("click_window", { targetRef: binding.targetRef, x: 0, y: 0 }, runtime, {} as never);
+  assert.equal((result as Record<string, unknown>).clicked, true);
+  const rec = lastTargetOperation(binding.targetRef);
+  assert.ok(rec);
+  assert.equal(rec.after?.processAlive, true);
+  assert.equal(rec.after?.windowAlive, true, "rebound session is alive with a window");
+  assert.equal(rec.after?.hwnd, "200");
+  assert.equal(rec.windowRebound, true);
+  assert.equal(rec.result, "success");
+});
+
+test("regression: window lost but process alive and no rebind -> windowAlive=false, processAlive=true (NOT target-disappeared)", async () => {
+  resetTargetBindings();
+  const binding = launchFixture(1000, "100");
+  const runtime = makeRuntime({
+    aliveAfter: true,
+    windowAliveAfter: false,
+    windows: [] // no window matches -> no rebind
+  });
+  const result = await dispatchToolValue("click_window", { targetRef: binding.targetRef, x: 0, y: 0 }, runtime, {} as never);
+  assert.equal((result as Record<string, unknown>).clicked, true);
+  const rec = lastTargetOperation(binding.targetRef);
+  assert.ok(rec);
+  assert.equal(rec.after?.processAlive, true);
+  assert.equal(rec.after?.windowAlive, false);
+  assert.ok(rec.windowRebound === undefined || rec.windowRebound === false, "no rebind when no window matches");
+  // A windowless-but-alive process is NOT a disappearance.
+  assert.notEqual(rec.result, "target-disappeared");
+  assert.equal(rec.result, "success");
+});
+
+test("regression: process exited -> target-disappeared keeps exit diagnostics", async () => {
+  resetTargetBindings();
+  const binding = launchFixture(1000, "100");
+  const runtime = makeRuntime({
+    aliveAfter: false,
+    windowAliveAfter: false,
+    captureError: new McpUiError("TARGET_WINDOW_NOT_READY", "capture failed")
+  });
+  let caught: unknown;
+  try {
+    await dispatchToolValue("capture_window", { targetRef: binding.targetRef }, runtime, {} as never);
+  } catch (error) {
+    caught = error;
+  }
+  assert.ok(caught instanceof McpUiError);
+  assert.equal((caught as McpUiError).code, "TARGET_WINDOW_NOT_READY", "original business error survives diagnostics");
+  const rec = lastTargetOperation(binding.targetRef);
+  assert.ok(rec);
+  assert.equal(rec.result, "target-disappeared");
+  assert.equal(rec.after?.processAlive, false);
+  assert.equal(rec.errorCode, "TARGET_WINDOW_NOT_READY");
 });

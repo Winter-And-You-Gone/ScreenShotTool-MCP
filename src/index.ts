@@ -1131,18 +1131,34 @@ async function finalizeOperationRecord(
 
   // Best-effort AFTER state; a probe failure must never mask the original
   // operation outcome (error or success).
+  //
+  // The AFTER probe MUST pass the previous hwnd: without a hwnd the Windows
+  // helper cannot judge whether the specific window is still alive and would
+  // report windowAlive=false for a perfectly healthy target. The previous
+  // hwnd is the BEFORE hwnd when recorded, else the resolved target hwnd.
+  const previousHwnd = record.before?.hwnd;
   let after: { processAlive?: boolean; windowAlive?: boolean; hwnd?: string } = {};
+  let afterDiagnosticsAvailable = false;
   if (pid !== undefined) {
     try {
-      const state = await runtime.windows.checkProcessAlive({ pid });
+      const state = await runtime.windows.checkProcessAlive({
+        pid,
+        ...(previousHwnd !== undefined ? { hwnd: previousHwnd } : {})
+      });
+      afterDiagnosticsAvailable = true;
       after = {
         ...(state.processAlive !== undefined ? { processAlive: state.processAlive } : {}),
         ...(state.windowAlive !== undefined ? { windowAlive: state.windowAlive } : {}),
-        ...(record.before?.hwnd !== undefined && state.windowAlive ? { hwnd: record.before.hwnd } : {})
+        ...(previousHwnd !== undefined && state.windowAlive ? { hwnd: previousHwnd } : {})
       };
     } catch {
-      // diagnosticsUnavailable: after stays empty.
+      // diagnosticsUnavailable: after stays empty; the original outcome wins.
     }
+  }
+  // Diagnostics may be unavailable (probe threw) - record that fact instead
+  // of fabricating an empty after state. Never promoted to the main error.
+  if (!afterDiagnosticsAvailable) {
+    record.afterDiagnosticsAvailable = false;
   }
 
   record.finishedAt = Date.now();
@@ -1157,7 +1173,7 @@ async function finalizeOperationRecord(
     if (rebound) {
       record.result = "success";
       record.windowRebound = true;
-      record.after = { ...after, hwnd: rebound };
+      record.after = { ...after, hwnd: rebound, windowAlive: true };
     } else {
       record.result = "success";
       record.after = after;
@@ -1179,7 +1195,7 @@ async function finalizeOperationRecord(
       if (rebound) {
         record.result = "business-error";
         record.windowRebound = true;
-        record.after = { ...after, hwnd: rebound };
+        record.after = { ...after, hwnd: rebound, windowAlive: true };
         return;
       }
     }

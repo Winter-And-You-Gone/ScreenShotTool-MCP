@@ -57,6 +57,10 @@ export type TargetOperationRecord = {
   // session stayed alive and rebound to a new window. NEVER treated as
   // target-disappeared: the target session is still alive.
   windowRebound?: boolean;
+  // Present only when the AFTER lifecycle probe itself failed (diagnostics
+  // unavailable). The original operation outcome is never replaced by a
+  // diagnostics failure.
+  afterDiagnosticsAvailable?: boolean;
   result:
     | "success"
     | "business-error"
