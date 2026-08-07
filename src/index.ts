@@ -24,10 +24,10 @@ import {
   autoResolveTarget,
   bindLaunchTarget,
   getTarget,
-  lastTargetOperation,
   recordTargetOperation,
   resolveTargetRef,
-  type TargetBinding
+  type TargetBinding,
+  type TargetOperationRecord
 } from "./targets.js";
 import { getContract, contracts, toMcpToolDefinition } from "./contracts.js";
 import { executeValidatedTool, type ToolExecutorContext } from "./executor.js";
@@ -674,7 +674,10 @@ async function profileRunStepsTool(args: unknown, runtime: RuntimeModules, uiaDe
       waitForWindow: i.waitForWindow ?? true,
       noActivate: i.noActivate ?? true,
       startMinimized: i.startMinimized ?? false,
-      timeoutMs: i.timeoutMs ?? 30000
+      timeoutMs: i.timeoutMs ?? 30000,
+      // profile_run_steps launches the app the pipeline will operate on: it
+      // must survive the MCP server (independent by default).
+      lifetime: i.lifetime ?? "independent"
     }),
     runtime.windows.listWindows,
     {
@@ -1002,41 +1005,228 @@ async function resolveLaunchedExePath(
 // sensitive data (passwords, tokens, full text input, screenshot images).
 // The ring feeds TARGET_PROCESS_EXITED diagnostics: `lastOperation` is
 // temporal context, never a causality claim.
+//
+// This is the SINGLE wrapper for every targetRef-aware operation: the record
+// is created BEFORE the operation starts (so a throw always yields a record)
+// and finalized AFTER, with best-effort before/after lifecycle state. The
+// caller extracts safe interaction metadata via the context (never by
+// hand-writing a second record - exactly one record per operation).
+//
+// Classification:
+//   success             - operation completed; after state still alive.
+//   business-error      - structured business failure (ELEMENT_NOT_FOUND,
+//                         ACTION_STATE_INCONSISTENT, ...) while the target
+//                         session is still alive (or window rebound).
+//   protocol-error      - non-target internal/input error; the target was
+//                         alive before and cannot be confirmed dead.
+//   target-disappeared  - the target process was alive before and is gone
+//                         after. The ORIGINAL error is rethrown unchanged.
+// A before/after state probe that itself fails NEVER overrides the original
+// operation error - diagnostics are best-effort.
+
+// Central registry of operation-tracked tools. Every tool that (a) accepts a
+// targetRef AND (b) reads/operates the target window/process MUST be listed
+// here so the coverage test can prove the dispatch wiring never regresses to
+// untracked. Tools that accept targetRef but are deliberately untracked (pure
+// metadata/schema queries) are listed in the coverage test as
+// intentionally-untracked.
+export const TARGET_OPERATION_TOOLS = new Set([
+  "capture_window",
+  "click_window",
+  "move_mouse_window",
+  "click_menu_item",
+  "type_text",
+  "send_key",
+  "get_window_state",
+  "wait_for_window",
+  "ui_inspect_tree",
+  "ui_query",
+  "ui_get",
+  "ui_action",
+  "ui_wait",
+  "profile_resolve",
+  "profile_action",
+  "ui_catalog"
+]);
+
+type TargetOperationCtx = {
+  // Safe interaction metadata (method names like InvokePattern, PrintWindow,
+  // post_message). NEVER user data.
+  setInteractionMethod(method: string | undefined): void;
+};
 
 async function withTargetOperation<T>(
   tool: string,
   input: { targetRef?: string },
   runtime: RuntimeModules,
-  run: (resolved: ResolvedTarget) => Promise<T>
+  run: (resolved: ResolvedTarget, ctx: TargetOperationCtx) => Promise<T>
 ): Promise<T> {
   const { targetRef } = input;
   const resolved = await resolveTargetInput(input, runtime);
   if (!targetRef) {
-    return run(resolved);
+    // No session identity: nothing to correlate, run untracked (identical to
+    // the previous behavior). The per-target ring only exists for bound
+    // targetRefs.
+    return run(resolved, { setInteractionMethod: () => undefined });
   }
-  const targetMeta = resolved.targetMeta?.target as { targetRef?: string; pid?: number; hwnd?: string } | undefined;
-  recordTargetOperation(targetRef, {
+
+  const binding = getTarget(targetRef);
+  const targetMeta = resolved.targetMeta?.target as { targetRef?: string; pid?: number; hwnd?: string; rebound?: boolean; previousHwnd?: string } | undefined;
+  const pid = targetMeta?.pid ?? binding?.pid;
+
+  // Best-effort BEFORE state. Never throws into the caller.
+  let before: { processAlive?: boolean; windowAlive?: boolean; hwnd?: string } = {};
+  if (pid !== undefined) {
+    try {
+      const state = await runtime.windows.checkProcessAlive({ pid, ...(targetMeta?.hwnd ? { hwnd: targetMeta.hwnd } : {}) });
+      before = {
+        ...(state.processAlive !== undefined ? { processAlive: state.processAlive } : {}),
+        ...(state.windowAlive !== undefined ? { windowAlive: state.windowAlive } : {}),
+        ...(targetMeta?.hwnd ? { hwnd: String(targetMeta.hwnd) } : {})
+      };
+    } catch {
+      before = { ...(targetMeta?.hwnd ? { hwnd: String(targetMeta.hwnd) } : {}) };
+    }
+  }
+
+  const record = recordTargetOperation(targetRef, {
     tool,
     startedAt: Date.now(),
-    before: { processAlive: true, windowAlive: true, ...(targetMeta?.hwnd ? { hwnd: String(targetMeta.hwnd) } : {}) },
-    result: "success"
+    ...(Object.keys(before).length > 0 ? { before } : {})
   });
+
+  let interactionMethod: string | undefined;
+  const ctx: TargetOperationCtx = {
+    setInteractionMethod: (method) => { interactionMethod = method; }
+  };
+
   try {
-    const result = await run(resolved);
-    const op = lastTargetOperation(targetRef);
-    if (op && op.tool === tool && op.finishedAt === undefined) {
-      op.finishedAt = Date.now();
-      op.result = "success";
-    }
+    const result = await run(resolved, ctx);
+    await finalizeOperationRecord(runtime, record, tool, targetRef, pid, {
+      interactionMethod,
+      before,
+      error: undefined
+    });
     return result;
   } catch (error) {
-    const op = lastTargetOperation(targetRef);
-    if (op && op.tool === tool && op.finishedAt === undefined) {
-      op.finishedAt = Date.now();
-      op.result = error instanceof McpUiError ? "business-error" : "protocol-error";
-    }
+    await finalizeOperationRecord(runtime, record, tool, targetRef, pid, {
+      interactionMethod,
+      before,
+      error
+    });
+    // The ORIGINAL error is always rethrown - diagnostics never replace it.
     throw error;
   }
+}
+
+async function finalizeOperationRecord(
+  runtime: RuntimeModules,
+  record: TargetOperationRecord | undefined,
+  tool: string,
+  targetRef: string,
+  pid: number | undefined,
+  opts: { interactionMethod?: string; before?: TargetOperationRecord["before"]; error: unknown }
+): Promise<void> {
+  if (!record) return;
+
+  // Best-effort AFTER state; a probe failure must never mask the original
+  // operation outcome (error or success).
+  let after: { processAlive?: boolean; windowAlive?: boolean; hwnd?: string } = {};
+  if (pid !== undefined) {
+    try {
+      const state = await runtime.windows.checkProcessAlive({ pid });
+      after = {
+        ...(state.processAlive !== undefined ? { processAlive: state.processAlive } : {}),
+        ...(state.windowAlive !== undefined ? { windowAlive: state.windowAlive } : {}),
+        ...(record.before?.hwnd !== undefined && state.windowAlive ? { hwnd: record.before.hwnd } : {})
+      };
+    } catch {
+      // diagnosticsUnavailable: after stays empty.
+    }
+  }
+
+  record.finishedAt = Date.now();
+  if (opts.interactionMethod) record.interactionMethod = opts.interactionMethod;
+
+  const err = opts.error;
+  if (err === undefined) {
+    // Success: if the before hwnd went stale but the process survived and a
+    // new window can be resolved, the session is still alive - record the
+    // rebound, never a disappearance.
+    const rebound = await captureRebound(runtime, record, tool, targetRef, pid, after);
+    if (rebound) {
+      record.result = "success";
+      record.windowRebound = true;
+      record.after = { ...after, hwnd: rebound };
+    } else {
+      record.result = "success";
+      record.after = after;
+    }
+    return;
+  }
+
+  if (err instanceof McpUiError) {
+    record.errorCode = err.code;
+    if (after.processAlive === false) {
+      record.result = "target-disappeared";
+      record.after = after;
+      return;
+    }
+    // Window lost but the process is alive: check whether the target session
+    // rebound to a new window - that is NOT a disappearance.
+    if (after.processAlive === true && after.windowAlive === false) {
+      const rebound = await captureRebound(runtime, record, tool, targetRef, pid, after);
+      if (rebound) {
+        record.result = "business-error";
+        record.windowRebound = true;
+        record.after = { ...after, hwnd: rebound };
+        return;
+      }
+    }
+    record.result = "business-error";
+    record.after = after;
+    return;
+  }
+
+  // Non-structured error: internal/protocol. Only classify as
+  // target-disappeared when the process was alive before and is provably dead
+  // after; otherwise protocol-error.
+  if (opts.before?.processAlive === true && after.processAlive === false) {
+    record.result = "target-disappeared";
+    record.after = after;
+    return;
+  }
+  record.result = "protocol-error";
+  record.after = after;
+}
+
+// Re-resolve the main window when the before hwnd went stale but the process
+// survived. Returns the new hwnd, or undefined when no window matches right
+// now. Best-effort: never throws into the record finalization.
+async function captureRebound(
+  runtime: RuntimeModules,
+  record: TargetOperationRecord,
+  tool: string,
+  targetRef: string,
+  pid: number | undefined,
+  after: { processAlive?: boolean; windowAlive?: boolean; hwnd?: string }
+): Promise<string | undefined> {
+  if (pid === undefined) return undefined;
+  const binding = getTarget(targetRef);
+  if (!binding) return undefined;
+  if (record.before?.hwnd === undefined) return undefined;
+  try {
+    const windows = await runtime.windows.listWindows({ pid });
+    const matched = windows.find((w: { hwnd: string }) => w.hwnd !== record.before!.hwnd);
+    if (matched) {
+      binding.hwnd = matched.hwnd;
+      binding.lastResolvedAt = Date.now();
+      return matched.hwnd;
+    }
+  } catch {
+    // best-effort
+  }
+  return undefined;
 }
 
 // Large-tree output guard: results that would flood the client are refused
@@ -1069,7 +1259,8 @@ function mergeTargetMeta(result: Record<string, unknown>, targetMeta: Record<str
   return out;
 }
 
-async function dispatchToolValue(
+// Exported for the operation-wrapper tests (test-only hook; not an MCP tool).
+export async function dispatchToolValue(
   name: string,
   input: unknown,
   runtime: RuntimeModules,
@@ -1110,14 +1301,22 @@ async function dispatchToolValue(
       // Interaction mode: explicit > pack default (matched by process name /
       // title) > auto. capture_window itself never hardcodes any app.
       const captureInput = input as import("./schemas.js").CaptureWindowInput;
-      const resolved = await resolveTargetInput(captureInput, runtime);
-      const targetProfile = profiles.findProfileForTarget({ processName: resolved.windowSel.processName, titleContains: resolved.windowSel.titleContains });
-      const captureMode: InteractionMode = resolveInteractionMode({
-        explicit: captureInput.interactionMode,
-        packDefault: targetProfile?.interaction?.defaultMode
-      });
-      const captureResult = await windows.captureWindow({ ...captureInput, ...resolved.windowSel }, captureMode);
-      return resolved.targetMeta ? mergeTargetMeta(captureResult as unknown as Record<string, unknown>, resolved.targetMeta) : captureResult;
+      return await withTargetOperation(
+        "capture_window",
+        captureInput,
+        runtime,
+        async (resolved, ctx) => {
+          const targetProfile = profiles.findProfileForTarget({ processName: resolved.windowSel.processName, titleContains: resolved.windowSel.titleContains });
+          const captureMode: InteractionMode = resolveInteractionMode({
+            explicit: captureInput.interactionMode,
+            packDefault: targetProfile?.interaction?.defaultMode
+          });
+          const captureResult = await windows.captureWindow({ ...captureInput, ...resolved.windowSel }, captureMode);
+          // Safe interaction metadata (e.g. PrintWindow) for the ring.
+          ctx.setInteractionMethod(captureResult.interaction?.method);
+          return resolved.targetMeta ? mergeTargetMeta(captureResult as unknown as Record<string, unknown>, resolved.targetMeta) : captureResult;
+        }
+      );
     }
     case "capture_screen_region":
       return await windows.captureScreenRegion(input as import("./schemas.js").CaptureScreenRegionInput);
@@ -1127,35 +1326,70 @@ async function dispatchToolValue(
       // stale hwnd never forces a manual relaunch. This is lifecycle
       // consistency, not an encouragement of coordinate fallbacks.
       const clickInput = input as import("./schemas.js").ClickWindowInput;
-      const resolved = await resolveTargetInput(clickInput, runtime);
-      const clickResult = await windows.clickWindow({ ...clickInput, ...resolved.windowSel });
-      return resolved.targetMeta ? { ...clickResult, ...resolved.targetMeta } : clickResult;
+      return await withTargetOperation(
+        "click_window",
+        clickInput,
+        runtime,
+        async (resolved, ctx) => {
+          const clickResult = await windows.clickWindow({ ...clickInput, ...resolved.windowSel });
+          ctx.setInteractionMethod(clickResult.method);
+          return resolved.targetMeta ? { ...clickResult, ...resolved.targetMeta } : clickResult;
+        }
+      );
     }
     case "click_menu_item": {
       const menuInput = input as import("./schemas.js").ClickMenuItemInput;
-      const resolved = await resolveTargetInput(menuInput, runtime);
-      const menuResult = await windows.clickMenuItem({ ...menuInput, ...resolved.windowSel });
-      return resolved.targetMeta ? { ...menuResult, ...resolved.targetMeta } : menuResult;
+      return await withTargetOperation(
+        "click_menu_item",
+        menuInput,
+        runtime,
+        async (resolved, ctx) => {
+          const menuResult = await windows.clickMenuItem({ ...menuInput, ...resolved.windowSel });
+          ctx.setInteractionMethod(menuResult.method);
+          return resolved.targetMeta ? { ...menuResult, ...resolved.targetMeta } : menuResult;
+        }
+      );
     }
     case "move_mouse_window": {
       const moveInput = input as import("./schemas.js").MoveMouseWindowInput;
-      const resolved = await resolveTargetInput(moveInput, runtime);
-      const moveResult = await windows.moveMouseWindow({ ...moveInput, ...resolved.windowSel });
-      return resolved.targetMeta ? { ...moveResult, ...resolved.targetMeta } : moveResult;
+      return await withTargetOperation(
+        "move_mouse_window",
+        moveInput,
+        runtime,
+        async (resolved, ctx) => {
+          const moveResult = await windows.moveMouseWindow({ ...moveInput, ...resolved.windowSel });
+          ctx.setInteractionMethod(moveResult.method);
+          return resolved.targetMeta ? { ...moveResult, ...resolved.targetMeta } : moveResult;
+        }
+      );
     }
     case "close_app":
       return await windows.closeApp((input as import("./schemas.js").CloseAppInput).pid);
     case "type_text": {
       const typeInput = input as import("./schemas.js").TypeTextInput;
-      const resolved = await resolveTargetInput(typeInput, runtime);
-      const typeResult = await windows.typeText({ ...typeInput, ...resolved.windowSel });
-      return resolved.targetMeta ? { ...typeResult, ...resolved.targetMeta } : typeResult;
+      return await withTargetOperation(
+        "type_text",
+        typeInput,
+        runtime,
+        async (resolved, ctx) => {
+          const typeResult = await windows.typeText({ ...typeInput, ...resolved.windowSel });
+          ctx.setInteractionMethod("post_message");
+          return resolved.targetMeta ? { ...typeResult, ...resolved.targetMeta } : typeResult;
+        }
+      );
     }
     case "send_key": {
       const keyInput = input as import("./schemas.js").SendKeyInput;
-      const resolved = await resolveTargetInput(keyInput, runtime);
-      const keyResult = await windows.sendKey({ ...keyInput, ...resolved.windowSel });
-      return resolved.targetMeta ? { ...keyResult, ...resolved.targetMeta } : keyResult;
+      return await withTargetOperation(
+        "send_key",
+        keyInput,
+        runtime,
+        async (resolved, ctx) => {
+          const keyResult = await windows.sendKey({ ...keyInput, ...resolved.windowSel });
+          ctx.setInteractionMethod("post_message");
+          return resolved.targetMeta ? { ...keyResult, ...resolved.targetMeta } : keyResult;
+        }
+      );
     }
     case "read_clipboard":
       return await windows.readClipboard(input as import("./schemas.js").ReadClipboardInput);
@@ -1163,78 +1397,121 @@ async function dispatchToolValue(
       return await windows.writeClipboard(input as import("./schemas.js").WriteClipboardInput);
     case "get_window_state": {
       const stateInput = input as import("./schemas.js").GetWindowStateInput;
-      const resolved = await resolveTargetInput(stateInput, runtime);
-      const stateResult = await windows.getWindowState({ ...stateInput, ...resolved.windowSel });
-      return resolved.targetMeta ? { ...stateResult, ...resolved.targetMeta } : stateResult;
+      return await withTargetOperation(
+        "get_window_state",
+        stateInput,
+        runtime,
+        async (resolved) => {
+          const stateResult = await windows.getWindowState({ ...stateInput, ...resolved.windowSel });
+          return resolved.targetMeta ? { ...stateResult, ...resolved.targetMeta } : stateResult;
+        }
+      );
     }
     case "wait_for_window": {
       const waitInput = input as import("./schemas.js").WaitForWindowInput;
-      const resolved = await resolveTargetInput(waitInput, runtime);
-      const waitResult = await windows.waitForWindow({ ...waitInput, ...resolved.windowSel });
-      return resolved.targetMeta ? { ...waitResult, ...resolved.targetMeta } : waitResult;
+      return await withTargetOperation(
+        "wait_for_window",
+        waitInput,
+        runtime,
+        async (resolved) => {
+          const waitResult = await windows.waitForWindow({ ...waitInput, ...resolved.windowSel });
+          return resolved.targetMeta ? { ...waitResult, ...resolved.targetMeta } : waitResult;
+        }
+      );
     }
     case "ui_inspect_tree": {
       const treeInput = input as import("./schemas.js").UiInspectTreeInput;
-      const resolved = await resolveTargetInput(treeInput, runtime);
-      const treeResult = await windows.inspectUiTree({ ...treeInput, ...resolved.windowSel });
-      guardLargeTreeResult(treeResult.nodes, "ui_inspect_tree");
-      return resolved.targetMeta ? { ...treeResult, ...resolved.targetMeta } : treeResult;
+      return await withTargetOperation(
+        "ui_inspect_tree",
+        treeInput,
+        runtime,
+        async (resolved, ctx) => {
+          const treeResult = await windows.inspectUiTree({ ...treeInput, ...resolved.windowSel });
+          guardLargeTreeResult(treeResult.nodes, "ui_inspect_tree");
+          ctx.setInteractionMethod("UIAQuery");
+          return resolved.targetMeta ? { ...treeResult, ...resolved.targetMeta } : treeResult;
+        }
+      );
     }
     case "ui_query": {
       const queryInput = input as import("./schemas.js").UiQueryInput;
-      const resolved = await resolveTargetInput(queryInput, runtime);
-      const queryResult = await windows.queryUi({ ...queryInput, ...resolved.windowSel });
-      if (queryInput.targetRef) {
-        recordTargetOperation(queryInput.targetRef, {
-          tool: "ui_query",
-          startedAt: Date.now(),
-          finishedAt: Date.now(),
-          interactionMethod: "UIAQuery",
-          result: "success"
-        });
-      }
-      return resolved.targetMeta ? { ...queryResult, ...resolved.targetMeta } : queryResult;
+      return await withTargetOperation(
+        "ui_query",
+        queryInput,
+        runtime,
+        async (resolved, ctx) => {
+          const queryResult = await windows.queryUi({ ...queryInput, ...resolved.windowSel });
+          ctx.setInteractionMethod("UIAQuery");
+          return resolved.targetMeta ? { ...queryResult, ...resolved.targetMeta } : queryResult;
+        }
+      );
     }
     case "ui_get": {
       const getInput = input as import("./schemas.js").UiGetInput;
-      const resolved = await resolveTargetInput(getInput, runtime);
-      const getResult = await windows.getUiElement({ ...getInput, ...resolved.windowSel });
-      return resolved.targetMeta ? { ...getResult, ...resolved.targetMeta } : getResult;
+      return await withTargetOperation(
+        "ui_get",
+        getInput,
+        runtime,
+        async (resolved, ctx) => {
+          const getResult = await windows.getUiElement({ ...getInput, ...resolved.windowSel });
+          ctx.setInteractionMethod("UIAQuery");
+          return resolved.targetMeta ? { ...getResult, ...resolved.targetMeta } : getResult;
+        }
+      );
     }
     case "ui_action": {
       const actionInput = input as import("./schemas.js").UiActionInput;
-      const resolved = await resolveTargetInput(actionInput, runtime);
-      const actionResult = await windows.performUiAction({ ...actionInput, ...resolved.windowSel });
-      return resolved.targetMeta ? { ...actionResult, ...resolved.targetMeta } : actionResult;
+      return await withTargetOperation(
+        "ui_action",
+        actionInput,
+        runtime,
+        async (resolved, ctx) => {
+          const actionResult = await windows.performUiAction({ ...actionInput, ...resolved.windowSel });
+          ctx.setInteractionMethod(actionResult.method);
+          return resolved.targetMeta ? { ...actionResult, ...resolved.targetMeta } : actionResult;
+        }
+      );
     }
     case "ui_wait": {
       const waitInput = input as import("./schemas.js").UiWaitInput;
-      const resolved = await resolveTargetInput(waitInput, runtime);
-      const waitResult = await windows.waitForUi({ ...waitInput, ...resolved.windowSel });
-      return resolved.targetMeta ? { ...waitResult, ...resolved.targetMeta } : waitResult;
+      return await withTargetOperation(
+        "ui_wait",
+        waitInput,
+        runtime,
+        async (resolved, ctx) => {
+          const waitResult = await windows.waitForUi({ ...waitInput, ...resolved.windowSel });
+          ctx.setInteractionMethod("UIAQuery");
+          return resolved.targetMeta ? { ...waitResult, ...resolved.targetMeta } : waitResult;
+        }
+      );
     }
     case "profile_list":
       return profiles.profileList();
     case "profile_resolve": {
       const resolveInput = input as import("./schemas.js").ProfileResolveInput;
-      const resolved = await resolveTargetInput(resolveInput, runtime);
-      const resolveResult = await profiles.resolveProfileControl(uiaDeps, { ...resolveInput, ...resolved.windowSel });
-      return resolved.targetMeta ? { ...resolveResult, ...resolved.targetMeta } : resolveResult;
+      return await withTargetOperation(
+        "profile_resolve",
+        resolveInput,
+        runtime,
+        async (resolved, ctx) => {
+          const resolveResult = await profiles.resolveProfileControl(uiaDeps, { ...resolveInput, ...resolved.windowSel });
+          ctx.setInteractionMethod("UIAQuery");
+          return resolved.targetMeta ? { ...resolveResult, ...resolved.targetMeta } : resolveResult;
+        }
+      );
     }
     case "profile_action": {
       const actionInput = input as import("./schemas.js").ProfileActionInput;
-      const resolved = await resolveTargetInput(actionInput, runtime);
-      const actionResult = await profiles.performProfileAction(uiaDeps, { ...actionInput, ...resolved.windowSel });
-      if (actionInput.targetRef) {
-        recordTargetOperation(actionInput.targetRef, {
-          tool: "profile_action",
-          startedAt: Date.now(),
-          finishedAt: Date.now(),
-          interactionMethod: (actionResult.interaction?.method) as string | undefined,
-          result: "success"
-        });
-      }
-      return resolved.targetMeta ? { ...actionResult, ...resolved.targetMeta } : actionResult;
+      return await withTargetOperation(
+        "profile_action",
+        actionInput,
+        runtime,
+        async (resolved, ctx) => {
+          const actionResult = await profiles.performProfileAction(uiaDeps, { ...actionInput, ...resolved.windowSel });
+          ctx.setInteractionMethod(actionResult.interaction?.method);
+          return resolved.targetMeta ? { ...actionResult, ...resolved.targetMeta } : actionResult;
+        }
+      );
     }
     case "profile_launch": {
       const launchInput = input as import("./schemas.js").ProfileLaunchInput;
@@ -1246,7 +1523,10 @@ async function dispatchToolValue(
           waitForWindow: i.waitForWindow ?? true,
           noActivate: i.noActivate ?? true,
           startMinimized: i.startMinimized ?? false,
-          timeoutMs: i.timeoutMs ?? 30000
+          timeoutMs: i.timeoutMs ?? 30000,
+          // profile_launch launches desktop apps the user wants to operate:
+          // the app must survive the MCP server (independent by default).
+          lifetime: i.lifetime ?? "independent"
         }),
         windows.listWindows,
         launchInput,
@@ -1265,7 +1545,11 @@ async function dispatchToolValue(
         pid: launchResult.pid,
         ...(launchResult.hwnd ? { hwnd: launchResult.hwnd } : {}),
         ...(launchResult.title ? { title: launchResult.title } : {}),
-        ...(launchResult.startedByMcp ? { startedByMcp: true, startedAt: Date.now() } : {})
+        // startedByMcp and lifetime are SEPARATE concepts: a process can be
+        // started by the MCP server yet be independent of its lifetime (the
+        // profile_launch default). lifetime records the launch contract.
+        ...(launchResult.startedByMcp ? { startedByMcp: true, startedAt: Date.now() } : {}),
+        ...(launchResult.lifetime ? { lifetime: launchResult.lifetime } : {})
       });
       // OPTIONAL App Pack ↔ EXE compatibility check. A mismatch is a WARNING
       // (never a launch block): layout changes do not necessarily invalidate
@@ -1285,14 +1569,21 @@ async function dispatchToolValue(
     }
     case "ui_catalog": {
       const catInput = input as import("./schemas.js").UiCatalogInput;
-      const resolved = await resolveTargetInput(catInput, runtime);
-      const catalog = await windows.catalogUi({ ...catInput, ...resolved.windowSel });
-      guardLargeTreeResult(catalog.controls, "ui_catalog");
-      const profile = profiles.findProfileForTarget({ processName: resolved.windowSel.processName, titleContains: resolved.windowSel.titleContains });
-      if (!catInput.summaryOnly) {
-        catalog.controls = profiles.enrichCatalogControls(profile, catalog.controls);
-      }
-      return resolved.targetMeta ? { ...catalog, ...resolved.targetMeta } : catalog;
+      return await withTargetOperation(
+        "ui_catalog",
+        catInput,
+        runtime,
+        async (resolved, ctx) => {
+          const catalog = await windows.catalogUi({ ...catInput, ...resolved.windowSel });
+          guardLargeTreeResult(catalog.controls, "ui_catalog");
+          ctx.setInteractionMethod("UIAQuery");
+          const profile = profiles.findProfileForTarget({ processName: resolved.windowSel.processName, titleContains: resolved.windowSel.titleContains });
+          if (!catInput.summaryOnly) {
+            catalog.controls = profiles.enrichCatalogControls(profile, catalog.controls);
+          }
+          return resolved.targetMeta ? { ...catalog, ...resolved.targetMeta } : catalog;
+        }
+      );
     }
     case "app_pack_list":
       return appPackListTool(input, runtime);
@@ -1422,22 +1713,38 @@ function formatError(error: unknown): string {
 }
 
 // ── Startup ──
+//
+// The server only connects when index.ts is the ENTRY module (direct run /
+// dist build). Tests import the module for the dispatch/wrapper machinery and
+// must not connect a stdio transport or load packs.
 
-await packRegistry.load(cliArgs.appPackDir, envPackDirs());
-
-const transport = new StdioServerTransport();
-await server.connect(transport);
-const { windows } = await loadRuntime();
-
-for (const sig of ["SIGINT", "SIGTERM"] as const) {
-  process.once(sig, () => {
-    shutdownRuntime();
-    process.exit(0);
-  });
+function isMainModule(): boolean {
+  const entry = process.argv[1];
+  if (!entry) return false;
+  try {
+    return path.resolve(fileURLToPath(import.meta.url)) === path.resolve(entry);
+  } catch {
+    return false;
+  }
 }
-process.once("exit", () => {
-  shutdownRuntime();
-});
 
-const packCount = packRegistry.listPacks("all").length;
-console.error(`screenshottool-mcp ready. Default output directory: ${windows.getDefaultOutputDir()}. Hot reload: ${hotReloadEnabled ? "enabled" : "disabled"}. App Packs loaded: ${packCount}.`);
+if (isMainModule()) {
+  await packRegistry.load(cliArgs.appPackDir, envPackDirs());
+
+  const transport = new StdioServerTransport();
+  await server.connect(transport);
+  const { windows } = await loadRuntime();
+
+  for (const sig of ["SIGINT", "SIGTERM"] as const) {
+    process.once(sig, () => {
+      shutdownRuntime();
+      process.exit(0);
+    });
+  }
+  process.once("exit", () => {
+    shutdownRuntime();
+  });
+
+  const packCount = packRegistry.listPacks("all").length;
+  console.error(`screenshottool-mcp ready. Default output directory: ${windows.getDefaultOutputDir()}. Hot reload: ${hotReloadEnabled ? "enabled" : "disabled"}. App Packs loaded: ${packCount}.`);
+}
