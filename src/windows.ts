@@ -93,7 +93,25 @@ export type CaptureResult = {
   // True when the captured frame is blank/fully-transparent (uniform grid
   // sample). Present only on the PrintWindow path.
   blankFrame?: boolean;
+  // ACTUAL capture backend that executed, reported by the PowerShell helper
+  // branch that ran (never guessed from rect or requested method).
+  captureBackend?: CaptureBackend;
 };
+
+// Capture backend identity (what actually executed in the helper), layered
+// SEPARATELY from the interaction method name:
+//   backend "print"  -> interaction method "PrintWindow"
+//   backend "screen" -> interaction method "CopyFromScreen"
+export type CaptureBackend = "print" | "screen";
+
+// Single source of truth for the backend -> interaction-method mapping. Every
+// consumer (success metadata, error details, operation ring) goes through
+// this - never hand-written per call site.
+export function captureBackendToInteractionMethod(backend: CaptureBackend | undefined): "PrintWindow" | "CopyFromScreen" | undefined {
+  if (backend === "print") return "PrintWindow";
+  if (backend === "screen") return "CopyFromScreen";
+  return undefined;
+}
 
 // ── Capture geometry validation ──
 //
@@ -145,11 +163,13 @@ const MIN_AREA_RATIO = 0.1;
 // real geometry. Pure function (no Win32 calls) so tests can drive it with
 // fixtures. `requestedRegion` present => the capture is a crop of the window;
 // crop geometry is intentionally NOT compared against the full window size.
+// The backend is deliberately NOT an input: geometry validity does not depend
+// on which backend captured (tolerance stays backend-agnostic; the backend is
+// reported separately by the caller for error metadata).
 export function validateCaptureGeometry(input: {
   targetRect: { width: number; height: number } | undefined;
   capturedWidth: number;
   capturedHeight: number;
-  captureMethod: string;
   requestedRegion?: { width: number; height: number } | undefined;
 }): CaptureGeometryValidation {
   const { targetRect, capturedWidth, capturedHeight, requestedRegion } = input;
@@ -1369,6 +1389,12 @@ export async function captureWindow(input: CaptureWindowInput, resolvedMode?: In
   const foregroundAfter = await getForegroundWindowHwnd().catch(() => undefined);
   const foregroundChanged = foregroundBefore !== undefined && foregroundAfter !== undefined && foregroundBefore !== foregroundAfter;
 
+  // The ACTUAL backend that executed, reported by the helper branch that ran.
+  // Never guessed from rect presence or the requested captureMethod (a
+  // background-mode request for screen is overridden to print in the helper).
+  const actualBackend: CaptureBackend = result.captureBackend ?? (isBackground ? "print" : (target.captureMethod ?? "print"));
+  const actualInteractionMethod = captureBackendToInteractionMethod(actualBackend);
+
   // background mode: a blank/fully-transparent frame is a failed background
   // capture - refuse with BACKGROUND_CAPTURE_UNAVAILABLE instead of saving it.
   if (isBackground && result.blankFrame === true) {
@@ -1378,7 +1404,7 @@ export async function captureWindow(input: CaptureWindowInput, resolvedMode?: In
       {
         requestedMode: mode,
         effectiveMode: "background",
-        captureMethod: "PrintWindow",
+        captureMethod: actualInteractionMethod,
         foregroundChanged,
         suggestedMode: "foregroundDemo"
       }
@@ -1409,12 +1435,12 @@ export async function captureWindow(input: CaptureWindowInput, resolvedMode?: In
     targetRect,
     capturedWidth: result.width,
     capturedHeight: result.height,
-    captureMethod: result.rect ? "print" : (target.captureMethod ?? "print"),
     ...(target.region ? { requestedRegion: target.region } : {})
   });
   if (!geometryValidation.valid) {
     const details: Record<string, unknown> = {
-      captureMethod: "PrintWindow",
+      captureBackend: actualBackend,
+      ...(actualInteractionMethod ? { interactionMethod: actualInteractionMethod } : {}),
       ...(target.pid !== undefined || target.hwnd !== undefined ? { target: { ...(target.pid !== undefined ? { pid: target.pid } : {}), ...(target.hwnd !== undefined ? { hwnd: target.hwnd } : {}) } } : {}),
       ...(geometryValidation.expected ? { expectedGeometry: geometryValidation.expected } : {}),
       ...(geometryValidation.actual ? { capturedGeometry: geometryValidation.actual } : {}),
@@ -1422,11 +1448,21 @@ export async function captureWindow(input: CaptureWindowInput, resolvedMode?: In
       ...(geometryValidation.heightRatio !== undefined ? { heightRatio: geometryValidation.heightRatio } : {}),
       ...(geometryValidation.areaRatio !== undefined ? { areaRatio: geometryValidation.areaRatio } : {})
     };
+    // Recovery guidance depends on the ACTUAL backend that failed:
+    //  - print (PrintWindow) failed: background mode intentionally forces
+    //    non-activating PrintWindow, so changing captureMethod alone is NOT
+    //    sufficient while the effective interactionMode remains background.
+    //    Recovery needs an EXPLICIT interactionMode=foregroundDemo.
+    //  - screen (CopyFromScreen) failed: never repeat the same screen
+    //    fallback (dead loop); point at the diagnostics instead.
+    const suggestion = actualBackend === "print"
+      ? 'Retry capture_window against the same targetRef with captureMethod="screen" and interactionMode="foregroundDemo" if visible-screen capture is acceptable. Background mode intentionally forces non-activating PrintWindow capture, so changing captureMethod alone is not sufficient while the effective interactionMode remains background.'
+      : "The screen capture backend failed for the resolved target. Inspect the returned target/window diagnostics before retrying.";
     throw new HelperError(
       "The captured image geometry does not plausibly match the resolved target window.",
       "CAPTURE_GEOMETRY_MISMATCH",
       details,
-      'Retry capture_window against the same targetRef with captureMethod="screen" if the user needs a visible screenshot and screen capture semantics are acceptable.'
+      suggestion
     );
   }
 
@@ -1434,8 +1470,8 @@ export async function captureWindow(input: CaptureWindowInput, resolvedMode?: In
     ...(foregroundBefore !== undefined ? { foregroundBefore } : {}),
     ...(foregroundAfter !== undefined ? { foregroundAfter } : {}),
     foregroundChanged,
-    captureMethod: "PrintWindow",
-    targetActivated: mode === "foregroundDemo" && (target.captureMethod ?? "print") === "screen"
+    captureMethod: actualInteractionMethod ?? "PrintWindow",
+    targetActivated: mode === "foregroundDemo" && actualBackend === "screen"
   });
 
   // Lightweight geometry diagnostics on the SUCCESS path so the model never

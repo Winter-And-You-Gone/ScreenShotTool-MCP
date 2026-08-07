@@ -775,7 +775,8 @@ function Save-Screenshot {
     [int]$Height,
     [string]$OutputPath,
     [string]$Target,
-    [hashtable]$Rect
+    [hashtable]$Rect,
+    [string]$CaptureBackend
   )
 
   if ($Width -le 0 -or $Height -le 0) {
@@ -805,6 +806,8 @@ function Save-Screenshot {
     target = $Target
     rect = $Rect
     timestamp = (Get-Date).ToUniversalTime().ToString("o")
+    # ACTUAL capture backend that executed (screen = CopyFromScreen).
+    captureBackend = $CaptureBackend
   }
 }
 
@@ -984,6 +987,8 @@ function Capture-WindowPrint {
     rect = $rect
     timestamp = (Get-Date).ToUniversalTime().ToString("o")
     blankFrame = $blankFrame
+    # ACTUAL capture backend that executed (written by the branch that ran).
+    captureBackend = "print"
   }
 }
 
@@ -1057,7 +1062,7 @@ function Capture-Window {
   }
 
   try {
-    return Save-Screenshot -X $captureX -Y $captureY -Width $captureWidth -Height $captureHeight -OutputPath $OutputPath -Target ("window:" + $window.hwnd) -Rect $rect
+    return Save-Screenshot -X $captureX -Y $captureY -Width $captureWidth -Height $captureHeight -OutputPath $OutputPath -Target ("window:" + $window.hwnd) -Rect $rect -CaptureBackend "screen"
   } finally {
     if ($focus -and $previousForeground -ne [IntPtr]::Zero -and $previousForeground -ne ([IntPtr]([int64]$window.hwnd))) {
       [ScreenshotTool.Native]::SetForegroundWindow($previousForeground) | Out-Null
@@ -1082,7 +1087,7 @@ function Capture-ScreenRegion {
     bottom = [int]$Region.y + [int]$Region.height
   }
 
-  return Save-Screenshot -X $rect.x -Y $rect.y -Width $rect.width -Height $rect.height -OutputPath $OutputPath -Target "screen" -Rect $rect
+  return Save-Screenshot -X $rect.x -Y $rect.y -Width $rect.width -Height $rect.height -OutputPath $OutputPath -Target "screen" -Rect $rect -CaptureBackend "screen"
 }
 
 function New-MouseLParam {

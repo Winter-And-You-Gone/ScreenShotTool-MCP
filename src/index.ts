@@ -1372,10 +1372,29 @@ export async function dispatchToolValue(
             explicit: captureInput.interactionMode,
             packDefault: targetProfile?.interaction?.defaultMode
           });
-          const captureResult = await windows.captureWindow({ ...captureInput, ...resolved.windowSel }, captureMode);
-          // Safe interaction metadata (e.g. PrintWindow) for the ring.
-          ctx.setInteractionMethod(captureResult.interaction?.method);
-          return resolved.targetMeta ? mergeTargetMeta(captureResult as unknown as Record<string, unknown>, resolved.targetMeta) : captureResult;
+          // The ring must record the ACTUAL backend even when the capture
+          // throws (e.g. CAPTURE_GEOMETRY_MISMATCH after PrintWindow ran):
+          // the error's own backend metadata is the source of truth.
+          try {
+            const captureResult = await windows.captureWindow({ ...captureInput, ...resolved.windowSel }, captureMode);
+            // Safe interaction metadata (actual backend method, e.g.
+            // PrintWindow / CopyFromScreen) for the ring.
+            ctx.setInteractionMethod(captureResult.interaction?.method);
+            return resolved.targetMeta ? mergeTargetMeta(captureResult as unknown as Record<string, unknown>, resolved.targetMeta) : captureResult;
+          } catch (error) {
+            if (error instanceof McpUiError) {
+              const details = error.details as Record<string, unknown> | undefined;
+              const method = details?.interactionMethod;
+              if (typeof method === "string") {
+                ctx.setInteractionMethod(method);
+              } else if (details?.captureBackend === "print") {
+                ctx.setInteractionMethod("PrintWindow");
+              } else if (details?.captureBackend === "screen") {
+                ctx.setInteractionMethod("CopyFromScreen");
+              }
+            }
+            throw error;
+          }
         }
       );
     }

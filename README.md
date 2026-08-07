@@ -570,5 +570,6 @@ App Pack JSON 通过 `app_pack_reload` 独立热重载。
 
 - `click_window` / `move_mouse_window` 只投递窗口消息：不支持拖拽、手势、真实 hover。Qt/Electron 应用读取系统光标位置，假消息不会触发 tooltip/右键菜单——需要时请请求人类操作。
 - PrintWindow 无法捕获独立顶层弹窗（Qt ToolTip、菜单面板、Electron 子窗口）；`captureMethod:"screen"` 捕获的是屏幕可见内容，可能被遮挡。
+- **严格 background 模式使用非激活的 PrintWindow**。如果 PrintWindow 返回 blank frame 或明显异常的窗口几何，而用户确实需要可见屏幕截图，可针对同一 targetRef 显式重试：`captureMethod="screen"` + `interactionMode="foregroundDemo"`。**不要只修改 captureMethod**，因为 background 模式会继续强制使用 PrintWindow。
 - UIA 依赖目标应用的无障碍实现：无 ValuePattern 的编辑控件不能 setValue；自定义绘制的菜单/ComboBox 只能走声明在 Pack 中的降级路径；某些控件如实标记 `unsupported`（如 popup 内未暴露的 QLineEdit）。
 - 前台被游戏/全屏程序占用时，光标与焦点相关断言可能假失败。
