@@ -257,16 +257,19 @@ const stepResult = obj(
 
 // Process lifetime isolation report (launch_app / profile_launch).
 // Diagnostic only: reports what was REQUESTED, what was effectively achieved,
-// and whether the isolation was verified (never assumed).
+// and what the verification actually proves (verificationScope) plus any
+// residual outer host Job coupling (outerJobCoupling) - never assumed.
 const processLifetimeShape = obj(
   {
     requested: en(["independent", "managed"]),
     effective: en(["independent", "best-effort", "managed"]),
     isolationMethod: str(),
-    verified: bool()
+    verified: bool(),
+    verificationScope: en(["job-breakaway", "mcp-server-process-exit", "none"]),
+    outerJobCoupling: en(["none-observed", "possible", "unknown"])
   },
   ["requested", "effective", "verified"],
-  "Process lifetime isolation: requested (independent/managed), effective isolation actually achieved (best-effort when it could not be proven), the method used, and whether it was verified - the server never claims isolation it could not prove."
+  "Process lifetime isolation: requested (independent/managed), effective isolation actually achieved (best-effort when it could not be proven), the method used, whether it was verified, WHAT the verification proves (verificationScope: job-breakaway = child escaped the host job; mcp-server-process-exit = verified for server-process exit but an outer host job may still apply), and whether outer host Job coupling is still possible (outerJobCoupling). The server never claims isolation it could not prove."
 );
 
 // ── Window / process tools ──
@@ -1234,7 +1237,7 @@ export const contracts: Record<string, ToolContract> = {
   },
   resolve_semantic_control: {
     name: "resolve_semantic_control",
-    description: "Resolve a natural-language control description against a loaded App Pack's semantic map (pages.json/components.json + control aliases). Inputs: profile (pack id), query (e.g. '通道1 传感器配置'), optional page and within scopes. Returns ranked matches with the semantic group of each control plus a suggestedPath of logical control names (e.g. [sidebarTemperature, rd105Channel1Tab, rd105SensorConfigurationTab]) the caller can pass to profile_action. PURE RESOLUTION - performs no actions, moves nothing, and never triggers side effects; it only maps language to logical controls.",
+    description: "Resolve a natural-language control description against a loaded App Pack's semantic map (pages.json/components.json + control aliases). Inputs: profile (pack id), query (e.g. '温度 通道1'), optional page and within scopes. Returns ranked matches with the semantic group of each control plus a suggestedPath of logical control names (e.g. [temperatureTab, channel1ConfigTab]) the caller can pass to profile_action. PURE RESOLUTION - performs no actions, moves nothing, and never triggers side effects; it only maps language to logical controls.",
     inputSchema: toolInputSchemas.resolve_semantic_control as unknown as JsonSchema,
     outputSchema: resolveSemanticControlOutput,
     schemaVersion: 1,

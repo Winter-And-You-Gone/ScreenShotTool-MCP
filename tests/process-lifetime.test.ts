@@ -48,38 +48,70 @@ test("toolZodSchemas expose the lifetime param on launch tools", () => {
   assert.equal((parsed as { lifetime?: string }).lifetime, "independent");
 });
 
-test("processLifetime report shape: verified independent", () => {
+test("processLifetime report shape: verified independent (breakaway)", () => {
   const report: ProcessLifetimeReport = {
     requested: "independent",
     effective: "independent",
     isolationMethod: "windows-breakaway",
-    verified: true
+    verified: true,
+    verificationScope: "job-breakaway",
+    outerJobCoupling: "none-observed"
   };
   assert.equal(report.verified, true);
   assert.equal(report.effective, "independent");
   assert.equal(report.isolationMethod, "windows-breakaway");
+  assert.equal(report.verificationScope, "job-breakaway");
+  assert.equal(report.outerJobCoupling, "none-observed");
 });
 
-test("processLifetime report shape: best-effort is honest (verified=false)", () => {
+test("processLifetime report shape: detached-spawn verification is scoped to mcp-server-process-exit", () => {
+  const report: ProcessLifetimeReport = {
+    requested: "independent",
+    effective: "independent",
+    isolationMethod: "detached-spawn",
+    verified: true,
+    // verified=true MUST NOT imply full escape from every outer host job.
+    verificationScope: "mcp-server-process-exit",
+    outerJobCoupling: "possible"
+  };
+  assert.equal(report.verified, true);
+  assert.equal(report.verificationScope, "mcp-server-process-exit");
+  assert.equal(report.outerJobCoupling, "possible");
+  // The semantic contract: this is NOT a claim of full job isolation.
+  assert.notEqual(report.verificationScope, "job-breakaway");
+  assert.notEqual(report.outerJobCoupling, "none-observed");
+});
+
+test("processLifetime report shape: best-effort is honest (verified=false, scope none)", () => {
   const report: ProcessLifetimeReport = {
     requested: "independent",
     effective: "best-effort",
-    isolationMethod: "windows-breakaway",
-    verified: false
+    isolationMethod: "detached-spawn",
+    verified: false,
+    verificationScope: "none",
+    outerJobCoupling: "unknown"
   };
   assert.equal(report.verified, false, "never claim verified isolation that was not proven");
   assert.equal(report.effective, "best-effort");
+  assert.equal(report.verificationScope, "none");
+  assert.equal(report.outerJobCoupling, "unknown");
 });
 
-test("processLifetime report shape: managed is explicit", () => {
+test("processLifetime report shape: managed is explicit and carries no independence verification", () => {
   const report: ProcessLifetimeReport = {
     requested: "managed",
     effective: "managed",
     isolationMethod: "spawn-managed",
-    verified: true
+    verified: true,
+    verificationScope: "none",
+    outerJobCoupling: "unknown"
   };
   assert.equal(report.requested, "managed");
   assert.equal(report.effective, "managed");
+  // A managed process is deliberately tied to the server lifetime - it must
+  // never claim an independence verification scope.
+  assert.notEqual(report.verificationScope, "job-breakaway");
+  assert.notEqual(report.verificationScope, "mcp-server-process-exit");
 });
 
 test("profile_launch outputSchema accepts the processLifetime report", async () => {
@@ -103,8 +135,10 @@ test("profile_launch outputSchema accepts the processLifetime report", async () 
     processLifetime: {
       requested: "independent",
       effective: "best-effort",
-      isolationMethod: "windows-breakaway",
-      verified: false
+      isolationMethod: "detached-spawn",
+      verified: false,
+      verificationScope: "none",
+      outerJobCoupling: "unknown"
     }
   };
   const check = validateAgainstSchema(result, contracts.profile_launch!.outputSchema);
@@ -120,8 +154,10 @@ test("launch_app outputSchema accepts the processLifetime report", async () => {
     processLifetime: {
       requested: "independent",
       effective: "independent",
-      isolationMethod: "windows-breakaway",
-      verified: true
+      isolationMethod: "detached-spawn",
+      verified: true,
+      verificationScope: "mcp-server-process-exit",
+      outerJobCoupling: "possible"
     }
   };
   const check = validateAgainstSchema(result, contracts.launch_app!.outputSchema);

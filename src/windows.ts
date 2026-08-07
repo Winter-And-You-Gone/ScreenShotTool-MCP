@@ -890,22 +890,46 @@ export async function ensureOutputPath(outputPath?: string): Promise<string> {
 // Job Object that terminates all descendants when it closes, so `detached:
 // true` alone is NOT enough: the child must ESCAPE the host job.
 //
-// Implementation (verified on real hosts): first try a structured breakaway
-// launch through the helper (CreateProcessW with CREATE_BREAKAWAY_FROM_JOB +
-// DETACHED_PROCESS + CREATE_NEW_PROCESS_GROUP, verified via IsProcessInJob).
-// Breakaway is only honored when the parent job allows it - and many host
-// jobs do NOT (verified: this happens on real machines). When breakaway
-// fails, the fallback is a Node detached spawn: Node.js then does NOT create
-// its KILL_ON_JOB_CLOSE job for the child, which is the primary mechanism by
-// which the server's exit would cascade into the launched app. The ACTUAL
-// method and verification are always reported - never assumed.
+// Independent launch isolates the target from the MCP server process lifetime
+// when supported. On Windows the implementation first attempts verified Job
+// breakaway (CreateProcessW with CREATE_BREAKAWAY_FROM_JOB + DETACHED_PROCESS
+// + CREATE_NEW_PROCESS_GROUP, verified via IsProcessInJob). If the host Job
+// disallows breakaway, it falls back to detached spawning, which is verified
+// for MCP server-process exit but may still be subject to an outer host Job
+// lifecycle. The ACTUAL method, what the verification proves
+// (verificationScope) and any residual outer Job coupling (outerJobCoupling)
+// are always reported - never assumed.
 export type ProcessLifetime = "independent" | "managed";
+
+// What `verified` actually proves. Never over-claims:
+//   job-breakaway            - the child escaped the host job (IsProcessInJob
+//                              verified it is NOT in the caller's job).
+//   mcp-server-process-exit  - the launch method is known (by construction
+//                              and platform integration test) to survive the
+//                              MCP server process's own exit; an OUTER host
+//                              job lifecycle may still apply.
+//   none                     - launched, but no lifetime isolation was
+//                              verified.
+export type VerificationScope = "job-breakaway" | "mcp-server-process-exit" | "none";
+
+// Residual coupling to an OUTER host job (a job that is not the MCP server
+// process's own). Honest, never assumed:
+//   none-observed - the child is not in any job we can observe.
+//   possible      - an outer host job may still terminate the child when the
+//                   whole host session ends (detached spawn does not escape
+//                   outer jobs).
+//   unknown       - no verification was performed.
+export type OuterJobCoupling = "none-observed" | "possible" | "unknown";
 
 export type ProcessLifetimeReport = {
   requested: ProcessLifetime;
   effective: "independent" | "best-effort" | "managed";
   isolationMethod?: "windows-breakaway" | "detached-spawn" | "spawn-managed";
   verified: boolean;
+  // What the verification actually proves (absent = "none").
+  verificationScope?: VerificationScope;
+  // Whether an outer host job lifecycle may still apply.
+  outerJobCoupling?: OuterJobCoupling;
 };
 
 export type LaunchResult = {
@@ -928,11 +952,18 @@ async function launchIndependent(exePath: string, args: string[], cwd?: string):
     const result = await runHelper<{ pid: number; started: boolean; verified?: boolean | null; isolationMethod?: string }>(request);
     if (result.started && typeof result.pid === "number") {
       if (result.verified === true) {
-        // Breakaway succeeded: the child escaped the host job (strongest
-        // isolation). The helper owns the process handle.
+        // Breakaway succeeded: IsProcessInJob verified the child is NOT in
+        // the caller's job (strongest observable isolation).
         return {
           pid: result.pid,
-          report: { requested: "independent", effective: "independent", isolationMethod: "windows-breakaway", verified: true }
+          report: {
+            requested: "independent",
+            effective: "independent",
+            isolationMethod: "windows-breakaway",
+            verified: true,
+            verificationScope: "job-breakaway",
+            outerJobCoupling: "none-observed"
+          }
         };
       }
       // Breakaway was requested but the child is still inside the host job
@@ -952,7 +983,7 @@ async function launchIndependent(exePath: string, args: string[], cwd?: string):
   // KILL_ON_JOB_CLOSE job, which is the primary server-exit cascade
   // mechanism. The child may still share any OUTER host job (breakaway was
   // not honored) - that residual coupling is reported honestly via
-  // effective/isolationMethod and cannot be removed from inside the server.
+  // outerJobCoupling and cannot be removed from inside the server.
   const child = await spawnDetached(exePath, args, cwd);
   if (typeof child.pid !== "number") {
     throw new Error("Failed to start process.");
@@ -963,9 +994,13 @@ async function launchIndependent(exePath: string, args: string[], cwd?: string):
       requested: "independent",
       effective: "independent",
       isolationMethod: "detached-spawn",
-      // Verified by construction (Node never creates a KILL_ON_JOB_CLOSE job
-      // for detached children) AND by the parent-exit integration test.
-      verified: true
+      // Verified for MCP server-process exit survival (by construction:
+      // Node creates no KILL_ON_JOB_CLOSE job for detached children, and the
+      // platform integration test proves parent-exit survival). This is NOT
+      // a claim of full isolation from every outer host job.
+      verified: true,
+      verificationScope: "mcp-server-process-exit",
+      outerJobCoupling: "possible"
     }
   };
 }
@@ -1044,7 +1079,10 @@ export async function launchApp(input: LaunchAppInput): Promise<LaunchResult> {
     // spawnApp already verified a numeric pid (it throws otherwise); keep the
     // ChildProcess so the exit listener works on the managed path.
     child = spawnedProcess as unknown as { pid: number };
-    processLifetime = { requested: "managed", effective: "managed", isolationMethod: "spawn-managed", verified: true };
+    // managed: the process is deliberately tied to the server's lifetime
+    // (no independence verification applies; verified means the managed
+    // contract itself - the historical spawn path - was used as designed).
+    processLifetime = { requested: "managed", effective: "managed", isolationMethod: "spawn-managed", verified: true, verificationScope: "none", outerJobCoupling: "unknown" };
   }
 
   if (typeof child.pid !== "number") {
