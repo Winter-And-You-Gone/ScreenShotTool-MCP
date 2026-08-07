@@ -196,14 +196,33 @@ export function classifyTargetLifecycle(
   return "alive";
 }
 
-export function getTarget(targetRef: string): TargetBinding | undefined {
+// Tri-state result of a targetRef lookup. "expired" is reserved for a binding
+// that EXISTED but exceeded its TTL; "unknown" means the server has no record
+// of the targetRef at all (never the same error - a server restart or an
+// invalid ref must not be reported as a TTL expiry).
+export type TargetLookupResult =
+  | { status: "found"; binding: TargetBinding }
+  | { status: "expired"; expiredAt: number }
+  | { status: "unknown" };
+
+export function lookupTarget(targetRef: string): TargetLookupResult {
   const binding = bindings.get(targetRef);
-  if (!binding) return undefined;
-  if (Date.now() - binding.lastResolvedAt > TARGET_REF_TTL_MS) {
-    bindings.delete(targetRef);
-    return undefined;
+  if (!binding) return { status: "unknown" };
+  const now = Date.now();
+  if (now - binding.lastResolvedAt > TARGET_REF_TTL_MS) {
+    // Do NOT delete here: resolveTargetRef looks up again immediately after a
+    // TTL classification and must still see "expired" (not "unknown"). The
+    // store is swept by listTargetBindings / getTarget instead.
+    return { status: "expired", expiredAt: binding.lastResolvedAt + TARGET_REF_TTL_MS };
   }
-  return binding;
+  return { status: "found", binding };
+}
+
+export function getTarget(targetRef: string): TargetBinding | undefined {
+  const result = lookupTarget(targetRef);
+  if (result.status === "found") return result.binding;
+  if (result.status === "expired") bindings.delete(targetRef);
+  return undefined;
 }
 
 export function unregisterTarget(targetRef: string): void {
@@ -256,8 +275,22 @@ export async function resolveTargetRef(
   targetRef: string,
   deps: TargetLookupDeps
 ): Promise<TargetResolution> {
-  const binding = getTarget(targetRef);
-  if (!binding) {
+  const lookup = lookupTarget(targetRef);
+  if (lookup.status !== "found") {
+    if (lookup.status === "expired") {
+      return {
+        ok: false,
+        processAlive: false,
+        windowAlive: false,
+        profileWindowMatched: false,
+        error: new McpUiError(
+          "TARGET_REQUIRED",
+          `targetRef '${targetRef}' has expired (bindings live for ${TARGET_REF_TTL_MS / 60000} minutes in memory).`,
+          { targetRef, reason: "expired", expired: true, expiredAt: new Date(lookup.expiredAt).toISOString() },
+          "Run profile_launch again and use the new targetRef."
+        )
+      };
+    }
     return {
       ok: false,
       processAlive: false,
@@ -265,12 +298,13 @@ export async function resolveTargetRef(
       profileWindowMatched: false,
       error: new McpUiError(
         "TARGET_REQUIRED",
-        `targetRef '${targetRef}' is unknown or expired (bindings live for ${TARGET_REF_TTL_MS / 60000} minutes in memory).`,
-        { targetRef: targetRef, expired: true },
-        "Run profile_launch again and use the returned targetRef."
+        `targetRef '${targetRef}' is not known to the current MCP server session.`,
+        { targetRef, reason: "binding-not-found", expired: false },
+        "This targetRef is not known to the current MCP server session. Rebind/reuse the running application with profile_launch and use the returned targetRef."
       )
     };
   }
+  const binding = lookup.binding;
 
   // 1. Saved hwnd still valid?
   if (binding.hwnd !== undefined) {
