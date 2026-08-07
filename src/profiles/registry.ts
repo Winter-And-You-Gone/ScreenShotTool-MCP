@@ -1465,11 +1465,11 @@ async function waitForPopupRoot(
 // local absolute paths in the profile.
 export async function launchProfile(
   deps: UiaDeps,
-  windowsLaunch: (input: { exePath: string; args?: string[]; waitForWindow?: boolean; noActivate?: boolean; startMinimized?: boolean; timeoutMs?: number }) => Promise<{ pid: number; window: { hwnd: string; title: string; pid: number; processName: string; className: string; rect: unknown } | null }>,
+  windowsLaunch: (input: { exePath: string; args?: string[]; waitForWindow?: boolean; noActivate?: boolean; startMinimized?: boolean; timeoutMs?: number; lifetime?: "independent" | "managed" }) => Promise<{ pid: number; window: { hwnd: string; title: string; pid: number; processName: string; className: string; rect: unknown } | null; processLifetime?: import("../windows.js").ProcessLifetimeReport }>,
   listWindows: (filters: { processName?: string }) => Promise<Array<{ hwnd: string; title: string; pid: number; processName: string }>>,
-  input: { profile: string; exePath?: string; args?: string[]; waitForWindow?: boolean; noActivate?: boolean; startMinimized?: boolean; timeoutMs?: number; reuseIfRunning?: boolean; interactionMode?: InteractionMode; foregroundDemo?: InteractionOptions },
+  input: { profile: string; exePath?: string; args?: string[]; waitForWindow?: boolean; noActivate?: boolean; startMinimized?: boolean; timeoutMs?: number; reuseIfRunning?: boolean; interactionMode?: InteractionMode; foregroundDemo?: InteractionOptions; lifetime?: "independent" | "managed" },
   getExeManifestLevel?: (exePath: string) => Promise<string>
-): Promise<{ profile: string; pid: number; hwnd?: string; title?: string; startedByMcp: boolean; reused: boolean; uiaRootAvailable: boolean; manifestLevel?: string; interaction: InteractionReport; warning?: string }> {
+): Promise<{ profile: string; pid: number; hwnd?: string; title?: string; startedByMcp: boolean; reused: boolean; uiaRootAvailable: boolean; manifestLevel?: string; interaction: InteractionReport; warning?: string; lifetime?: "independent" | "managed"; processLifetime?: import("../windows.js").ProcessLifetimeReport }> {
   const profile = getProfile(input.profile);
   if (!profile) {
     throw new McpUiError("PROFILE_NOT_FOUND", `No profile with id '${input.profile}'.`, { profile: input.profile });
@@ -1533,7 +1533,10 @@ export async function launchProfile(
     waitForWindow: input.waitForWindow ?? launchDefaults.waitForWindow ?? true,
     noActivate,
     startMinimized,
-    timeoutMs: input.timeoutMs ?? launchDefaults.timeoutMs ?? 30000
+    timeoutMs: input.timeoutMs ?? launchDefaults.timeoutMs ?? 30000,
+    // Desktop apps the user wants to operate must survive the MCP server's
+    // own exit: independent is the profile_launch default.
+    lifetime: input.lifetime ?? "independent"
   });
 
   // Wait for UIA root to be available (best-effort).
@@ -1553,12 +1556,14 @@ export async function launchProfile(
     startedByMcp: true,
     reused: false,
     uiaRootAvailable,
-    ...(manifestLevel !== undefined ? { manifestLevel } : {})
+    ...(manifestLevel !== undefined ? { manifestLevel } : {}),
+    ...(launched.processLifetime ? { processLifetime: launched.processLifetime } : {}),
+    ...(input.lifetime !== undefined ? { lifetime: input.lifetime } : {})
   });
 
   // Shared outcome path: foreground observation, foregroundDemo activation,
   // background steal recovery, and the interaction report.
-  async function launchOutcome(base: { profile: string; pid: number; hwnd?: string; title?: string; startedByMcp: boolean; reused: boolean; uiaRootAvailable: boolean; manifestLevel?: string }): Promise<{ profile: string; pid: number; hwnd?: string; title?: string; startedByMcp: boolean; reused: boolean; uiaRootAvailable: boolean; manifestLevel?: string; interaction: InteractionReport; warning?: string }> {
+  async function launchOutcome(base: { profile: string; pid: number; hwnd?: string; title?: string; startedByMcp: boolean; reused: boolean; uiaRootAvailable: boolean; manifestLevel?: string; lifetime?: "independent" | "managed"; processLifetime?: import("../windows.js").ProcessLifetimeReport }): Promise<{ profile: string; pid: number; hwnd?: string; title?: string; startedByMcp: boolean; reused: boolean; uiaRootAvailable: boolean; manifestLevel?: string; interaction: InteractionReport; warning?: string; lifetime?: "independent" | "managed"; processLifetime?: import("../windows.js").ProcessLifetimeReport }> {
     const targetHwnd = base.hwnd;
     let targetActivated = false;
     let foregroundChanged = false;

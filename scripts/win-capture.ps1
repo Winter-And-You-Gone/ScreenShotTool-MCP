@@ -336,6 +336,71 @@ namespace ScreenshotTool {
 
     [DllImport("kernel32.dll", SetLastError = true)]
     public static extern bool FreeLibrary(IntPtr hModule);
+
+    // ── Independent process launch (process lifetime decoupling) ──
+    // Used by launch_app/profile_launch when lifetime=independent: the target
+    // app must survive the MCP server's own exit. The MCP server's host may
+    // run inside a Job Object that kills all descendants when it closes, so
+    // the launch requests CREATE_BREAKAWAY_FROM_JOB (only honored when the
+    // parent job allows breakaway) AND DETACHED_PROCESS +
+    // CREATE_NEW_PROCESS_GROUP. IsProcessInJob verifies whether the child is
+    // still inside the caller's job - the caller reports the ACTUAL isolation
+    // (verified only when the breakaway succeeded), never an assumption.
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+    public struct STARTUPINFO {
+      public int cb;
+      public string lpReserved;
+      public string lpDesktop;
+      public string lpTitle;
+      public int dwX;
+      public int dwY;
+      public int dwXSize;
+      public int dwYSize;
+      public int dwXCountChars;
+      public int dwYCountChars;
+      public int dwFillAttribute;
+      public int dwFlags;
+      public short wShowWindow;
+      public short cbReserved2;
+      public IntPtr lpReserved2;
+      public IntPtr hStdInput;
+      public IntPtr hStdOutput;
+      public IntPtr hStdError;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct PROCESS_INFORMATION {
+      public IntPtr hProcess;
+      public IntPtr hThread;
+      public uint dwProcessId;
+      public uint dwThreadId;
+    }
+
+    public const uint CREATE_NEW_PROCESS_GROUP = 0x00000200;
+    public const uint CREATE_UNICODE_ENVIRONMENT = 0x00000400;
+    public const uint CREATE_BREAKAWAY_FROM_JOB = 0x01000000;
+    public const uint DETACHED_PROCESS = 0x00000008;
+    public const uint STARTF_USESHOWWINDOW = 0x00000001;
+    public const short SW_HIDE = 0;
+
+    [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+    public static extern bool CreateProcessW(
+      string lpApplicationName,
+      StringBuilder lpCommandLine,
+      IntPtr lpProcessAttributes,
+      IntPtr lpThreadAttributes,
+      bool bInheritHandles,
+      uint dwCreationFlags,
+      IntPtr lpEnvironment,
+      string lpCurrentDirectory,
+      ref STARTUPINFO lpStartupInfo,
+      out PROCESS_INFORMATION lpProcessInformation);
+
+    [DllImport("kernel32.dll")]
+    public static extern IntPtr GetCurrentProcess();
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    public static extern bool IsProcessInJob(IntPtr hProcess, IntPtr hJob, out bool pbResult);
   }
 }
 "@
@@ -2210,6 +2275,100 @@ function Write-Clipboard {
 # is best-effort: GetExitCodeProcess on a pid that already exited may return
 # STILL_ACTIVE (handle cached by the OS) or fail; callers must never treat a
 # missing exit code as evidence of anything.
+function Start-IndependentProcess {
+  param([hashtable]$Request)
+
+  # Launch an application with an explicit attempt to escape the caller's
+  # process/job lifetime (CREATE_BREAKAWAY_FROM_JOB + DETACHED_PROCESS +
+  # CREATE_NEW_PROCESS_GROUP). The caller MCP server may live inside a Job
+  # Object that would terminate all descendants when it closes; breakaway is
+  # only honored when the parent job allows it, so the actual isolation is
+  # VERIFIED with IsProcessInJob and reported back - never assumed.
+  #
+  # Run in the same process as the caller (via the shared worker) so the
+  # "parent job" observed by IsProcessInJob is the REAL host environment of
+  # the MCP server, not a detached PowerShell helper.
+  $exe = [string]$Request.target.exePath
+  if ([string]::IsNullOrWhiteSpace($exe)) { throw "launch-process: exePath is required." }
+  if (-not (Test-Path -LiteralPath $exe -PathType Leaf)) { throw "launch-process: exePath does not exist: $exe" }
+
+  $args = @()
+  if ($Request.target.ContainsKey("args") -and $null -ne $Request.target.args) { $args = @($Request.target.args) }
+  # lpCommandLine starts with the quoted exe path (the standard Windows
+  # convention: the first token is the executable), followed by the quoted
+  # arguments. lpApplicationName carries the absolute path as well.
+  $cmd = '"' + $exe + '"'
+  foreach ($a in $args) {
+    $arg = [string]$a
+    if ($arg -match '[ \t"]') {
+      $cmd += ' "' + ($arg -replace '"', '\"') + '"'
+    } else {
+      $cmd += ' ' + $arg
+    }
+  }
+  # The command line is a mutable StringBuilder (CreateProcessW may write to it).
+  $cmdLine = New-Object System.Text.StringBuilder ($cmd)
+
+  $cwd = $null
+  if ($Request.target.ContainsKey("cwd") -and -not [string]::IsNullOrWhiteSpace([string]$Request.target.cwd)) {
+    $cwd = [string]$Request.target.cwd
+    if (-not (Test-Path -LiteralPath $cwd -PathType Container)) { throw "launch-process: cwd does not exist: $cwd" }
+  } else {
+    # PowerShell marshals $null for a [string] parameter as an EMPTY string,
+    # which CreateProcessW rejects with ERROR_INVALID_NAME. "No cwd" must be
+    # the current directory explicitly (the worker inherits the MCP server's).
+    $cwd = [System.Environment]::CurrentDirectory
+  }
+
+  $si = New-Object ScreenshotTool.Native+STARTUPINFO
+  $si.cb = [Runtime.InteropServices.Marshal]::SizeOf([type][ScreenshotTool.Native+STARTUPINFO])
+  $si.dwFlags = [ScreenshotTool.Native]::STARTF_USESHOWWINDOW
+  $si.wShowWindow = [ScreenshotTool.Native]::SW_HIDE
+
+  $flags = [ScreenshotTool.Native]::CREATE_BREAKAWAY_FROM_JOB -bor
+           [ScreenshotTool.Native]::DETACHED_PROCESS -bor
+           [ScreenshotTool.Native]::CREATE_NEW_PROCESS_GROUP
+
+  $pi = New-Object ScreenshotTool.Native+PROCESS_INFORMATION
+  # lpApplicationName = the absolute exe path (explicit, no PATH resolution;
+  # a PowerShell $null for a string parameter would marshal as an empty
+  # string, which fails with ERROR_INVALID_NAME). lpCommandLine carries only
+  # the arguments. lpEnvironment=IntPtr.Zero inherits the worker's
+  # environment (which mirrors the MCP server's), so CREATE_UNICODE_ENVIRONMENT
+  # is not needed. The command line is a mutable StringBuilder - CLR
+  # marshaling handles the in/out semantics without a PS [ref] wrapper.
+  $ok = [ScreenshotTool.Native]::CreateProcessW(
+    $exe, $cmdLine, [IntPtr]::Zero, [IntPtr]::Zero, $false,
+    $flags, [IntPtr]::Zero, $cwd, [ref]$si, [ref]$pi)
+  if (-not $ok) {
+    $err = [Runtime.InteropServices.Marshal]::GetLastWin32Error()
+    throw "launch-process: CreateProcessW failed with Win32 error $err."
+  }
+  try {
+    $childPid = [int]$pi.dwProcessId
+    # VERIFY the actual isolation: is the child still inside this process's
+    # job? IsProcessInJob(child, NULL) returns TRUE when the child is in ANY
+    # job (a nested job hierarchy also counts as "in a job" - that is exactly
+    # the failure mode we are reporting).
+    $inJob = $true
+    try {
+      [ScreenshotTool.Native]::IsProcessInJob($pi.hProcess, [IntPtr]::Zero, [ref]$inJob) | Out-Null
+    } catch {
+      $inJob = $null
+    }
+    return @{
+      pid = $childPid
+      started = $true
+      verified = ($inJob -eq $false)
+      isolationMethod = "windows-breakaway"
+      inJob = $inJob
+    }
+  } finally {
+    [ScreenshotTool.Native]::CloseHandle($pi.hProcess) | Out-Null
+    [ScreenshotTool.Native]::CloseHandle($pi.hThread) | Out-Null
+  }
+}
+
 function Test-ProcessAlive {
   param([int]$ProcessId)
 
@@ -4270,6 +4429,9 @@ function Invoke-Action {
     }
     "capture-window" {
       return Capture-Window -Target $Request.target -OutputPath $Request.outputPath
+    }
+    "launch-process" {
+      return Start-IndependentProcess -Request $Request
     }
     "capture-screen-region" {
       return Capture-ScreenRegion -Region $Request.region -OutputPath $Request.outputPath

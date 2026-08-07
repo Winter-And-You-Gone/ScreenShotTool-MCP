@@ -255,6 +255,20 @@ const stepResult = obj(
 // title, found, count, element, elements, value, matched, timedOut, code,
 // message, details.
 
+// Process lifetime isolation report (launch_app / profile_launch).
+// Diagnostic only: reports what was REQUESTED, what was effectively achieved,
+// and whether the isolation was verified (never assumed).
+const processLifetimeShape = obj(
+  {
+    requested: en(["independent", "managed"]),
+    effective: en(["independent", "best-effort", "managed"]),
+    isolationMethod: str(),
+    verified: bool()
+  },
+  ["requested", "effective", "verified"],
+  "Process lifetime isolation: requested (independent/managed), effective isolation actually achieved (best-effort when it could not be proven), the method used, and whether it was verified - the server never claims isolation it could not prove."
+);
+
 // ── Window / process tools ──
 
 const launchAppOutput = withToolError(obj(
@@ -266,7 +280,8 @@ const launchAppOutput = withToolError(obj(
         { type: "null" }
       ],
       description: "First visible window, or null when waitForWindow=false."
-    }
+    },
+    processLifetime: processLifetimeShape
   },
   ["pid"],
   "launch_app success result."
@@ -654,10 +669,12 @@ const profileLaunchOutput = withToolError(obj(
     uiaRootAvailable: bool(),
     manifestLevel: str(),
     interaction: interactionShape,
+    lifetime: en(["independent", "managed"]),
+    processLifetime: processLifetimeShape,
     packCompatibility: any()
   },
   ["profile", "targetRef", "pid", "startedByMcp", "uiaRootAvailable", "interaction"],
-  "profile_launch success result (stable fields: profile, targetRef, pid, hwnd, title, startedByMcp, reused, uiaRootAvailable). targetRef is REQUIRED: the preferred target binding for later profile actions (hwnd may be absent when the launch did not wait for a window). packCompatibility is OPTIONAL: {status: verified|compatible-unverified|mismatch|not-declared, checked, matchedBy?} - a mismatch is a WARNING that App Pack selectors may have drifted, never a launch block."
+  "profile_launch success result (stable fields: profile, targetRef, pid, hwnd, title, startedByMcp, reused, uiaRootAvailable). targetRef is REQUIRED: the preferred target binding for later profile actions (hwnd may be absent when the launch did not wait for a window). lifetime is the launch contract (independent by default: the app survives the MCP server); processLifetime reports the effective isolation. packCompatibility is OPTIONAL: {status: verified|compatible-unverified|mismatch|not-declared, checked, matchedBy?} - a mismatch is a WARNING that App Pack selectors may have drifted, never a launch block."
 ));
 
 // ── App Pack tools ──

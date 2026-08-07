@@ -85,6 +85,16 @@ export const regionSchema = z.object({
   `Capture region area must be at most ${maxCaptureRegionArea} pixels.`
 );
 
+// Process lifetime semantics for launched applications:
+//   independent - the target app should survive the MCP server's own exit
+//                 (normal exit, crash, client kill, hot reload). On Windows the
+//                 launch attempts to escape the host process/job (breakaway);
+//                 the effective isolation is reported back, never assumed.
+//   managed     - the target process is explicitly owned by the MCP server and
+//                 may be torn down with it; used for temporary test programs,
+//                 one-shot helpers, and controlled tool processes.
+const processLifetimeSchema = z.enum(["independent", "managed"]).default("independent");
+
 export const launchAppSchema = z.object({
   exePath: z.string().min(1),
   args: z.array(z.string()).optional().default([]),
@@ -93,6 +103,7 @@ export const launchAppSchema = z.object({
   timeoutMs: optionalTimeout.default(10000),
   startMinimized: z.boolean().optional().default(false),
   noActivate: z.boolean().optional().default(false),
+  lifetime: processLifetimeSchema,
   ...interactionParams
 }).strict();
 
@@ -476,6 +487,10 @@ export const profileLaunchSchema = z.object({
   startMinimized: z.boolean().optional().default(false),
   timeoutMs: z.number().int().min(100).max(120000).optional().default(30000),
   reuseIfRunning: z.boolean().optional().default(true),
+  // profile_launch launches desktop apps the user wants to operate: the
+  // default lifetime is ALWAYS independent (the app must survive the MCP
+  // server). Explicit managed is allowed for controlled helper scenarios.
+  lifetime: processLifetimeSchema,
   ...interactionParams
 }).strict();
 export type ProfileLaunchInput = z.infer<typeof profileLaunchSchema>;
@@ -726,6 +741,14 @@ const targetRefJson = {
   description: "Stable target binding returned by profile_launch. Preferred over pid/hwnd: it survives window recreation and refreshes the binding automatically. Priority: targetRef > explicit hwnd > pid/processName/titleContains. When targetRef is available, reuse it instead of carrying the returned hwnd across calls - the hwnd is diagnostic/transient and may change."
 } as const;
 
+// Shared JSON Schema entry for the process lifetime param.
+const processLifetimeJson = {
+  type: "string",
+  enum: ["independent", "managed"],
+  default: "independent",
+  description: "Process lifetime: 'independent' (default) - the launched app should survive the MCP server's own exit (normal exit, crash, client kill, hot reload). 'managed' - the process is explicitly owned by the MCP server and may be torn down with it (temporary test programs, one-shot helpers). The effective isolation actually achieved is reported back in processLifetime - never assumed."
+} as const;
+
 // Shared JSON Schema for the interactionMode + foregroundDemo params.
 const interactionParamsJson = {
   interactionMode: {
@@ -777,6 +800,7 @@ export const toolInputSchemas = {
       timeoutMs: { type: "integer", minimum: 100, maximum: 120000, default: 10000 },
       startMinimized: { type: "boolean", default: false, description: "After the first window is found, request minimized/background presentation. Some apps may briefly show during startup." },
       noActivate: { type: "boolean", default: false, description: "Best-effort background launch: restore the previous foreground window and push the new window to the bottom of the z-order without activation when possible." },
+      lifetime: processLifetimeJson,
       ...interactionParamsJson
     },
     required: ["exePath"],
@@ -1171,6 +1195,7 @@ export const toolInputSchemas = {
       startMinimized: { type: "boolean", default: false, description: "Superseded by interactionMode=background, which keeps the window normal-but-behind (never minimized by default)." },
       timeoutMs: { type: "integer", minimum: 100, maximum: 120000, default: 30000 },
       reuseIfRunning: { type: "boolean", default: true, description: "If a process with a matching name is already running, attach to it instead of launching a new one." },
+      lifetime: processLifetimeJson,
       ...interactionParamsJson
     },
     required: ["profile"],

@@ -53,11 +53,18 @@ export type TargetOperationRecord = {
     windowAlive?: boolean;
     hwnd?: string;
   };
+  // True when the before hwnd was stale after the operation but the target
+  // session stayed alive and rebound to a new window. NEVER treated as
+  // target-disappeared: the target session is still alive.
+  windowRebound?: boolean;
   result:
     | "success"
     | "business-error"
     | "protocol-error"
     | "target-disappeared";
+  // Safe machine code only (e.g. ELEMENT_NOT_FOUND, TARGET_PROCESS_EXITED).
+  // Error MESSAGES are never recorded - they can embed user data.
+  errorCode?: string;
 };
 
 export const TARGET_OPERATION_RING_MAX = 20;
@@ -83,6 +90,11 @@ export type TargetBinding = {
   // missing exitCode is NOT evidence of anything.
   startedByMcp?: boolean;
   startedAt?: number;
+  // Launch contract, SEPARATE from startedByMcp: a process can be started by
+  // the MCP server yet be independent of its lifetime (the profile_launch
+  // default). "independent" = the process should survive the server's exit;
+  // "managed" = explicitly owned by the server.
+  lifetime?: "independent" | "managed";
   lastSeenAliveAt?: number;
   exitObservedAt?: number;
   exitCode?: number;
@@ -129,19 +141,33 @@ export function registerTarget(binding: Omit<TargetBinding, "targetRef" | "creat
   return stored;
 }
 
+// A record may be created before the outcome is known: the unified operation
+// wrapper registers startedAt + before state FIRST (so a throwing operation
+// still leaves a record), then finalizes result/finishedAt/after. Callers
+// that already know the outcome pass the full record.
+export type TargetOperationRecordDraft = Omit<TargetOperationRecord, "result"> & { result?: TargetOperationRecord["result"] };
+
 // Record one safe operation against a target (bounded ring). Never records
 // sensitive data - only the tool name, lifecycle observations, and safe
-// interaction metadata.
+// interaction metadata. Returns the stored record so the caller can finalize
+// it in place (startedAt before the operation, finishedAt/result afterwards).
 export function recordTargetOperation(
   targetRef: string,
-  record: TargetOperationRecord
-): void {
+  record: TargetOperationRecordDraft
+): TargetOperationRecord | undefined {
   const binding = bindings.get(targetRef);
-  if (!binding) return;
-  binding.operations.push(record);
+  if (!binding) return undefined;
+  const stored: TargetOperationRecord = {
+    // Transient placeholder until the wrapper finalizes the outcome; every
+    // wrapper path overwrites it before the operation is observable.
+    result: "success",
+    ...record
+  };
+  binding.operations.push(stored);
   if (binding.operations.length > TARGET_OPERATION_RING_MAX) {
     binding.operations.splice(0, binding.operations.length - TARGET_OPERATION_RING_MAX);
   }
+  return stored;
 }
 
 export function lastTargetOperation(targetRef: string): TargetOperationRecord | undefined {
@@ -291,6 +317,9 @@ export async function resolveTargetRef(
           processAlive: false,
           windowAlive: false,
           startedByMcp: binding.startedByMcp ?? false,
+          // Launch contract: independent targets are expected to outlive the
+          // MCP server - an exit here is never the server's fault.
+          ...(binding.lifetime ? { lifetime: binding.lifetime } : {}),
           ...(binding.exitCode !== undefined ? { exitCode: binding.exitCode } : {}),
           ...(binding.exitObservedAt !== undefined ? { exitObservedAt: new Date(binding.exitObservedAt).toISOString() } : {}),
           lifecycle,
@@ -355,6 +384,7 @@ export function bindLaunchTarget(input: {
   title?: string;
   startedByMcp?: boolean;
   startedAt?: number;
+  lifetime?: "independent" | "managed";
 }): TargetBinding {
   return registerTarget(input);
 }

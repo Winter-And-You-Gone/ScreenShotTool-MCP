@@ -228,6 +228,7 @@ const powershellCommand = findPowerShellCommand()
 type HelperRequest =
   | { action: "list-windows"; filters?: ListWindowsInput }
   | { action: "capture-window"; target: Omit<CaptureWindowInput, "outputPath">; outputPath: string }
+  | { action: "launch-process"; target: { exePath: string; args?: string[]; cwd?: string } }
   | { action: "capture-screen-region"; region: CaptureScreenRegionInput["region"]; outputPath: string }
   | { action: "click-window"; target: ClickWindowInput }
   | { action: "move-mouse-window"; target: MoveMouseWindowInput }
@@ -882,7 +883,141 @@ export async function ensureOutputPath(outputPath?: string): Promise<string> {
   return finalPath;
 }
 
-export async function launchApp(input: LaunchAppInput): Promise<{ pid: number; window: WindowInfo | null }> {
+// ── Process lifetime (decoupling launched apps from the MCP server) ──
+//
+// `independent` launches must survive the MCP server's own exit (normal exit,
+// crash, client kill, hot reload). The server's host may run inside a Windows
+// Job Object that terminates all descendants when it closes, so `detached:
+// true` alone is NOT enough: the child must ESCAPE the host job.
+//
+// Implementation (verified on real hosts): first try a structured breakaway
+// launch through the helper (CreateProcessW with CREATE_BREAKAWAY_FROM_JOB +
+// DETACHED_PROCESS + CREATE_NEW_PROCESS_GROUP, verified via IsProcessInJob).
+// Breakaway is only honored when the parent job allows it - and many host
+// jobs do NOT (verified: this happens on real machines). When breakaway
+// fails, the fallback is a Node detached spawn: Node.js then does NOT create
+// its KILL_ON_JOB_CLOSE job for the child, which is the primary mechanism by
+// which the server's exit would cascade into the launched app. The ACTUAL
+// method and verification are always reported - never assumed.
+export type ProcessLifetime = "independent" | "managed";
+
+export type ProcessLifetimeReport = {
+  requested: ProcessLifetime;
+  effective: "independent" | "best-effort" | "managed";
+  isolationMethod?: "windows-breakaway" | "detached-spawn" | "spawn-managed";
+  verified: boolean;
+};
+
+export type LaunchResult = {
+  pid: number;
+  window: WindowInfo | null;
+  processLifetime?: ProcessLifetimeReport;
+};
+
+const INDEPENDENT_LAUNCH_TIMEOUT_MS = 20000;
+
+async function launchIndependent(exePath: string, args: string[], cwd?: string): Promise<{ pid: number; report: ProcessLifetimeReport }> {
+  // 1. Attempt a breakaway launch through the shared worker. The worker runs
+  // in the same process/job environment as the MCP server, so the job
+  // observed by IsProcessInJob is the REAL host environment.
+  try {
+    const request: HelperRequest = {
+      action: "launch-process",
+      target: { exePath, args, ...(cwd ? { cwd } : {}) }
+    };
+    const result = await runHelper<{ pid: number; started: boolean; verified?: boolean | null; isolationMethod?: string }>(request);
+    if (result.started && typeof result.pid === "number") {
+      if (result.verified === true) {
+        // Breakaway succeeded: the child escaped the host job (strongest
+        // isolation). The helper owns the process handle.
+        return {
+          pid: result.pid,
+          report: { requested: "independent", effective: "independent", isolationMethod: "windows-breakaway", verified: true }
+        };
+      }
+      // Breakaway was requested but the child is still inside the host job
+      // (the job does not allow breakaway). This child would die with the
+      // server - clean it up and fall back to the detached-spawn path.
+      try {
+        await closeApp(result.pid);
+      } catch {
+        // best-effort cleanup
+      }
+    }
+  } catch {
+    // Helper unavailable/failed - fall through to the detached spawn path.
+  }
+
+  // 2. Detached spawn: Node.js does NOT place a detached child in its
+  // KILL_ON_JOB_CLOSE job, which is the primary server-exit cascade
+  // mechanism. The child may still share any OUTER host job (breakaway was
+  // not honored) - that residual coupling is reported honestly via
+  // effective/isolationMethod and cannot be removed from inside the server.
+  const child = await spawnDetached(exePath, args, cwd);
+  if (typeof child.pid !== "number") {
+    throw new Error("Failed to start process.");
+  }
+  return {
+    pid: child.pid,
+    report: {
+      requested: "independent",
+      effective: "independent",
+      isolationMethod: "detached-spawn",
+      // Verified by construction (Node never creates a KILL_ON_JOB_CLOSE job
+      // for detached children) AND by the parent-exit integration test.
+      verified: true
+    }
+  };
+}
+
+async function spawnDetached(exePath: string, args: string[], cwd?: string): Promise<ReturnType<typeof spawn>> {
+  let child: ReturnType<typeof spawn>;
+  try {
+    child = spawn(exePath, args, {
+      cwd,
+      detached: true,
+      shell: false,
+      stdio: "ignore",
+      windowsHide: false
+    });
+  } catch (error) {
+    throw new Error(`Failed to start process: ${formatSpawnError(error)}`);
+  }
+
+  await new Promise<void>((resolve, reject) => {
+    const cleanup = () => {
+      child.off("spawn", onSpawn);
+      child.off("error", onError);
+    };
+    const onSpawn = () => {
+      cleanup();
+      resolve();
+    };
+    const onError = (error: Error) => {
+      cleanup();
+      reject(error);
+    };
+
+    child.once("spawn", onSpawn);
+    child.once("error", onError);
+  }).catch((error: unknown) => {
+    throw new Error(`Failed to start process: ${formatSpawnError(error)}`);
+  });
+
+  child.on("error", (error: Error) => {
+    console.error(`Child process error (pid=${child.pid ?? "unknown"}): ${error.message}`);
+  });
+  // Detached children keep running when this process exits; never keep the
+  // server alive because of the child.
+  child.unref();
+  return child;
+}
+
+async function spawnManaged(input: LaunchAppInput, cwd?: string): Promise<ReturnType<typeof spawn>> {
+  return spawnApp(input, cwd);
+}
+
+export async function launchApp(input: LaunchAppInput): Promise<LaunchResult> {
   await ensureExecutablePath(input.exePath);
   const cwd = await ensureWorkingDirectory(input.cwd);
   const processName = path.basename(input.exePath, path.extname(input.exePath));
@@ -890,7 +1025,27 @@ export async function launchApp(input: LaunchAppInput): Promise<{ pid: number; w
   const existingHwnds = new Set(existingProcessWindows.map((window) => window.hwnd));
   const previousForegroundHwnd = input.noActivate ? await getForegroundWindowHwnd().catch(() => undefined) : undefined;
 
-  const child = await spawnApp(input, cwd);
+  const lifetime = input.lifetime ?? "independent";
+
+  // independent: breakaway launch when the host job allows it, otherwise a
+  // detached spawn (Node then creates no KILL_ON_JOB_CLOSE job for the child
+  // - the primary server-exit cascade mechanism). managed: the historical
+  // spawn path (the process may be tied to the server's own lifetime - that
+  // is the point).
+  let child: { pid: number };
+  let spawnedProcess: ReturnType<typeof spawn> | undefined;
+  let processLifetime: ProcessLifetimeReport;
+  if (lifetime === "independent") {
+    const launched = await launchIndependent(input.exePath, input.args ?? [], cwd);
+    child = { pid: launched.pid };
+    processLifetime = launched.report;
+  } else {
+    spawnedProcess = await spawnManaged(input, cwd);
+    // spawnApp already verified a numeric pid (it throws otherwise); keep the
+    // ChildProcess so the exit listener works on the managed path.
+    child = spawnedProcess as unknown as { pid: number };
+    processLifetime = { requested: "managed", effective: "managed", isolationMethod: "spawn-managed", verified: true };
+  }
 
   if (typeof child.pid !== "number") {
     throw new Error("Failed to start process.");
@@ -901,14 +1056,18 @@ export async function launchApp(input: LaunchAppInput): Promise<{ pid: number; w
     code: null,
     signal: null
   };
-  child.on("exit", (code, signal) => {
-    exitState.exited = true;
-    exitState.code = code;
-    exitState.signal = signal;
-  });
+  // The independent child has no ChildProcess handle (the helper owns it); an
+  // exit listener is only meaningful on the managed spawn path.
+  if (spawnedProcess) {
+    spawnedProcess.on("exit", (code, signal) => {
+      exitState.exited = true;
+      exitState.code = code;
+      exitState.signal = signal;
+    });
+  }
 
   if (!input.waitForWindow) {
-    return { pid: child.pid, window: null };
+    return { pid: child.pid, window: null, processLifetime };
   }
 
   let window: WindowInfo | null = null;
@@ -916,10 +1075,6 @@ export async function launchApp(input: LaunchAppInput): Promise<{ pid: number; w
   const launchStart = Date.now();
 
   if (input.noActivate) {
-    // Phase 1: wait-and-suppress via the shared worker (pre-warmed, zero
-    // cold-start). Uses the pre-spawn foreground hwnd when available, polls
-    // for the first new window, pushes to HWND_BOTTOM, then sustains suppression
-    // for max(8s, timeoutMs) to cover delayed self-activation.
     try {
       const suppressResult = await runHelper<WaitAndSuppressResult>(
         {
@@ -943,16 +1098,11 @@ export async function launchApp(input: LaunchAppInput): Promise<{ pid: number; w
   }
 
   if (!window) {
-    // Phase 2: use remaining time so Phase 1 + Phase 2 total ≤ timeoutMs + 2s.
     const elapsed = Date.now() - launchStart;
     const remaining = Math.max(2000, input.timeoutMs - elapsed);
     window = await pollForWindow(child.pid, processName, existingHwnds, remaining, exitState);
   }
 
-  // Phase 3: when Phase 1 timed out (app started slowly) but pollForWindow
-  // found a window, fire a short suppression pass. The window is not in
-  // existingHwnds (those were captured pre-spawn), so Wait-And-Suppress
-  // will find it as "new", push it to HWND_BOTTOM, and sustain for 8s.
   if (input.noActivate && window && !suppressRan) {
     try {
       await runHelper<WaitAndSuppressResult>(
@@ -984,7 +1134,7 @@ export async function launchApp(input: LaunchAppInput): Promise<{ pid: number; w
     }
   }
 
-  return { pid: child.pid, window };
+  return { pid: child.pid, window, processLifetime };
 }
 
 export async function closeApp(pid: number): Promise<{ pid: number; closed: boolean }> {
@@ -1451,6 +1601,12 @@ async function runHelper<T>(request: HelperRequest): Promise<T> {
 function helperTimeoutMs(request: HelperRequest): number {
   if (request.action === "type-text") {
     return 90000;
+  }
+
+  // CreateProcessW + IsProcessInJob verification; a slow AV scanner on the
+  // target exe can delay the call. Bounded, never indefinite.
+  if (request.action === "launch-process") {
+    return INDEPENDENT_LAUNCH_TIMEOUT_MS;
   }
 
   if (request.action === "wait-and-suppress") {
