@@ -921,6 +921,29 @@ type ResolvedTarget = {
   targetBinding?: TargetBinding;
 };
 
+// Resolve the App Pack Profile that governs a resolved target. Priority:
+//   1. the targetRef binding's own profileId (authoritative - the binding
+//      was created by profile_launch for that profile),
+//   2. profile inference from the direct window selector (processName /
+//      titleContains) when no binding exists.
+// A targetRef that already knows its profile must NEVER be re-guessed from
+// processName/titleContains (which may be absent or ambiguous).
+function resolveProfileForResolvedTarget(
+  resolved: ResolvedTarget,
+  profiles: RuntimeModules["profiles"]
+): import("./profiles/types.js").AppProfile | undefined {
+  if (resolved.targetBinding?.profileId) {
+    return getAppProfile(resolved.targetBinding.profileId);
+  }
+  if (resolved.windowSel.processName || resolved.windowSel.titleContains) {
+    return profiles.findProfileForTarget({
+      processName: resolved.windowSel.processName,
+      titleContains: resolved.windowSel.titleContains
+    });
+  }
+  return undefined;
+}
+
 async function resolveTargetInput(
   input: { targetRef?: string; profile?: string; pid?: number; hwnd?: string | number; processName?: string; titleContains?: string },
   runtime: RuntimeModules
@@ -935,9 +958,15 @@ async function resolveTargetInput(
     if (!resolution.ok) {
       throw resolution.error;
     }
+    // The binding carries the Profile/App Pack identity (profileId) created
+    // by profile_launch. It MUST survive into the tool dispatch so capture
+    // etc. can inherit the pack's interaction/capture defaults without
+    // re-guessing the profile from processName/titleContains.
+    const binding = getTarget(input.targetRef);
     return {
       windowSel: { ...(resolution.target.hwnd !== undefined ? { hwnd: resolution.target.hwnd } : {}), pid: resolution.target.pid },
-      targetMeta: { target: resolution.target }
+      targetMeta: { target: resolution.target },
+      ...(binding ? { targetBinding: binding } : {})
     };
   }
   // 2. Explicit hwnd (low-level direct targeting only - diagnostic/transient;
@@ -1327,15 +1356,18 @@ export async function dispatchToolValue(
     case "list_windows":
       return await windows.listWindows(input as import("./schemas.js").ListWindowsInput);
     case "capture_window": {
-      // Interaction mode: explicit > pack default (matched by process name /
-      // title) > auto. capture_window itself never hardcodes any app.
+      // Interaction mode resolution order:
+      //   1. explicit interactionMode on this call,
+      //   2. the targetRef binding's Profile/App Pack default,
+      //   3. profile inferred from the direct window selector,
+      //   4. generic auto/default.
       const captureInput = input as import("./schemas.js").CaptureWindowInput;
       return await withTargetOperation(
         "capture_window",
         captureInput,
         runtime,
         async (resolved, ctx) => {
-          const targetProfile = profiles.findProfileForTarget({ processName: resolved.windowSel.processName, titleContains: resolved.windowSel.titleContains });
+          const targetProfile = resolveProfileForResolvedTarget(resolved, profiles);
           const captureMode: InteractionMode = resolveInteractionMode({
             explicit: captureInput.interactionMode,
             packDefault: targetProfile?.interaction?.defaultMode
@@ -1606,7 +1638,7 @@ export async function dispatchToolValue(
           const catalog = await windows.catalogUi({ ...catInput, ...resolved.windowSel });
           guardLargeTreeResult(catalog.controls, "ui_catalog");
           ctx.setInteractionMethod("UIAQuery");
-          const profile = profiles.findProfileForTarget({ processName: resolved.windowSel.processName, titleContains: resolved.windowSel.titleContains });
+          const profile = resolveProfileForResolvedTarget(resolved, profiles);
           if (!catInput.summaryOnly) {
             catalog.controls = profiles.enrichCatalogControls(profile, catalog.controls);
           }
