@@ -76,7 +76,17 @@ export const packManifestSchema = z.object({
   pagesFile: nonEmptyStr.optional(),
   componentsFile: nonEmptyStr.optional(),
   catalogVisibility: z.enum(["session", "hidden"]).optional().default("session"),
-  enabled: z.boolean().optional().default(true)
+  enabled: z.boolean().optional().default(true),
+  // Optional build-identity metadata (see PackManifest.testedAgainst).
+  testedAgainst: z.object({
+    executable: z.object({
+      sha256: nonEmptyStr.optional(),
+      fileVersion: nonEmptyStr.optional(),
+      productVersion: nonEmptyStr.optional()
+    }).strict().optional(),
+    appVersion: nonEmptyStr.optional(),
+    sourceRevision: nonEmptyStr.optional()
+  }).strict().optional()
 }).strict().refine(
   (value) => value.enabled !== false,
   "enabled:false packs are not loaded"

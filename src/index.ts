@@ -24,6 +24,8 @@ import {
   autoResolveTarget,
   bindLaunchTarget,
   getTarget,
+  lastTargetOperation,
+  recordTargetOperation,
   resolveTargetRef,
   type TargetBinding
 } from "./targets.js";
@@ -309,7 +311,8 @@ async function appPackDescribeTool(args: unknown, runtime: RuntimeModules) {
       preferredTargetBinding: "targetRef",
       recommendedOrder: [
         "profile_launch",
-        "profile_action",
+        "resolve_semantic_control (for natural-language composite targets)",
+        "profile_action (following the suggestedPath; use ensureSelected for selection-group controls)",
         "scoped ui_query",
         "ui_catalog",
         "ui_inspect_tree"
@@ -319,7 +322,9 @@ async function appPackDescribeTool(args: unknown, runtime: RuntimeModules) {
         "Do not enumerate the full UI tree before trying profile controls.",
         "Do not manually convert screen coordinates to window coordinates.",
         "Do not infer a process crash only because no window is currently found.",
-        "Do not reuse an old hwnd after the window was recreated; pass the targetRef."
+        "Do not reuse an old hwnd after the window was recreated; pass the targetRef.",
+        "Do not guess a control id for a natural-language goal - run resolve_semantic_control first and follow its suggestedPath.",
+        "Do not invoke a selection-group control with raw invoke when ensureSelected is the recommended action."
       ]
     }
   };
@@ -357,7 +362,8 @@ async function appPackDescribeTool(args: unknown, runtime: RuntimeModules) {
         preferredTargetBinding: "targetRef",
         recommendedOrder: [
           "profile_launch",
-          "profile_action",
+          "resolve_semantic_control (for natural-language composite targets)",
+          "profile_action (following the suggestedPath; use ensureSelected for selection-group controls)",
           "scoped ui_query",
           "ui_catalog",
           "ui_inspect_tree"
@@ -367,7 +373,9 @@ async function appPackDescribeTool(args: unknown, runtime: RuntimeModules) {
           "Do not enumerate the full UI tree before trying profile controls.",
           "Do not manually convert screen coordinates to window coordinates.",
           "Do not infer a process crash only because no window is currently found.",
-          "Do not reuse an old hwnd after the window was recreated; pass the targetRef."
+          "Do not reuse an old hwnd after the window was recreated; pass the targetRef.",
+          "Do not guess a control id for a natural-language goal - run resolve_semantic_control first and follow its suggestedPath.",
+          "Do not invoke a selection-group control with raw invoke when ensureSelected is the recommended action."
         ]
       }
     };
@@ -410,7 +418,8 @@ async function appPackDescribeTool(args: unknown, runtime: RuntimeModules) {
       preferredTargetBinding: "targetRef",
       recommendedOrder: [
         "profile_launch",
-        "profile_action",
+        "resolve_semantic_control (for natural-language composite targets)",
+        "profile_action (following the suggestedPath; use ensureSelected for selection-group controls)",
         "scoped ui_query",
         "ui_catalog",
         "ui_inspect_tree"
@@ -420,7 +429,9 @@ async function appPackDescribeTool(args: unknown, runtime: RuntimeModules) {
         "Do not enumerate the full UI tree before trying profile controls.",
         "Do not manually convert screen coordinates to window coordinates.",
         "Do not infer a process crash only because no window is currently found.",
-        "Do not reuse an old hwnd after the window was recreated; pass the targetRef."
+        "Do not reuse an old hwnd after the window was recreated; pass the targetRef.",
+        "Do not guess a control id for a natural-language goal - run resolve_semantic_control first and follow its suggestedPath.",
+        "Do not invoke a selection-group control with raw invoke when ensureSelected is the recommended action."
       ]
     }
   };
@@ -890,11 +901,15 @@ function withRunTtl(result: import("./pipeline.js").PipelineResult): Record<stri
 // ── targetRef resolution ──
 //
 // High-level target tools accept targetRef (preferred), hwnd, pid,
-// processName, or titleContains. Resolution priority: explicit hwnd >
-// targetRef binding (auto-rebound when the window was recreated) >
-// pid/processName/titleContains. When a profile is given with NO target at
-// all and exactly one instance is running, the instance is auto-bound
-// (targetAutoResolved:true); several instances never resolve (TARGET_AMBIGUOUS).
+// processName, or titleContains. Resolution priority: targetRef (auto-rebound
+// when the window was recreated) > explicit hwnd (direct low-level targeting
+// only) > pid/processName/titleContains. When BOTH targetRef and hwnd are
+// given, targetRef wins: it is the session identity, and an old explicit hwnd
+// must never override the binding's rebind capability (a stale hwnd would
+// otherwise force the model to relaunch). When a profile is given with NO
+// target at all and exactly one instance is running, the instance is
+// auto-bound (targetAutoResolved:true); several instances never resolve
+// (TARGET_AMBIGUOUS).
 
 type ResolvedTarget = {
   windowSel: { hwnd?: string | number; pid?: number; processName?: string; titleContains?: string };
@@ -906,11 +921,8 @@ async function resolveTargetInput(
   input: { targetRef?: string; profile?: string; pid?: number; hwnd?: string | number; processName?: string; titleContains?: string },
   runtime: RuntimeModules
 ): Promise<ResolvedTarget> {
-  // 1. Explicit hwnd always wins.
-  if (input.hwnd !== undefined) {
-    return { windowSel: { hwnd: input.hwnd } };
-  }
-  // 2. targetRef: resolve (and auto-rebind when the window was recreated).
+  // 1. targetRef is the SESSION identity: resolve (and auto-rebind when the
+  //    window was recreated). Wins over an explicit stale hwnd.
   if (input.targetRef) {
     const resolution = await resolveTargetRef(input.targetRef, {
       checkProcessAlive: (i) => runtime.windows.checkProcessAlive(i),
@@ -923,6 +935,11 @@ async function resolveTargetInput(
       windowSel: { ...(resolution.target.hwnd !== undefined ? { hwnd: resolution.target.hwnd } : {}), pid: resolution.target.pid },
       targetMeta: { target: resolution.target }
     };
+  }
+  // 2. Explicit hwnd (low-level direct targeting only - diagnostic/transient;
+  //    it may change, so prefer a targetRef from profile_launch).
+  if (input.hwnd !== undefined) {
+    return { windowSel: { hwnd: input.hwnd } };
   }
   // 3. Auto-bind a unique running instance when a profile is specified and
   //    no pid/processName/titleContains was given. Never picks among
@@ -951,6 +968,77 @@ async function resolveTargetInput(
   return { windowSel: { pid: input.pid, processName: input.processName, titleContains: input.titleContains } };
 }
 
+// Resolve the executable path actually used by profile_launch (mirrors the
+// profile layer's priority chain: explicit exePath > env var > common build
+// dirs > PATH). Used only for the OPTIONAL packCompatibility check; a
+// resolution failure skips the check (never blocks launch).
+async function resolveLaunchedExePath(
+  input: { exePath?: string },
+  profile: import("./profiles/types.js").AppProfile | undefined
+): Promise<string | undefined> {
+  const { access } = await import("node:fs/promises");
+  const { resolve: resolvePath } = await import("node:path");
+  const names = profile?.executableNames ?? [];
+  const explicit = input.exePath;
+  if (explicit) {
+    try { await access(explicit); return resolvePath(explicit); } catch { /* fall through */ }
+  }
+  if (profile?.executableEnv && process.env[profile.executableEnv]) {
+    const p = process.env[profile.executableEnv]!;
+    try { await access(p); return resolvePath(p); } catch { /* fall through */ }
+  }
+  for (const name of names) {
+    for (const c of [`./build/Release/${name}`, `./build/Release/Release/${name}`, `./${name}`]) {
+      try { await access(c); return resolvePath(c); } catch { /* next */ }
+    }
+  }
+  return undefined;
+}
+
+// ── Per-target operation ring (safe lifecycle diagnostics) ──
+//
+// Records the last N operations against a targetRef: tool name, timestamps,
+// before/after process+window liveness, and the outcome class. NEVER records
+// sensitive data (passwords, tokens, full text input, screenshot images).
+// The ring feeds TARGET_PROCESS_EXITED diagnostics: `lastOperation` is
+// temporal context, never a causality claim.
+
+async function withTargetOperation<T>(
+  tool: string,
+  input: { targetRef?: string },
+  runtime: RuntimeModules,
+  run: (resolved: ResolvedTarget) => Promise<T>
+): Promise<T> {
+  const { targetRef } = input;
+  const resolved = await resolveTargetInput(input, runtime);
+  if (!targetRef) {
+    return run(resolved);
+  }
+  const targetMeta = resolved.targetMeta?.target as { targetRef?: string; pid?: number; hwnd?: string } | undefined;
+  recordTargetOperation(targetRef, {
+    tool,
+    startedAt: Date.now(),
+    before: { processAlive: true, windowAlive: true, ...(targetMeta?.hwnd ? { hwnd: String(targetMeta.hwnd) } : {}) },
+    result: "success"
+  });
+  try {
+    const result = await run(resolved);
+    const op = lastTargetOperation(targetRef);
+    if (op && op.tool === tool && op.finishedAt === undefined) {
+      op.finishedAt = Date.now();
+      op.result = "success";
+    }
+    return result;
+  } catch (error) {
+    const op = lastTargetOperation(targetRef);
+    if (op && op.tool === tool && op.finishedAt === undefined) {
+      op.finishedAt = Date.now();
+      op.result = error instanceof McpUiError ? "business-error" : "protocol-error";
+    }
+    throw error;
+  }
+}
+
 // Large-tree output guard: results that would flood the client are refused
 // with a scoped-query suggestion (TREE_OUTPUT_TOO_LARGE) instead of forcing
 // the model to parse a huge persisted dump.
@@ -969,6 +1057,18 @@ function guardLargeTreeResult(nodes: unknown[] | undefined, tool: string): void 
 
 // Raw dispatch: input is ALREADY validated/parsed (the unified executor did
 // it). Orchestration tools (run_steps etc.) receive their parsed input too.
+// Merge resolved-target metadata into a tool result WITHOUT overwriting
+// result-owned fields (e.g. capture_window's `target` is a window title
+// string while targetMeta.target is the resolution object - the result's own
+// field must win to satisfy its outputSchema).
+function mergeTargetMeta(result: Record<string, unknown>, targetMeta: Record<string, unknown>): Record<string, unknown> {
+  const out = { ...result };
+  for (const [k, v] of Object.entries(targetMeta)) {
+    if (!(k in out)) out[k] = v;
+  }
+  return out;
+}
+
 async function dispatchToolValue(
   name: string,
   input: unknown,
@@ -1017,30 +1117,62 @@ async function dispatchToolValue(
         packDefault: targetProfile?.interaction?.defaultMode
       });
       const captureResult = await windows.captureWindow({ ...captureInput, ...resolved.windowSel }, captureMode);
-      return resolved.targetMeta ? { ...captureResult, ...resolved.targetMeta } : captureResult;
+      return resolved.targetMeta ? mergeTargetMeta(captureResult as unknown as Record<string, unknown>, resolved.targetMeta) : captureResult;
     }
     case "capture_screen_region":
       return await windows.captureScreenRegion(input as import("./schemas.js").CaptureScreenRegionInput);
-    case "click_window":
-      return await windows.clickWindow(input as import("./schemas.js").ClickWindowInput);
-    case "click_menu_item":
-      return await windows.clickMenuItem(input as import("./schemas.js").ClickMenuItemInput);
-    case "move_mouse_window":
-      return await windows.moveMouseWindow(input as import("./schemas.js").MoveMouseWindowInput);
+    case "click_window": {
+      // Low-level window tools accept targetRef too: once a target session
+      // exists (profile_launch), the SAME session identity applies here, so a
+      // stale hwnd never forces a manual relaunch. This is lifecycle
+      // consistency, not an encouragement of coordinate fallbacks.
+      const clickInput = input as import("./schemas.js").ClickWindowInput;
+      const resolved = await resolveTargetInput(clickInput, runtime);
+      const clickResult = await windows.clickWindow({ ...clickInput, ...resolved.windowSel });
+      return resolved.targetMeta ? { ...clickResult, ...resolved.targetMeta } : clickResult;
+    }
+    case "click_menu_item": {
+      const menuInput = input as import("./schemas.js").ClickMenuItemInput;
+      const resolved = await resolveTargetInput(menuInput, runtime);
+      const menuResult = await windows.clickMenuItem({ ...menuInput, ...resolved.windowSel });
+      return resolved.targetMeta ? { ...menuResult, ...resolved.targetMeta } : menuResult;
+    }
+    case "move_mouse_window": {
+      const moveInput = input as import("./schemas.js").MoveMouseWindowInput;
+      const resolved = await resolveTargetInput(moveInput, runtime);
+      const moveResult = await windows.moveMouseWindow({ ...moveInput, ...resolved.windowSel });
+      return resolved.targetMeta ? { ...moveResult, ...resolved.targetMeta } : moveResult;
+    }
     case "close_app":
       return await windows.closeApp((input as import("./schemas.js").CloseAppInput).pid);
-    case "type_text":
-      return await windows.typeText(input as import("./schemas.js").TypeTextInput);
-    case "send_key":
-      return await windows.sendKey(input as import("./schemas.js").SendKeyInput);
+    case "type_text": {
+      const typeInput = input as import("./schemas.js").TypeTextInput;
+      const resolved = await resolveTargetInput(typeInput, runtime);
+      const typeResult = await windows.typeText({ ...typeInput, ...resolved.windowSel });
+      return resolved.targetMeta ? { ...typeResult, ...resolved.targetMeta } : typeResult;
+    }
+    case "send_key": {
+      const keyInput = input as import("./schemas.js").SendKeyInput;
+      const resolved = await resolveTargetInput(keyInput, runtime);
+      const keyResult = await windows.sendKey({ ...keyInput, ...resolved.windowSel });
+      return resolved.targetMeta ? { ...keyResult, ...resolved.targetMeta } : keyResult;
+    }
     case "read_clipboard":
       return await windows.readClipboard(input as import("./schemas.js").ReadClipboardInput);
     case "write_clipboard":
       return await windows.writeClipboard(input as import("./schemas.js").WriteClipboardInput);
-    case "get_window_state":
-      return await windows.getWindowState(input as import("./schemas.js").GetWindowStateInput);
-    case "wait_for_window":
-      return await windows.waitForWindow(input as import("./schemas.js").WaitForWindowInput);
+    case "get_window_state": {
+      const stateInput = input as import("./schemas.js").GetWindowStateInput;
+      const resolved = await resolveTargetInput(stateInput, runtime);
+      const stateResult = await windows.getWindowState({ ...stateInput, ...resolved.windowSel });
+      return resolved.targetMeta ? { ...stateResult, ...resolved.targetMeta } : stateResult;
+    }
+    case "wait_for_window": {
+      const waitInput = input as import("./schemas.js").WaitForWindowInput;
+      const resolved = await resolveTargetInput(waitInput, runtime);
+      const waitResult = await windows.waitForWindow({ ...waitInput, ...resolved.windowSel });
+      return resolved.targetMeta ? { ...waitResult, ...resolved.targetMeta } : waitResult;
+    }
     case "ui_inspect_tree": {
       const treeInput = input as import("./schemas.js").UiInspectTreeInput;
       const resolved = await resolveTargetInput(treeInput, runtime);
@@ -1052,6 +1184,15 @@ async function dispatchToolValue(
       const queryInput = input as import("./schemas.js").UiQueryInput;
       const resolved = await resolveTargetInput(queryInput, runtime);
       const queryResult = await windows.queryUi({ ...queryInput, ...resolved.windowSel });
+      if (queryInput.targetRef) {
+        recordTargetOperation(queryInput.targetRef, {
+          tool: "ui_query",
+          startedAt: Date.now(),
+          finishedAt: Date.now(),
+          interactionMethod: "UIAQuery",
+          result: "success"
+        });
+      }
       return resolved.targetMeta ? { ...queryResult, ...resolved.targetMeta } : queryResult;
     }
     case "ui_get": {
@@ -1084,6 +1225,15 @@ async function dispatchToolValue(
       const actionInput = input as import("./schemas.js").ProfileActionInput;
       const resolved = await resolveTargetInput(actionInput, runtime);
       const actionResult = await profiles.performProfileAction(uiaDeps, { ...actionInput, ...resolved.windowSel });
+      if (actionInput.targetRef) {
+        recordTargetOperation(actionInput.targetRef, {
+          tool: "profile_action",
+          startedAt: Date.now(),
+          finishedAt: Date.now(),
+          interactionMethod: (actionResult.interaction?.method) as string | undefined,
+          result: "success"
+        });
+      }
       return resolved.targetMeta ? { ...actionResult, ...resolved.targetMeta } : actionResult;
     }
     case "profile_launch": {
@@ -1114,9 +1264,24 @@ async function dispatchToolValue(
         mainWindow: pack?.profile.mainWindow,
         pid: launchResult.pid,
         ...(launchResult.hwnd ? { hwnd: launchResult.hwnd } : {}),
-        ...(launchResult.title ? { title: launchResult.title } : {})
+        ...(launchResult.title ? { title: launchResult.title } : {}),
+        ...(launchResult.startedByMcp ? { startedByMcp: true, startedAt: Date.now() } : {})
       });
-      return { ...launchResult, targetRef: binding.targetRef };
+      // OPTIONAL App Pack ↔ EXE compatibility check. A mismatch is a WARNING
+      // (never a launch block): layout changes do not necessarily invalidate
+      // every selector. `checked` is false when the pack declares no
+      // testedAgainst metadata.
+      let packCompatibility: import("./app-packs/compatibility.js").PackCompatibility | undefined;
+      const resolvedExePath = await resolveLaunchedExePath(launchInput, profile);
+      if (resolvedExePath) {
+        const { checkPackCompatibility } = await import("./app-packs/compatibility.js");
+        packCompatibility = await checkPackCompatibility(pack, resolvedExePath, (p) => windows.getExeIdentity(p));
+      }
+      return {
+        ...launchResult,
+        targetRef: binding.targetRef,
+        ...(packCompatibility ? { packCompatibility } : {})
+      };
     }
     case "ui_catalog": {
       const catInput = input as import("./schemas.js").UiCatalogInput;

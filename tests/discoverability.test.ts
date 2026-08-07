@@ -126,17 +126,24 @@ test("profile_launch outputSchema requires targetRef in the success branch", () 
 // ── 2b. targetRef-aware vs unaware tool contract table ──
 
 // Tools whose runtime resolves targetRef (dispatch -> resolveTargetInput).
+// Target tools: HIGH-LEVEL tools plus the LOW-LEVEL window tools that now
+// resolve targetRef at runtime (lifecycle consistency: once a target session
+// exists, the same session identity applies to click_window / get_window_state
+// / type_text / send_key / etc., so a stale hwnd never forces a manual
+// relaunch). click_menu_item resolves targetRef too (native Win32 menu
+// invocation on the same target window).
 const TARGET_REF_AWARE = [
   "profile_action", "profile_resolve", "capture_window",
-  "ui_query", "ui_get", "ui_action", "ui_catalog", "ui_inspect_tree", "ui_wait"
-];
-
-// Low-level tools that share the window-selector shape but do NOT resolve
-// targetRef at runtime; they must not advertise it.
-const TARGET_REF_UNAWARE = [
+  "ui_query", "ui_get", "ui_action", "ui_catalog", "ui_inspect_tree", "ui_wait",
   "click_window", "move_mouse_window", "click_menu_item",
   "type_text", "send_key", "get_window_state", "wait_for_window"
 ];
+
+// Tools that share the window-selector shape but do NOT accept targetRef:
+// capture_screen_region is screen-space (no window), close_app is pid-only,
+// launch_app/list_windows/read_clipboard/write_clipboard have no target
+// session.
+const TARGET_REF_UNAWARE: string[] = [];
 
 test("targetRef-aware tools accept targetRef alone and mention it in the missing-target message", () => {
   // toolZodSchemas is statically imported above.
@@ -154,7 +161,11 @@ test("targetRef-aware tools accept targetRef alone and mention it in the missing
       : tool === "profile_resolve" ? { profile: "p", control: "c" }
         : ["ui_query", "ui_get", "ui_action", "ui_wait"].includes(tool)
           ? { selector: { controlType: "Button" }, ...(tool === "ui_action" ? { action: "invoke" } : {}), ...(tool === "ui_wait" ? { condition: "exists" } : {}) }
-          : {};
+          : tool === "click_window" || tool === "move_mouse_window" ? { x: 1, y: 1 }
+            : tool === "click_menu_item" ? { path: ["File"] }
+              : tool === "type_text" ? { text: "hi" }
+                : tool === "send_key" ? { key: "enter" }
+                  : {};
     try {
       zodSchema.parse(base);
       assert.fail(`${tool} must reject a call with no target`);
@@ -168,38 +179,21 @@ test("targetRef-aware tools accept targetRef alone and mention it in the missing
     assert.equal(parsed.targetRef, "target_p_1", `${tool} must accept targetRef alone`);
 
     // 4. JSON anyOf exposes the targetRef branch first.
-    assert.deepEqual((jsonSchema.anyOf ?? [])[0], { required: ["targetRef"] }, `${tool} anyOf must allow targetRef`);
+    //    (ui_query uses allOf with the target anyOf nested inside - check
+    //    either shape.)
+    const anyOf = (jsonSchema.anyOf ?? (jsonSchema.allOf as Array<{ anyOf?: unknown[] }> | undefined)?.find((b) => "anyOf" in (b as object))?.anyOf) as Array<{ required?: string[] }> | undefined;
+    assert.ok(anyOf && anyOf.some((b) => b.required?.includes("targetRef")), `${tool} anyOf must allow targetRef`);
   }
 });
 
 test("targetRef-unaware tools do not advertise targetRef and keep the legacy message", () => {
-  // toolZodSchemas is statically imported above.
-  for (const tool of TARGET_REF_UNAWARE) {
-    const zodSchema = toolZodSchemas[tool];
-    const jsonSchema = contracts[tool]!.inputSchema as { properties?: Record<string, unknown>; anyOf?: unknown[] };
-
-    // 1. No targetRef property anywhere (Zod + JSON exposure).
-    assert.ok(!("targetRef" in (zodSchema.shape as Record<string, unknown>)), `${tool} Zod schema must not declare targetRef`);
-    assert.equal(jsonSchema.properties?.targetRef, undefined, `${tool} JSON inputSchema must not expose targetRef`);
-
-    // 2. JSON anyOf does NOT include a targetRef branch.
-    const anyOf = (jsonSchema.anyOf ?? []) as Array<{ required?: string[] }>;
-    assert.ok(!anyOf.some((b) => b.required?.includes("targetRef")), `${tool} anyOf must not accept targetRef`);
-
-    // 3. Missing-target message stays legacy (no false targetRef claim).
-    const base = tool === "click_window" || tool === "move_mouse_window" ? { x: 1, y: 1 }
-      : tool === "click_menu_item" ? { path: ["File"] }
-        : tool === "type_text" ? { text: "hi" }
-          : tool === "send_key" ? { key: "enter" }
-            : {};
-    try {
-      zodSchema.parse(base);
-      assert.fail(`${tool} must reject a call with no target`);
-    } catch (error) {
-      const message = (error as Error).message;
-      assert.ok(!message.includes("targetRef"), `${tool} must not claim targetRef support, got: ${message.slice(0, 120)}`);
-    }
-  }
+  // No tools are currently targetRef-unaware: every window-target tool
+  // resolves targetRef at runtime (click_window / move_mouse_window /
+  // click_menu_item / type_text / send_key / get_window_state /
+  // wait_for_window were extended in the target-session hardening). The
+  // contract test stays to guard against FUTURE tools that share the
+  // window-selector shape without targetRef support.
+  assert.equal(TARGET_REF_UNAWARE.length, 0, "all window-target tools must support targetRef");
 });
 
 test("stale HWND rebinds to the new window of the same process", async () => {
@@ -245,7 +239,7 @@ test("process alive but no window returns WINDOW_NOT_FOUND_FOR_PROCESS (never a 
   }
 });
 
-test("process exit returns PROCESS_EXITED", async () => {
+test("process exit returns TARGET_PROCESS_EXITED with lifecycle details", async () => {
   resetTargetBindings();
   const binding = bindLaunchTarget({
     profileId: "fixture", executableNames: ["FixtureApp.exe"], processNames: ["fixtureapp"], pid: 42, hwnd: "0x111"
@@ -256,8 +250,11 @@ test("process exit returns PROCESS_EXITED", async () => {
   });
   assert.equal(resolution.ok, false);
   if (!resolution.ok) {
-    assert.equal(resolution.error.code, "PROCESS_EXITED");
+    assert.equal(resolution.error.code, "TARGET_PROCESS_EXITED");
     assert.equal(resolution.processAlive, false);
+    const details = resolution.error.details as Record<string, unknown>;
+    assert.equal(details.lifecycle, "process-exited");
+    assert.equal(details.causality, "unknown");
     assert.ok(resolution.error.suggestion?.includes("profile_launch"), "suggestion must say relaunch");
   }
 });

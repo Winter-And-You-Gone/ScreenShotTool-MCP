@@ -24,6 +24,7 @@ import type {
   UiActionInput,
   UiWaitInput
 } from "./schemas.js";
+import { MAX_SELECTOR_STR_LEN } from "./uia/selectors.js";
 import type {
   InspectTreeResult,
   QueryResult,
@@ -250,6 +251,7 @@ type HelperRequest =
   | { action: "ui-action"; target: UiActionInput }
   | { action: "ui-wait"; target: Omit<UiWaitInput, "timeoutMs" | "pollIntervalMs"> & { timeoutMs?: number; pollIntervalMs?: number } }
   | { action: "get-exe-manifest-level"; exePath: string }
+  | { action: "get-exe-identity"; exePath: string }
   | { action: "check-process-alive"; target: { pid?: number; hwnd?: string } }
 
 export function getDefaultOutputDir(): string {
@@ -297,6 +299,10 @@ export type ProcessAliveResult = {
   pid: number;
   processAlive: boolean;
   windowAlive: boolean;
+  // Best-effort exit code when the process is dead (null when the platform
+  // cannot obtain it after exit - e.g. the pid was reused or the handle is
+  // gone). A missing exit code is NOT evidence of anything.
+  exitCode?: number | null;
 };
 
 // REAL process liveness (OpenProcess/GetExitCodeProcess in the helper) plus
@@ -472,11 +478,35 @@ export async function catalogUi(input: {
     selectorVerified: boolean;
     selectorMatchCount: number;
     supportedActions: string[]; patterns: string[];
+    // rawAutomationId: the FULL provider AutomationId (diagnostic only - may
+    // exceed the selector input length limit and is NOT re-inputtable).
+    rawAutomationId?: string;
+    // replaySelector: a SHORT, schema-valid selector that re-resolves this
+    // element. Guaranteed to pass the selector input schema (≤256 chars per
+    // locator field, match mode included). Present when automationId would
+    // otherwise be too long to feed back in.
+    replaySelector?: Record<string, unknown>;
   }> = [];
   let stableAutomationIdNodes = 0;
   let nameOnlyNodes = 0;
   let unsupportedNodes = 0;
   const unmappedActionableControls: Array<{ automationId: string; name: string; controlType: string }> = [];
+
+  // Build a SHORT replay locator from a long hierarchical Qt automationId:
+  // the last dot-separated segment (the objectName) with match:"contains".
+  // Short enough to pass the selector schema (≤MAX_SELECTOR_STR_LEN) and
+  // stable because Qt objectNames are source-declared. Falls back to
+  // name+controlType when the last segment is still too long.
+  function buildReplaySelector(aid: string, controlType: string, name: string): Record<string, unknown> | undefined {
+    const lastSegment = aid.split(".").pop() ?? "";
+    if (lastSegment.length > 0 && lastSegment.length <= MAX_SELECTOR_STR_LEN) {
+      return { automationId: lastSegment, match: "contains" };
+    }
+    if (name.length > 0 && name.length <= MAX_SELECTOR_STR_LEN) {
+      return { name, controlType, match: "contains" };
+    }
+    return undefined;
+  }
 
   for (const n of nodes) {
     const actionable = n.patterns.length > 0 || (n.enabled && n.focusable);
@@ -500,14 +530,41 @@ export async function catalogUi(input: {
     // within-tree count (the resolver's data source); disabled when truncated.
     let selectorVerified = false;
     let selectorMatchCount = 0;
+    // Replay contract: any selector this tool recommends MUST be acceptable
+    // by the selector input schema (≤MAX_SELECTOR_STR_LEN per locator field).
+    // A Qt hierarchical automationId can exceed that; when it does, the full
+    // id is reported as rawAutomationId (diagnostic) and a short
+    // replaySelector is emitted instead - the tool never recommends a value
+    // it cannot accept back.
+    const aidTooLong = aid.length > MAX_SELECTOR_STR_LEN;
+    const aidUniqueReplayable = aidUnique && !aidTooLong;
+    let replaySelector: Record<string, unknown> | undefined;
 
-    if (aidUnique) {
+    if (aidUniqueReplayable) {
       // Unique AutomationId, no index, not localized -> stable & directly executable.
       recommendedSelector = { automationId: aid };
       selectorConfidence = "stable";
       selectorVerified = canVerify;
       selectorMatchCount = aidCount;
       stableAutomationIdNodes++;
+    } else if (aidUnique && aidTooLong) {
+      // Unique AutomationId but too long to feed back in. The raw id is kept
+      // for diagnostics; the replay selector is a short contains-match on the
+      // trailing objectName segment (Qt objectNames are source-declared and
+      // stable), scoped by controlType when available.
+      replaySelector = buildReplaySelector(aid, n.controlType, n.name);
+      if (replaySelector) {
+        recommendedSelector = replaySelector;
+        selectorConfidence = "stable";
+        selectorVerified = canVerify;
+        selectorMatchCount = aidCount;
+        stableAutomationIdNodes++;
+      } else {
+        recommendedSelector = { controlType: n.controlType };
+        selectorConfidence = "fragile";
+        selectorVerified = false;
+        selectorMatchCount = aidCount;
+      }
     } else if (aidNameUnique) {
       // AutomationId shared but unique together with Name (e.g. the shared
       // 'appSidebarButton' / 'titleBarButton' disambiguated by accessibleName).
@@ -571,7 +628,9 @@ export async function catalogUi(input: {
       selectorVerified,
       selectorMatchCount,
       supportedActions,
-      patterns: n.patterns
+      patterns: n.patterns,
+      ...(aidTooLong ? { rawAutomationId: aid } : {}),
+      ...(replaySelector ? { replaySelector } : {})
     });
   }
 
@@ -604,6 +663,8 @@ export async function catalogUi(input: {
       supportedActions: string[];
       patterns: string[];
       profileControl?: string;
+      rawAutomationId?: string;
+      replaySelector?: Record<string, unknown>;
     }>,
     truncated: tree.truncated,
     elapsedMs: tree.elapsedMs
@@ -774,6 +835,21 @@ export async function getExeManifestLevel(exePath: string): Promise<string> {
     { action: "get-exe-manifest-level", exePath }
   );
   return r.executionLevel ?? "unknown";
+}
+
+export type ExeIdentity = {
+  exePath?: string;
+  sha256?: string;
+  fileVersion?: string;
+  productVersion?: string;
+  error?: string;
+};
+
+// Read an executable's build identity (SHA-256 + version resources) WITHOUT
+// executing it. Used for the OPTIONAL App Pack compatibility check - the
+// result feeds a warning, never a launch block.
+export async function getExeIdentity(exePath: string): Promise<ExeIdentity> {
+  return runHelper<ExeIdentity>({ action: "get-exe-identity", exePath });
 }
 
 export async function ensureExecutablePath(exePath: string): Promise<void> {

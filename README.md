@@ -92,7 +92,25 @@ app_pack_describe → profile_launch → 使用 targetRef 的 profile_action
 
 用户已明确指定 Profile 时可直接 `profile_launch → profile_action`，不强制先调用
 `app_pack_list`。`profile_launch` 返回的 `targetRef` 是后续动作的首选目标绑定：
-窗口重建后它会自动重新绑定到新窗口，无需手工换 HWND。
+窗口重建后它会自动重新绑定到新窗口，无需手工换 HWND。**targetRef 是 session 身份**：
+只要拿到 targetRef，后续目标窗口工具（profile_action / ui_query / capture_window /
+click_window / get_window_state / type_text / send_key 等）一律复用 targetRef，而不是
+把返回的 hwnd 跨调用携带——hwnd 是诊断性/临时性的，可能变化。
+
+**自然语言复合目标（推荐主路径）**
+
+用户用自然语言描述目标（例如 "RD105 通道1 传感器配置"）时：
+
+```
+profile_launch → resolve_semantic_control("RD105 通道1 传感器配置")
+              → 按 suggestedPath 依次 profile_action（selection group 控件用 ensureSelected）
+              → 业务后置条件验证 → capture_window
+```
+
+`resolve_semantic_control` 是纯解析（不执行动作）：它把自然语言映射到逻辑控件路径
+（suggestedPath）和推荐动作（selection-group 控件自动推荐 `ensureSelected`——幂等且
+验证 before/after 状态，而不是 raw invoke）。**不要**为自然语言目标猜控件 ID 直接调用
+profile_action；用户已明确给出控件 ID 时才可直接 profile_action。
 
 **查找未知控件**
 
@@ -104,6 +122,9 @@ profile controls（profile_resolve / profile_action）→ scoped ui_query
 
 `ui_catalog` 与 `ui_inspect_tree` 是诊断 fallback：不要为了定位一个已知语义控件
 枚举整棵应用树。`ui_query` 支持 `depthStrategy=auto` 自动从浅到深扩展搜索深度。
+`ui_query` 要求**至少一个查询范围**（selector / rootSelector / ancestorSelector
+三选一；`nameContains` 只是过滤条件，不能单独作为 selector root）——公开 JSON Schema
+与运行时一致，非法调用在 tools/list 阶段即被拒绝。
 
 **禁止的反模式**
 
@@ -115,6 +136,10 @@ profile controls（profile_resolve / profile_action）→ scoped ui_query
 - 把窗口消息点击描述成真实鼠标点击（结果明确 `physicalCursorMoved:false`）。
 - 看到没有窗口就断言应用崩溃（区分 `processAlive` / `windowAlive` /
   `profileWindowMatched`；`WINDOW_NOT_FOUND_FOR_PROCESS` 不代表进程退出）。
+- 为自然语言目标猜控件 ID（先 `resolve_semantic_control` 并跟随 suggestedPath）。
+- 对 selection-group 控件用 raw invoke 而不使用推荐的 `ensureSelected`。
+- 给 capture_window 编造输出路径（用户没指定时省略 `outputPath`，服务器写入默认
+  outputs/ 目录并返回路径；不要猜磁盘根目录如 `X:\...`）。
 
 ## 错误输出契约
 
@@ -137,6 +162,27 @@ profile controls（profile_resolve / profile_action）→ scoped ui_query
 WINDOW_NOT_FOUND_FOR_PROCESS / STALE_WINDOW_HANDLE / ELEMENT_NOT_FOUND /
 ELEMENT_AMBIGUOUS / FOREGROUND_REQUIRED / MAX_DEPTH_EXCEEDED /
 ACTION_STATE_INCONSISTENT / BACKGROUND_CAPTURE_UNAVAILABLE / TREE_OUTPUT_TOO_LARGE）。
+
+控件解析失败（profile_action 的 ELEMENT_NOT_FOUND）会升级为
+`PROFILE_CONTROL_UNRESOLVED`，携带语义诊断上下文：
+`page` / `component` / `parent` / `group` / `candidatesTried` /
+`diagnosticScope`（机器可用的 scoped ui_query 建议：`{rootControl, maxResults}`），
+让模型在最近的已知语义范围内诊断，而不是枚举整棵树。
+
+目标进程退出（targetRef 解析失败）返回 `TARGET_PROCESS_EXITED`，携带结构化证据：
+`processAlive` / `windowAlive` / `startedByMcp` / `exitCode`（尽力而为）/
+`exitObservedAt` / `lastOperation`（工具名 + 时间戳）/ `causality: "unknown"`。
+`lastOperation` 是时间相关性诊断上下文，**不代表工具导致退出**——措辞规则：
+只有真实观测到正常退出才能写 "Observed normal process exit."；有异常 exit code 时写
+"Observed abnormal process termination shortly after <op>. The temporal association
+is recorded, but causality is not proven."；证据不足时写 "Target disappeared; root
+cause remains unknown."。禁止写 "MCP crashed the app" / "UIA caused the crash"。
+
+`profile_launch` 可选返回 `packCompatibility`（App Pack ↔ EXE 兼容性）：
+`verified`（sha256 等强身份匹配）/ `compatible-unverified`（有版本信息但无法完全证明
+binary 身份）/ `mismatch`（Pack 声明的已验证 binary 与当前 binary 不一致，**警告**，
+不阻止启动）/ `not-declared`（Pack 未声明 testedAgainst）。`mismatch` 时控件解析失败
+应优先怀疑 App Pack selector 漂移，而不是 UIA 核心故障。
 
 ## App Pack 是什么
 

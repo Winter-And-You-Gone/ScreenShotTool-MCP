@@ -358,12 +358,21 @@ export async function performProfileAction(
   for (let i = 0; i < candidates.length; i++) {
     const selector = candidates[i]!;
     try {
+      // Pack-declared LOCAL search depth (entry.search) applies to the
+      // non-composite path too: deep controls (e.g. ~20 levels inside Qt
+      // stacks) need a deeper walk than the global default 15. The declared
+      // rootControl is composed into the selector as an ancestor so the walk
+      // stays scoped to that subtree.
+      const searchScope = entry.search;
+      const scopedSelector: UiElementSelector = searchScope?.rootControl && profile
+        ? { ...selector, ancestor: firstSelectorOf(profile, searchScope.rootControl) }
+        : selector;
       const result = await deps.performUiAction({
         hwnd: windowSel.hwnd,
         pid: windowSel.pid,
         processName: windowSel.processName,
         titleContains: windowSel.titleContains,
-        selector,
+        selector: scopedSelector,
         action: input.action,
         value: input.value,
         rangeValue: input.rangeValue,
@@ -371,9 +380,10 @@ export async function performProfileAction(
         allowMessageClickFallback: input.allowMessageClickFallback,
         forceCoordinateClick: input.forceCoordinateClick,
         includeProcessPopups: input.includeProcessPopups,
-        maxDepth: input.maxDepth,
+        maxDepth: searchScope?.maxDepth ?? input.maxDepth,
         maxNodes: input.maxNodes,
-        timeoutMs: input.timeoutMs
+        timeoutMs: input.timeoutMs,
+        ...(searchScope?.depthStrategy === "auto" ? { depthStrategy: "auto" as const } : {})
       });
       let foregroundAfter = await readForeground(deps);
       let foregroundChanged = foregroundBefore !== undefined && foregroundAfter !== undefined && foregroundBefore !== foregroundAfter;
@@ -419,6 +429,31 @@ export async function performProfileAction(
   }
 
   if (lastError instanceof McpUiError) {
+    // Enrich an unresolved-control failure with the control's SEMANTIC
+    // context (page/component/parent/group + candidatesTried + a structured
+    // diagnostic scope), so the model diagnoses within the nearest known
+    // scope instead of enumerating the whole tree or re-deriving selectors.
+    const semanticDetails = semanticFailureContext(entry, {
+      profile: profile.id,
+      control: input.control,
+      candidatesTried: candidatesTried.slice(0, 10)
+    });
+    if (lastError.code === "ELEMENT_NOT_FOUND" && semanticDetails) {
+      throw new McpUiError(
+        "PROFILE_CONTROL_UNRESOLVED",
+        `Profile control '${input.control}' could not be resolved to a unique element on the live UI.`,
+        semanticDetails,
+        lastError.suggestion
+      );
+    }
+    if (semanticDetails) {
+      throw new McpUiError(
+        lastError.code,
+        lastError.message,
+        { ...(typeof lastError.details === "object" && lastError.details !== null ? { ...(lastError.details as Record<string, unknown>) } : {}), ...semanticDetails },
+        lastError.suggestion
+      );
+    }
     throw lastError;
   }
   throw new McpUiError("ACTION_FAILED", "All candidate selectors failed.", {
@@ -428,6 +463,38 @@ export async function performProfileAction(
     notes: entry.notes,
     attempts: candidatesTried.slice(0, 10)
   });
+}
+
+// Build the semantic diagnostic context for a failed control resolution:
+// the control's declared page/component/parent/group, the candidates tried,
+// and a machine-usable diagnosticScope pointing at the nearest RESOLVABLE
+// container (the control's own search.rootControl when declared - a logical
+// control that the profile can resolve - falling back to parent/group, then
+// page). Never app-specific; reads only the entry's declared metadata.
+function semanticFailureContext(
+  entry: ControlEntry,
+  base: { profile: string; control: string; candidatesTried: unknown[] }
+): Record<string, unknown> | undefined {
+  const parent = entry.parent ?? entry.group;
+  // search.rootControl is the strongest diagnostic root: it is a logical
+  // control id the profile can resolve to a real selector.
+  const scopedRoot = entry.search?.rootControl ?? parent ?? entry.page;
+  const diagnosticScope = scopedRoot
+    ? { rootControl: scopedRoot, maxResults: 10 }
+    : undefined;
+  return {
+    profile: base.profile,
+    control: base.control,
+    ...(entry.page ? { page: entry.page } : {}),
+    ...(entry.parent ? { component: entry.parent } : {}),
+    ...(entry.parent ? { parent: entry.parent } : {}),
+    ...(entry.group ? { group: entry.group } : {}),
+    candidatesTried: base.candidatesTried,
+    ...(diagnosticScope ? { diagnosticScope } : {}),
+    suggestedDiagnostic: diagnosticScope
+      ? { tool: "ui_query", withinControl: diagnosticScope.rootControl, maxResults: 10 }
+      : undefined
+  };
 }
 
 // Read the current foreground hwnd (best-effort; undefined when unavailable).

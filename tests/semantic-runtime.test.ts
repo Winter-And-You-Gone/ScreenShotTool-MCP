@@ -344,3 +344,55 @@ test("resolve: suggestedPath targets the right component and marks ambiguity", a
   const iB = multi.suggestedPath.indexOf("navB");
   assert.ok(iA >= 0 && iB > iA, "标签A precedes 标签B in the ordered path");
 });
+
+// ── recommendedAction derivation (方案 B: group + selection-state declaration) ──
+
+test("resolve: selection-group control with controlState -> recommendedAction ensureSelected", async () => {
+  const { registry } = await import("../src/app-packs/registry.js");
+  const { mkdtemp, mkdir, writeFile } = await import("node:fs/promises");
+  const { tmpdir } = await import("node:os");
+  const dir = await mkdtemp(tmpdir() + "/sem-rec-");
+  const pack = fixturePack();
+  // Give deepTarget a selection-state declaration (like a channel/tab control).
+  const controls = structuredClone(pack.controls) as typeof pack.controls;
+  controls.controls = { ...controls.controls };
+  const deepTarget = controls.controls.deepTarget;
+  if (typeof deepTarget === "object" && !Array.isArray(deepTarget) && "selectors" in deepTarget) {
+    (deepTarget as { controlState?: unknown }).controlState = { any: [{ condition: "toggleStateEquals", toggleState: "On" }] };
+  }
+  await mkdir(dir + "/graph-fixture", { recursive: true });
+  await writeFile(dir + "/graph-fixture/manifest.json", JSON.stringify(pack.manifest));
+  await writeFile(dir + "/graph-fixture/profile.json", JSON.stringify(pack.profile));
+  await writeFile(dir + "/graph-fixture/controls.json", JSON.stringify(controls));
+  await writeFile(dir + "/graph-fixture/pages.json", JSON.stringify(pack.pages));
+  await writeFile(dir + "/graph-fixture/components.json", JSON.stringify(pack.components));
+  const r = await registry.load(dir, [], false);
+  assert.equal(r.reloaded, true, JSON.stringify(r.issues));
+
+  const res = resolveSemanticControl({ profile: "graph-fixture", query: "目标" });
+  const match = res.matches.find((m) => m.control === "deepTarget");
+  assert.ok(match, JSON.stringify(res.matches));
+  assert.equal(match.recommendedAction, "ensureSelected");
+});
+
+test("resolve: control with group but no selection-state declaration -> no recommendedAction", async () => {
+  const { registry } = await import("../src/app-packs/registry.js");
+  const { mkdtemp, mkdir, writeFile } = await import("node:fs/promises");
+  const { tmpdir } = await import("node:os");
+  const dir = await mkdtemp(tmpdir() + "/sem-rec-");
+  const pack = fixturePack();
+  await mkdir(dir + "/graph-fixture", { recursive: true });
+  await writeFile(dir + "/graph-fixture/manifest.json", JSON.stringify(pack.manifest));
+  await writeFile(dir + "/graph-fixture/profile.json", JSON.stringify(pack.profile));
+  await writeFile(dir + "/graph-fixture/controls.json", JSON.stringify(pack.controls));
+  await writeFile(dir + "/graph-fixture/pages.json", JSON.stringify(pack.pages));
+  await writeFile(dir + "/graph-fixture/components.json", JSON.stringify(pack.components));
+  await registry.load(dir, [], false);
+
+  // deepTarget has a group but NO controlState in the base fixture -> no
+  // recommendedAction (raw invoke stays available for diagnostics).
+  const res = resolveSemanticControl({ profile: "graph-fixture", query: "目标" });
+  const match = res.matches.find((m) => m.control === "deepTarget");
+  assert.ok(match);
+  assert.equal(match.recommendedAction, undefined);
+});

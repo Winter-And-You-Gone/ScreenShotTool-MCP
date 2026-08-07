@@ -16,6 +16,12 @@ export type SemanticMatch = {
   group?: string;
   score: number;
   reason: string;
+  // Derived action preference (方案 B, no pack declaration needed):
+  // when the control belongs to a selection group AND declares a
+  // selected/toggle controlState, the natural-language path should use
+  // ensureSelected (idempotent, verifies before/after) instead of a raw
+  // invoke. Raw invoke stays available for diagnostics.
+  recommendedAction?: "ensureSelected";
 };
 
 export type ResolveSemanticInput = {
@@ -239,22 +245,44 @@ function groupOf(pack: LoadedPack, controlId: string): string | undefined {
 }
 
 // All controls of a pack with their semantic metadata (generic shape).
-function controlIndex(pack: LoadedPack): Map<string, { displayName?: string; aliases?: string[]; page?: string; group?: string; role?: string }> {
-  const index = new Map<string, { displayName?: string; aliases?: string[]; page?: string; group?: string; role?: string }>();
+function controlIndex(pack: LoadedPack): Map<string, { displayName?: string; aliases?: string[]; page?: string; group?: string; role?: string; controlState?: unknown; postconditions?: unknown[] }> {
+  const index = new Map<string, { displayName?: string; aliases?: string[]; page?: string; group?: string; role?: string; controlState?: unknown; postconditions?: unknown[] }>();
   for (const [id, raw] of Object.entries(pack.controls.controls)) {
     if (Array.isArray(raw) || !(typeof raw === "object") || !("selectors" in raw)) {
       index.set(id, {});
       continue;
     }
-    const entry = raw as { aliases?: string[]; page?: string; group?: string; role?: string };
+    const entry = raw as { aliases?: string[]; page?: string; group?: string; role?: string; controlState?: unknown; postconditions?: unknown[] };
     index.set(id, {
       aliases: entry.aliases,
       page: entry.page,
       group: entry.group,
-      role: entry.role
+      role: entry.role,
+      controlState: entry.controlState,
+      postconditions: entry.postconditions
     });
   }
   return index;
+}
+
+// 方案 B derivation: a selection-group member whose declaration describes
+// selected/toggle state is a "make this option the selected one" control -
+// the natural-language path should use ensureSelected (idempotent + verified)
+// instead of a raw invoke. No pack declaration needed beyond what the control
+// already carries.
+function deriveRecommendedAction(meta: {
+  group?: string;
+  controlState?: unknown;
+  supportedActions?: string[];
+}): "ensureSelected" | undefined {
+  if (!meta.group) return undefined;
+  const hasSelectionState = meta.controlState !== undefined
+    && typeof meta.controlState === "object"
+    && meta.controlState !== null
+    && (("any" in (meta.controlState as Record<string, unknown>)) || ("all" in (meta.controlState as Record<string, unknown>)));
+  const supportsEnsure = Array.isArray(meta.supportedActions) && meta.supportedActions.includes("ensureSelected");
+  if (hasSelectionState || supportsEnsure) return "ensureSelected";
+  return undefined;
 }
 
 // Display name of a control (alias[0] or the control id) for path building.
@@ -328,11 +356,13 @@ export function resolveSemanticControl(input: ResolveSemanticInput): ResolveSema
     }
     const { score, reason } = scoreControl(controlId, meta, tokens);
     if (score <= 0) continue;
+    const recommended = deriveRecommendedAction(meta);
     matches.push({
       control: controlId,
       ...(meta.group ? { group: meta.group } : {}),
       score,
-      reason
+      reason,
+      ...(recommended ? { recommendedAction: recommended } : {})
     });
   }
 
@@ -390,7 +420,7 @@ function buildSuggestedPath(
   graph: SemanticGraph,
   pack: LoadedPack,
   top: SemanticMatch[],
-  index: Map<string, { displayName?: string; aliases?: string[]; page?: string; group?: string; role?: string }>,
+  index: Map<string, { displayName?: string; aliases?: string[]; page?: string; group?: string; role?: string; controlState?: unknown; postconditions?: unknown[] }>,
   groupOrder: Map<string, number>
 ): { path: string[]; ambiguous: boolean } {
   if (top.length === 0) return { path: [], ambiguous: false };

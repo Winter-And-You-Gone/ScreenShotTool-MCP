@@ -12,7 +12,8 @@
 //      main-window rules and update the binding (rebound:true)
 //   3. process alive, no window        -> WINDOW_NOT_FOUND_FOR_PROCESS
 //      (the process is NOT dead; never call it a crash)
-//   4. process exited                  -> PROCESS_EXITED
+//   4. process exited                  -> TARGET_PROCESS_EXITED
+//      (with lifecycle details + lastOperation; causality is never asserted)
 //
 // Bindings are in-memory only and expire (default 20 minutes, like the run
 // cache). This module is pure data + injected callbacks so the hot-reload
@@ -20,6 +21,46 @@
 // (callers supply the lookups).
 
 import { McpUiError } from "./uia/results.js";
+
+// Target lifecycle classification (never asserts root cause - only observable
+// state). `terminated-by-mcp` is set only when the MCP server itself called
+// close_app / taskkill for this pid.
+export type TargetLifecycleState =
+  | "alive"
+  | "window-recreated"
+  | "window-lost-process-alive"
+  | "process-exited"
+  | "process-exited-with-code"
+  | "terminated-by-mcp"
+  | "unknown";
+
+// Lightweight per-target operation ring (bounded). Records ONLY safe
+// interaction metadata - never passwords, tokens, full text input, sensitive
+// args, or screenshot images. Temporal correlation is recorded, causality is
+// never asserted (see `lastOperation` wording rules).
+export type TargetOperationRecord = {
+  tool: string;
+  startedAt: number;
+  finishedAt?: number;
+  interactionMethod?: string;
+  before?: {
+    processAlive?: boolean;
+    windowAlive?: boolean;
+    hwnd?: string;
+  };
+  after?: {
+    processAlive?: boolean;
+    windowAlive?: boolean;
+    hwnd?: string;
+  };
+  result:
+    | "success"
+    | "business-error"
+    | "protocol-error"
+    | "target-disappeared";
+};
+
+export const TARGET_OPERATION_RING_MAX = 20;
 
 export type TargetBinding = {
   targetRef: string;
@@ -35,6 +76,19 @@ export type TargetBinding = {
   title?: string;
   createdAt: number;
   lastResolvedAt: number;
+  // Process identity recorded when the MCP server spawned the process
+  // (startedByMcp=true). exitObservedAt / exitCode are best-effort: Win32
+  // exit codes are only available while the process handle can be queried
+  // (GetExitCodeProcess on a stale pid returns STILL_ACTIVE or fails); a
+  // missing exitCode is NOT evidence of anything.
+  startedByMcp?: boolean;
+  startedAt?: number;
+  lastSeenAliveAt?: number;
+  exitObservedAt?: number;
+  exitCode?: number;
+  terminatedByMcp?: boolean;
+  // Ring of recent operations against this target (bounded).
+  operations: TargetOperationRecord[];
 };
 
 // Resolution outcome for a targetRef. `target` is present on success and on
@@ -42,12 +96,14 @@ export type TargetBinding = {
 // windowAlive / profileWindowMatched so the model never misreads "no window"
 // as "crashed".
 export type TargetResolution =
-  | { ok: true; target: { targetRef: string; pid: number; hwnd?: string; title?: string; rebound: boolean; previousHwnd?: string } }
+  | { ok: true; target: { targetRef: string; pid: number; hwnd?: string; title?: string; rebound: boolean; previousHwnd?: string; lifecycle?: TargetLifecycleState } }
   | { ok: false; error: McpUiError; processAlive: boolean; windowAlive: boolean; profileWindowMatched: boolean };
 
 export type TargetLookupDeps = {
   // Real process liveness (OpenProcess/GetExitCodeProcess) + IsWindow.
-  checkProcessAlive: (input: { pid?: number; hwnd?: string | number }) => Promise<{ processAlive: boolean; windowAlive: boolean }>;
+  // exitCode is best-effort (null when the platform cannot obtain it after
+  // the process exited or the handle is gone).
+  checkProcessAlive: (input: { pid?: number; hwnd?: string | number }) => Promise<{ processAlive: boolean; windowAlive: boolean; exitCode?: number | null }>;
   // List top-level windows, optionally filtered by pid.
   listWindows: (filters: { pid?: number; processName?: string; titleContains?: string }) => Promise<Array<{ hwnd: string; title: string; pid: number; processName: string }>>;
 };
@@ -65,12 +121,49 @@ export function targetRefFor(profileId: string, pid: number, hwnd?: string): str
   return `${TARGET_REF_PREFIX}${profileId}_${pid}${hwnd !== undefined ? `_${hwnd}` : ""}`;
 }
 
-export function registerTarget(binding: Omit<TargetBinding, "targetRef" | "createdAt" | "lastResolvedAt">): TargetBinding {
+export function registerTarget(binding: Omit<TargetBinding, "targetRef" | "createdAt" | "lastResolvedAt" | "operations">): TargetBinding {
   const targetRef = targetRefFor(binding.profileId, binding.pid, binding.hwnd);
   const now = Date.now();
-  const stored: TargetBinding = { ...binding, targetRef, createdAt: now, lastResolvedAt: now };
+  const stored: TargetBinding = { ...binding, targetRef, createdAt: now, lastResolvedAt: now, operations: [] };
   bindings.set(targetRef, stored);
   return stored;
+}
+
+// Record one safe operation against a target (bounded ring). Never records
+// sensitive data - only the tool name, lifecycle observations, and safe
+// interaction metadata.
+export function recordTargetOperation(
+  targetRef: string,
+  record: TargetOperationRecord
+): void {
+  const binding = bindings.get(targetRef);
+  if (!binding) return;
+  binding.operations.push(record);
+  if (binding.operations.length > TARGET_OPERATION_RING_MAX) {
+    binding.operations.splice(0, binding.operations.length - TARGET_OPERATION_RING_MAX);
+  }
+}
+
+export function lastTargetOperation(targetRef: string): TargetOperationRecord | undefined {
+  const binding = bindings.get(targetRef);
+  if (!binding || binding.operations.length === 0) return undefined;
+  return binding.operations[binding.operations.length - 1];
+}
+
+// Classify the current observable state of a target. This is EXACTLY what was
+// observed - never a root-cause claim.
+export function classifyTargetLifecycle(
+  binding: TargetBinding,
+  processAlive: boolean,
+  windowAlive: boolean
+): TargetLifecycleState {
+  if (!processAlive) {
+    if (binding.terminatedByMcp) return "terminated-by-mcp";
+    if (binding.exitCode !== undefined && binding.exitCode !== 0) return "process-exited-with-code";
+    return "process-exited";
+  }
+  if (binding.hwnd !== undefined && !windowAlive) return "window-lost-process-alive";
+  return "alive";
 }
 
 export function getTarget(targetRef: string): TargetBinding | undefined {
@@ -128,7 +221,7 @@ function matchesMainWindow(binding: TargetBinding, win: { hwnd: string; title: s
 
 // Resolve a targetRef to a live target, refreshing the hwnd when the window
 // was recreated. Process-alive-but-windowless is reported separately (NOT a
-// crash); only a real process exit returns PROCESS_EXITED.
+// crash); only a real process exit returns TARGET_PROCESS_EXITED.
 export async function resolveTargetRef(
   targetRef: string,
   deps: TargetLookupDeps
@@ -154,6 +247,7 @@ export async function resolveTargetRef(
     const state = await deps.checkProcessAlive({ hwnd: binding.hwnd, pid: binding.pid });
     if (state.windowAlive && state.processAlive) {
       binding.lastResolvedAt = Date.now();
+      binding.lastSeenAliveAt = Date.now();
       return {
         ok: true,
         target: { targetRef: binding.targetRef, pid: binding.pid, hwnd: binding.hwnd, title: binding.title, rebound: false }
@@ -163,6 +257,7 @@ export async function resolveTargetRef(
     const state = await deps.checkProcessAlive({ pid: binding.pid });
     if (state.processAlive && state.windowAlive) {
       binding.lastResolvedAt = Date.now();
+      binding.lastSeenAliveAt = Date.now();
       return { ok: true, target: { targetRef: binding.targetRef, pid: binding.pid, hwnd: binding.hwnd, title: binding.title, rebound: false } };
     }
   }
@@ -170,22 +265,46 @@ export async function resolveTargetRef(
   // 2. Saved hwnd is stale. Is the process itself still alive?
   const state = await deps.checkProcessAlive({ pid: binding.pid });
   if (!state.processAlive) {
+    // Read the operation ring BEFORE unregistering the binding (the ring
+    // lives on the binding).
+    const lastOp = lastTargetOperation(targetRef);
     unregisterTarget(targetRef);
+    if (binding.exitObservedAt === undefined) {
+      binding.exitObservedAt = Date.now();
+    }
+    if (state.exitCode !== undefined && state.exitCode !== null && binding.exitCode === undefined) {
+      binding.exitCode = state.exitCode;
+    }
+    const lifecycle = classifyTargetLifecycle(binding, false, false);
     return {
       ok: false,
       processAlive: false,
       windowAlive: false,
       profileWindowMatched: false,
       error: new McpUiError(
-        "PROCESS_EXITED",
+        "TARGET_PROCESS_EXITED",
         `The process for targetRef '${targetRef}' (pid ${binding.pid}) has exited.`,
-        { targetRef, pid: binding.pid, profile: binding.profileId },
-        "Relaunch the app with profile_launch and use the new targetRef."
+        {
+          targetRef,
+          pid: binding.pid,
+          profile: binding.profileId,
+          processAlive: false,
+          windowAlive: false,
+          startedByMcp: binding.startedByMcp ?? false,
+          ...(binding.exitCode !== undefined ? { exitCode: binding.exitCode } : {}),
+          ...(binding.exitObservedAt !== undefined ? { exitObservedAt: new Date(binding.exitObservedAt).toISOString() } : {}),
+          lifecycle,
+          // Temporal diagnostic context, explicitly NOT a causality claim.
+          ...(lastOp ? { lastOperation: { tool: lastOp.tool, interactionMethod: lastOp.interactionMethod, completed: lastOp.finishedAt !== undefined, startedAt: new Date(lastOp.startedAt).toISOString() } } : {}),
+          causality: "unknown"
+        },
+        "Relaunch the app with profile_launch and use the new targetRef. The recorded last operation is temporal diagnostic context and does not prove that the tool caused the exit."
       )
     };
   }
 
   // 3. Process alive: re-resolve the main window by the profile's rules.
+  binding.lastSeenAliveAt = Date.now();
   const windows = await deps.listWindows({ pid: binding.pid });
   const matched = windows.filter((w) => matchesMainWindow(binding, w));
   if (matched.length === 0) {
@@ -193,6 +312,7 @@ export async function resolveTargetRef(
     // crash - the window may be starting, hidden, or recreated. The caller
     // reports processAlive/windowAlive/profileWindowMatched so the model can
     // decide (e.g. wait) instead of assuming the app died.
+    const lifecycle = classifyTargetLifecycle(binding, true, windows.length > 0);
     return {
       ok: false,
       processAlive: true,
@@ -201,7 +321,7 @@ export async function resolveTargetRef(
       error: new McpUiError(
         "WINDOW_NOT_FOUND_FOR_PROCESS",
         "The process is alive, but no matching profile window is currently available.",
-        { targetRef, pid: binding.pid, profile: binding.profileId, processAlive: true, windowAlive: windows.length > 0, profileWindowMatched: false },
+        { targetRef, pid: binding.pid, profile: binding.profileId, processAlive: true, windowAlive: windows.length > 0, profileWindowMatched: false, lifecycle, previousHwnd: binding.hwnd },
         "Wait for the main window or call profile_resolve with the same targetRef. No matching window does not prove the process crashed; the window may be starting, hidden, or recreated."
       )
     };
@@ -213,14 +333,17 @@ export async function resolveTargetRef(
   binding.hwnd = win.hwnd;
   binding.title = win.title;
   binding.lastResolvedAt = Date.now();
+  binding.lastSeenAliveAt = Date.now();
   return {
     ok: true,
-    target: { targetRef: binding.targetRef, pid: binding.pid, hwnd: win.hwnd, title: win.title, rebound: true, ...(previousHwnd !== undefined ? { previousHwnd } : {}) }
+    target: { targetRef: binding.targetRef, pid: binding.pid, hwnd: win.hwnd, title: win.title, rebound: true, lifecycle: "window-recreated", ...(previousHwnd !== undefined ? { previousHwnd } : {}) }
   };
 }
 
 // Bind a targetRef for a profile launch outcome. hwnd may be undefined when
-// the launch did not wait for a window.
+// the launch did not wait for a window. startedByMcp records whether the MCP
+// server spawned this process (used by exit diagnostics - never a causality
+// claim).
 export function bindLaunchTarget(input: {
   profileId: string;
   executableNames: string[];
@@ -230,6 +353,8 @@ export function bindLaunchTarget(input: {
   pid: number;
   hwnd?: string;
   title?: string;
+  startedByMcp?: boolean;
+  startedAt?: number;
 }): TargetBinding {
   return registerTarget(input);
 }

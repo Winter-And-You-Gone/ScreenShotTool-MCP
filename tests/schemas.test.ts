@@ -382,8 +382,10 @@ test("tool JSON schemas expose runtime selector and enum constraints", () => {
   assert.equal(toolInputSchemas.capture_screen_region.properties.region.properties.height.maximum, 16_384);
   assert.deepEqual(toolInputSchemas.click_window.properties.button.enum, ["left", "right", "middle"]);
   // targetRef is accepted by every targetRef-aware tool and preferred over
-  // pid/hwnd; tools whose runtime does not resolve targetRef must NOT
-  // advertise it.
+  // pid/hwnd. Since the target-session hardening, EVERY window-target tool
+  // resolves targetRef at runtime (lifecycle consistency: click_window /
+  // get_window_state / type_text / ... reuse the profile_launch session
+  // identity, so a stale hwnd never forces a manual relaunch).
   assert.ok(toolInputSchemas.capture_window.properties.targetRef, "capture_window accepts targetRef");
   assert.ok(toolInputSchemas.ui_query.properties.targetRef, "ui_query accepts targetRef");
   assert.ok(toolInputSchemas.profile_action.properties.targetRef, "profile_action accepts targetRef");
@@ -393,16 +395,15 @@ test("tool JSON schemas expose runtime selector and enum constraints", () => {
   assert.ok(toolInputSchemas.ui_wait.properties.targetRef, "ui_wait accepts targetRef");
   assert.ok(toolInputSchemas.profile_resolve.properties.targetRef, "profile_resolve accepts targetRef");
   assert.ok(toolInputSchemas.ui_catalog.properties.targetRef, "ui_catalog accepts targetRef");
-  // Low-level tools without targetRef runtime resolution keep the 4-branch
-  // anyOf and no targetRef property.
-  assert.equal(toolInputSchemas.click_window.properties.targetRef, undefined, "click_window does not accept targetRef");
-  assert.equal(toolInputSchemas.move_mouse_window.properties.targetRef, undefined, "move_mouse_window does not accept targetRef");
-  assert.equal(toolInputSchemas.type_text.properties.targetRef, undefined, "type_text does not accept targetRef");
-  assert.equal(toolInputSchemas.send_key.properties.targetRef, undefined, "send_key does not accept targetRef");
-  assert.equal(toolInputSchemas.click_menu_item.properties.targetRef, undefined, "click_menu_item does not accept targetRef");
-  assert.equal(toolInputSchemas.get_window_state.properties.targetRef, undefined, "get_window_state does not accept targetRef");
-  assert.equal(toolInputSchemas.wait_for_window.properties.targetRef, undefined, "wait_for_window does not accept targetRef");
+  assert.ok(toolInputSchemas.click_window.properties.targetRef, "click_window accepts targetRef");
+  assert.ok(toolInputSchemas.move_mouse_window.properties.targetRef, "move_mouse_window accepts targetRef");
+  assert.ok(toolInputSchemas.type_text.properties.targetRef, "type_text accepts targetRef");
+  assert.ok(toolInputSchemas.send_key.properties.targetRef, "send_key accepts targetRef");
+  assert.ok(toolInputSchemas.click_menu_item.properties.targetRef, "click_menu_item accepts targetRef");
+  assert.ok(toolInputSchemas.get_window_state.properties.targetRef, "get_window_state accepts targetRef");
+  assert.ok(toolInputSchemas.wait_for_window.properties.targetRef, "wait_for_window accepts targetRef");
   assert.deepEqual(toolInputSchemas.click_window.anyOf, [
+    { required: ["targetRef"] },
     { required: ["hwnd"] },
     { required: ["pid"] },
     { required: ["processName"] },

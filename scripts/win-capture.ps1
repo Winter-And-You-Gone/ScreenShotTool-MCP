@@ -2206,17 +2206,24 @@ function Write-Clipboard {
 # the exit code is not STILL_ACTIVE (259). Never inferred from window
 # presence - a windowless process is alive, and a stale HWND can outlive its
 # owner process. (NOTE: $Pid is a read-only PowerShell automatic variable, so
-# the parameter is named ProcessId.)
+# the parameter is named ProcessId.) Returns @{ alive; exitCode } - exitCode
+# is best-effort: GetExitCodeProcess on a pid that already exited may return
+# STILL_ACTIVE (handle cached by the OS) or fail; callers must never treat a
+# missing exit code as evidence of anything.
 function Test-ProcessAlive {
   param([int]$ProcessId)
 
-  if ($ProcessId -le 0) { return $false }
+  if ($ProcessId -le 0) { return @{ alive = $false; exitCode = $null } }
   $handle = [ScreenshotTool.Native]::OpenProcess([ScreenshotTool.Native]::PROCESS_QUERY_LIMITED_INFORMATION, $false, [uint32]$ProcessId)
-  if ($handle -eq [IntPtr]::Zero) { return $false }
+  if ($handle -eq [IntPtr]::Zero) { return @{ alive = $false; exitCode = $null } }
   try {
     $exitCode = [uint32]0
-    if (-not [ScreenshotTool.Native]::GetExitCodeProcess($handle, [ref]$exitCode)) { return $false }
-    return ($exitCode -eq [ScreenshotTool.Native]::STILL_ACTIVE)
+    if (-not [ScreenshotTool.Native]::GetExitCodeProcess($handle, [ref]$exitCode)) { return @{ alive = $false; exitCode = $null } }
+    if ($exitCode -eq [ScreenshotTool.Native]::STILL_ACTIVE) { return @{ alive = $true; exitCode = $null } }
+    # Process exited. The exit code is only meaningful when the process was
+    # OBSERVED dead via GetExitCodeProcess; a later pid reuse is possible, so
+    # callers must not treat the code as a root-cause claim.
+    return @{ alive = $false; exitCode = [int]$exitCode }
   } finally {
     [ScreenshotTool.Native]::CloseHandle($handle) | Out-Null
   }
@@ -4316,18 +4323,23 @@ function Invoke-Action {
       # Real process-liveness check via OpenProcess/GetExitCodeProcess -
       # NEVER inferred from "the process still has a top-level window"
       # (a windowless process is alive; a window can belong to a dead
-      # process). Returns { processAlive, windowAlive, pid }.
+      # process). Returns { processAlive, windowAlive, pid, exitCode? }.
       $targetPid = $Request.target.pid
       if ($null -eq $targetPid) { $targetPid = 0 }
       $win = $null
       if ($Request.target.hwnd -and $Request.target.hwnd -ne "") {
         $win = Get-WindowByHandle $Request.target.hwnd
       }
-      return @{
+      $aliveInfo = Test-ProcessAlive -ProcessId ([int]$targetPid)
+      $result = @{
         pid = [int]$targetPid
-        processAlive = (Test-ProcessAlive -ProcessId ([int]$targetPid))
+        processAlive = $aliveInfo.alive
         windowAlive = ($null -ne $win)
       }
+      if (-not $aliveInfo.alive -and $null -ne $aliveInfo.exitCode) {
+        $result.exitCode = $aliveInfo.exitCode
+      }
+      return $result
     }
     "wait-for-window" {
       return Wait-ForWindow -Target $Request.target
@@ -4352,6 +4364,36 @@ function Invoke-Action {
       if ($Request.ContainsKey("exePath") -and $null -ne $Request.exePath) { $exePath = [string]$Request.exePath }
       $level = Get-ExeManifestLevel -ExePath $exePath
       return [ordered]@{ exePath = $exePath; executionLevel = $level }
+    }
+    "get-exe-identity" {
+      # Read an executable's build identity (SHA-256 + version resources)
+      # WITHOUT executing it. Used by profile_launch for the OPTIONAL App Pack
+      # compatibility check - the result is a warning, never a launch block.
+      $exePath = ""
+      if ($Request.ContainsKey("exePath") -and $null -ne $Request.exePath) { $exePath = [string]$Request.exePath }
+      $result = [ordered]@{ exePath = $exePath }
+      if (-not [string]::IsNullOrWhiteSpace($exePath) -and (Test-Path -LiteralPath $exePath -PathType Leaf)) {
+        try {
+          $stream = [System.IO.File]::OpenRead($exePath)
+          try {
+            $sha = [System.Security.Cryptography.SHA256]::Create()
+            try {
+              $hash = $sha.ComputeHash($stream)
+              $result.sha256 = ([BitConverter]::ToString($hash) -replace "-", "").ToLowerInvariant()
+            } finally {
+              $sha.Dispose()
+            }
+          } finally {
+            $stream.Dispose()
+          }
+          $vi = [System.Diagnostics.FileVersionInfo]::GetVersionInfo($exePath)
+          if (-not [string]::IsNullOrWhiteSpace($vi.FileVersion)) { $result.fileVersion = $vi.FileVersion }
+          if (-not [string]::IsNullOrWhiteSpace($vi.ProductVersion)) { $result.productVersion = $vi.ProductVersion }
+        } catch {
+          $result.error = "EXE_IDENTITY_UNREADABLE"
+        }
+      }
+      return $result
     }
     default {
       throw "Unknown action: $($Request.action)"

@@ -30,6 +30,18 @@ export type PackManifest = {
   componentsFile?: string;
   catalogVisibility?: CatalogVisibility;
   enabled?: boolean;
+  // OPTIONAL build-identity metadata used to detect selector drift:
+  // which executable this pack's selectors were verified against. All fields
+  // are optional - a pack is never required to know its git revision.
+  testedAgainst?: {
+    executable?: {
+      sha256?: string;
+      fileVersion?: string;
+      productVersion?: string;
+    };
+    appVersion?: string;
+    sourceRevision?: string;
+  };
 };
 
 // 4.2 profile.json ----------------------------------------------------------

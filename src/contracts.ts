@@ -570,7 +570,9 @@ const catalogControl = obj(
     selectorMatchCount: int(),
     supportedActions: arr(str()),
     patterns: arr(str()),
-    profileControl: str()
+    profileControl: str(),
+    rawAutomationId: str(),
+    replaySelector: any()
   },
   ["controlType", "automationId", "name", "selectorConfidence"]
 );
@@ -651,10 +653,11 @@ const profileLaunchOutput = withToolError(obj(
     reused: bool(),
     uiaRootAvailable: bool(),
     manifestLevel: str(),
-    interaction: interactionShape
+    interaction: interactionShape,
+    packCompatibility: any()
   },
   ["profile", "targetRef", "pid", "startedByMcp", "uiaRootAvailable", "interaction"],
-  "profile_launch success result (stable fields: profile, targetRef, pid, hwnd, title, startedByMcp, reused, uiaRootAvailable). targetRef is REQUIRED: the preferred target binding for later profile actions (hwnd may be absent when the launch did not wait for a window)."
+  "profile_launch success result (stable fields: profile, targetRef, pid, hwnd, title, startedByMcp, reused, uiaRootAvailable). targetRef is REQUIRED: the preferred target binding for later profile actions (hwnd may be absent when the launch did not wait for a window). packCompatibility is OPTIONAL: {status: verified|compatible-unverified|mismatch|not-declared, checked, matchedBy?} - a mismatch is a WARNING that App Pack selectors may have drifted, never a launch block."
 ));
 
 // ── App Pack tools ──
@@ -998,7 +1001,7 @@ export const contracts: Record<string, ToolContract> = {
   },
   capture_window: {
     name: "capture_window",
-    description: "Captures the visual contents of a target window as an image file. Use when the task requires visual content, layout inspection, rendering verification, or an image artifact - including when the user explicitly asks for a screenshot. 'print' mode uses PrintWindow (works occluded/minimized, misses separate popup/tooltip windows); 'screen' mode copies the visible screen. Capture latency depends on the target application, rendering backend, window state, and capture method; PrintWindow may require the target window to process a synchronous WM_PRINT/WM_PRINTCLIENT request. interactionMode=background forces the non-activating PrintWindow path and reports interaction metadata; capture never auto-upgrades to foreground (BACKGROUND_CAPTURE_UNAVAILABLE instead). Returns: path,width,height,target,rect,timestamp,interaction. Pipe-safe: path, interaction.",
+    description: "Captures the visual contents of a target window as an image file. Use when the task requires visual content, layout inspection, rendering verification, or an image artifact - including when the user explicitly asks for a screenshot. 'print' mode uses PrintWindow (works occluded/minimized, misses separate popup/tooltip windows); 'screen' mode copies the visible screen. Capture latency depends on the target application, rendering backend, window state, and capture method; PrintWindow may require the target window to process a synchronous WM_PRINT/WM_PRINTCLIENT request. interactionMode=background forces the non-activating PrintWindow path and reports interaction metadata; capture never auto-upgrades to foreground (BACKGROUND_CAPTURE_UNAVAILABLE instead). OMIT outputPath unless the user specified a target file - the server writes to its default writable outputs/ directory and returns the path (never invent a path like X:\\...). Returns: path,width,height,target,rect,timestamp,interaction. Pipe-safe: path, interaction.",
     inputSchema: toolInputSchemas.capture_window as unknown as JsonSchema,
     outputSchema: captureWindowOutput,
     schemaVersion: 1,

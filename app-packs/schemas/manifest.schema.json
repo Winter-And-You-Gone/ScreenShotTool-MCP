@@ -24,7 +24,26 @@
       "default": "session",
       "description": "session: exposed to the MCP client; hidden: callable by id but not listed; internal: only callable from the pack's own workflows."
     },
-    "enabled": { "type": "boolean", "default": true }
+    "enabled": { "type": "boolean", "default": true },
+    "testedAgainst": {
+      "type": "object",
+      "description": "OPTIONAL build-identity metadata: which executable / source revision this pack's selectors were verified against. Used to warn on selector drift (packCompatibility.mismatch) - never blocks launching. All fields optional; a pack is never required to know its git revision.",
+      "properties": {
+        "executable": {
+          "type": "object",
+          "description": "Identity of the executable the pack was verified against.",
+          "properties": {
+            "sha256": { "type": "string", "minLength": 64, "maxLength": 64, "description": "SHA-256 of the verified executable file." },
+            "fileVersion": { "type": "string", "description": "Win32 file version (FileVersionInfo.FileVersion)." },
+            "productVersion": { "type": "string", "description": "Win32 product version (FileVersionInfo.ProductVersion)." }
+          },
+          "additionalProperties": false
+        },
+        "appVersion": { "type": "string", "description": "Application-level version this pack was verified against." },
+        "sourceRevision": { "type": "string", "description": "Source revision (git hash etc.) the executable was built from." }
+      },
+      "additionalProperties": false
+    }
   },
   "required": ["schemaVersion", "id", "displayName", "version"],
   "additionalProperties": false
