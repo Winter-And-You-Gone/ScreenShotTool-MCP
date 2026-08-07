@@ -31,7 +31,11 @@ const FORBIDDEN_README_PATTERNS: Array<[RegExp, string]> = [
   [/1-5\s*秒/, "README must not cite a fixed 1-5 second latency"],
   [/优先(用)?其他工具替代截图/, "README must not direct models to substitute other tools for screenshots"],
   [/只有在真正需要.*?才截图/, "README must not make screenshots a last resort"],
-  [/只在真正需要视觉内容时才截图/, "README must not gate screenshots behind a last-resort condition"]
+  [/只在真正需要视觉内容时才截图/, "README must not gate screenshots behind a last-resort condition"],
+  [/UI Automation（UIA）优先|UIA\s*优先/, "README must not declare a fixed UIA-first priority"],
+  [/截图优先/, "README must not declare a screenshot-first priority"],
+  [/截图.*最后(手段|一步)/, "README must not make screenshots the final default step"],
+  [/最后才截图/, "README must not place capture at the end of every flow"]
 ];
 
 for (const [re, message] of FORBIDDEN_README_PATTERNS) {
@@ -45,6 +49,18 @@ test("README guidance: captures are described for visual content and complement 
   assert.match(readme, /或用户明确要求截图时，直接使用 `capture_window`/);
   assert.match(readme, /两类工具互补，不设固定的全局优先级/s);
   assert.match(readme, /当用户明确要求截图、图像或视觉\s*\n\s*验证时，执行截图而不是用状态查询代替/s);
+});
+
+test("README guidance: general task flows do not mandate a capture step by default", () => {
+  // The general flows must choose capture by task need, not as a fixed
+  // trailing step. The wording must express evidence-type selection.
+  assert.match(readme, /按任务需要 capture_window/s);
+  // Both classes are described neutrally: UIA is a capability, not a
+  // mandated-first tool.
+  assert.match(readme, /结构化 UI Automation（UIA）能力/s);
+  // The capability description states what UIA reads (structure/state/value/
+  // postconditions) without a priority claim.
+  assert.match(readme, /读取控件结构、状态、值和业务后置条件/s);
 });
 
 // ── public tool contracts ──

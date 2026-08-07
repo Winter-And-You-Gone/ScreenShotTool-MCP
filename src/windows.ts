@@ -979,11 +979,11 @@ async function launchIndependent(exePath: string, args: string[], cwd?: string):
     // Helper unavailable/failed - fall through to the detached spawn path.
   }
 
-  // 2. Detached spawn: Node.js does NOT place a detached child in its
-  // KILL_ON_JOB_CLOSE job, which is the primary server-exit cascade
-  // mechanism. The child may still share any OUTER host job (breakaway was
-  // not honored) - that residual coupling is reported honestly via
-  // outerJobCoupling and cannot be removed from inside the server.
+  // 2. Detached spawn. Detached spawning is verified by the Windows
+  // integration test to allow the child to survive the launching MCP server
+  // process exiting. This does not prove that the child has escaped every
+  // outer host Job or session lifetime - outerJobCoupling therefore remains
+  // "possible".
   const child = await spawnDetached(exePath, args, cwd);
   if (typeof child.pid !== "number") {
     throw new Error("Failed to start process.");
@@ -994,10 +994,9 @@ async function launchIndependent(exePath: string, args: string[], cwd?: string):
       requested: "independent",
       effective: "independent",
       isolationMethod: "detached-spawn",
-      // Verified for MCP server-process exit survival (by construction:
-      // Node creates no KILL_ON_JOB_CLOSE job for detached children, and the
-      // platform integration test proves parent-exit survival). This is NOT
-      // a claim of full isolation from every outer host job.
+      // Verified scope: survival of the MCP server process exit (platform
+      // integration test). NOT a claim of full isolation from every outer
+      // host job.
       verified: true,
       verificationScope: "mcp-server-process-exit",
       outerJobCoupling: "possible"
@@ -1063,10 +1062,10 @@ export async function launchApp(input: LaunchAppInput): Promise<LaunchResult> {
   const lifetime = input.lifetime ?? "independent";
 
   // independent: breakaway launch when the host job allows it, otherwise a
-  // detached spawn (Node then creates no KILL_ON_JOB_CLOSE job for the child
-  // - the primary server-exit cascade mechanism). managed: the historical
-  // spawn path (the process may be tied to the server's own lifetime - that
-  // is the point).
+  // detached spawn (verified for MCP server-process exit survival; an outer
+  // host Job lifecycle may still apply - outerJobCoupling="possible").
+  // managed: the historical spawn path (the process may be tied to the
+  // server's own lifetime - that is the point).
   let child: { pid: number };
   let spawnedProcess: ReturnType<typeof spawn> | undefined;
   let processLifetime: ProcessLifetimeReport;

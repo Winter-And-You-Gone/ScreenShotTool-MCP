@@ -17,7 +17,7 @@
 一个**通用的 Windows UI Automation MCP Server**，供 Codex、Claude Code 等 MCP 客户端通过 stdio 调用。核心能力：
 
 - 启动应用、发现窗口、截取窗口或屏幕区域、投递鼠标/键盘消息（不移动物理鼠标）。
-- **UI Automation（UIA）优先**：读取控件树、按 selector 查询控件、通过 UIA Pattern 操作控件、等待状态变化。
+- **结构化 UI Automation（UIA）能力**：读取控件结构、状态、值和业务后置条件；按 selector 查询控件、通过 UIA Pattern 操作控件、等待状态变化。
 - **App Pack 声明式适配**：任何桌面软件都可以通过一个 JSON 目录（App Pack）接入，无需修改 MCP 源码。
 - **管道引擎**：`run_steps` / `profile_run_steps` / `run_workflow` 服务端串联多步操作，支持命名步骤、`exports`、后置条件（expect）、重试、finally 清理、状态恢复与失败续接（continue_run）。
 - **机器可读工具契约**：`tools/list` 直接返回每个工具的 `inputSchema`、`outputSchema` 与标准 `annotations`（readOnlyHint/destructiveHint/idempotentHint/openWorldHint），`pipeSafeFields` 通过 `_meta` 携带；另有 `tool_contract_list` / `tool_contract_describe` 高层发现接口。所有工具调用（普通调用与管道步骤）都经过统一执行器做 input + output Schema 运行时校验。
@@ -87,7 +87,8 @@ npm test
 
 ```
 app_pack_describe → profile_launch → 使用 targetRef 的 profile_action
-                  → 业务后置条件验证（ui_wait / expect）→ capture_window
+                  → 业务后置条件验证（ui_wait / expect）
+                  → 按任务需要 capture_window（视觉证据/布局检查/用户要求截图时）
 ```
 
 用户已明确指定 Profile 时可直接 `profile_launch → profile_action`，不强制先调用
@@ -104,7 +105,8 @@ click_window / get_window_state / type_text / send_key 等）一律复用 target
 ```
 profile_launch → resolve_semantic_control("RD105 通道1 传感器配置")
               → 按 suggestedPath 依次 profile_action（selection group 控件用 ensureSelected）
-              → 业务后置条件验证 → capture_window
+              → 业务后置条件验证
+              → 按任务需要 capture_window（视觉证据/布局检查/用户要求截图时）
 ```
 
 `resolve_semantic_control` 是纯解析（不执行动作）：它把自然语言映射到逻辑控件路径
